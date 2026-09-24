@@ -87,6 +87,10 @@ cp export-config.example.yaml export-config.yaml
 every output but deletes each resource's temporary products after recording its hashes.
 The summary is complete only when every selected resource succeeds. Unknown paths fail;
 a selected subset does not constitute a full-catalog acceptance test.
+Retained exports can be independently checked with `sirius-asset-updater verify-export DIRECTORY jp`
+(use the expected region). Service jobs run this check after retained export and write
+`export-verification.json` beside the exports directory. See [export verification](docs/EXPORT_VERIFY.md).
+
 See [export formats and limits](docs/EXPORT.md) and [incremental export](docs/EXPORT_CACHE.md).
 
 The current JP catalog passed full download and export validation: **13,367 remote resources,

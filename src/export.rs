@@ -87,34 +87,34 @@ pub struct ExportSummary {
     pub retained: bool,
 }
 #[derive(Clone, Deserialize, Serialize)]
-struct OutputRecord {
-    path: String,
-    kind: String,
-    bytes: u64,
-    sha256: String,
+pub(crate) struct OutputRecord {
+    pub(crate) path: String,
+    pub(crate) kind: String,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    object: Option<ObjectIdentity>,
+    pub(crate) object: Option<ObjectIdentity>,
 }
 #[derive(Clone, Deserialize, Serialize)]
-struct ObjectIdentity {
-    source_file: String,
-    path_id: i64,
-    class_id: i32,
-    name: Option<String>,
-    container: Option<String>,
+pub(crate) struct ObjectIdentity {
+    pub(crate) source_file: String,
+    pub(crate) path_id: i64,
+    pub(crate) class_id: i32,
+    pub(crate) name: Option<String>,
+    pub(crate) container: Option<String>,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
-struct ResourceReport {
+pub(crate) struct ResourceReport {
     #[serde(default)]
-    cache_hit: bool,
-    source: String,
-    output_directory: String,
-    source_sha256: String,
-    objects: usize,
-    selected_objects: usize,
-    skipped_objects: usize,
-    outputs: Vec<OutputRecord>,
-    errors: Vec<String>,
+    pub(crate) cache_hit: bool,
+    pub(crate) source: String,
+    pub(crate) output_directory: String,
+    pub(crate) source_sha256: String,
+    pub(crate) objects: usize,
+    pub(crate) selected_objects: usize,
+    pub(crate) skipped_objects: usize,
+    pub(crate) outputs: Vec<OutputRecord>,
+    pub(crate) errors: Vec<String>,
 }
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Export(e.to_string())

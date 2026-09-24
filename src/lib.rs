@@ -3,6 +3,7 @@ pub mod assets;
 mod cache;
 pub mod catalog;
 pub mod export;
+pub mod export_verify;
 pub mod network;
 pub mod readiness;
 mod update;

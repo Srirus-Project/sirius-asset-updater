@@ -40,7 +40,25 @@ async fn run() -> Result<(), Error> {
         };
     }
     if args == ["--help"] {
-        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | inspect-keys FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        return Ok(());
+    }
+    if args.len() == 3 && args[0] == "verify-export" {
+        let region = match args[2].as_str() {
+            "jp" => sirius_asset_updater::region::Region::Jp,
+            "tw" => sirius_asset_updater::region::Region::Tw,
+            "en" => sirius_asset_updater::region::Region::En,
+            "kr" => sirius_asset_updater::region::Region::Kr,
+            "cn" => return Err(Error::ReservedRegion),
+            _ => return Err(Error::Config),
+        };
+        let report =
+            sirius_asset_updater::export_verify::verify(std::path::Path::new(&args[1]), region)
+                .await?;
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&report).map_err(|_| Error::Verification)?
+        );
         return Ok(());
     }
     if args.len() == 2 && args[0] == "verify" {
@@ -70,7 +88,7 @@ async fn run() -> Result<(), Error> {
     }
     if !args.is_empty() && args != ["check"] && args != ["probe"] {
         eprintln!(
-            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | inspect-keys FILE | export CONFIG]"
+            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG]"
         );
         return Err(Error::Config);
     }

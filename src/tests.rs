@@ -2048,6 +2048,7 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         jobs::{Job, Status},
         service::{Profile, Service, ServiceConfig},
     };
+    use sonic_rs::JsonValueTrait;
     let directory = tempfile::tempdir().unwrap();
     let mut cfg = config();
     cfg.output = directory.path().join("input");
@@ -2135,7 +2136,8 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         .await
         .unwrap();
         assert_eq!(finished.status, Status::Completed);
-        assert_eq!(finished.progress.completed, 1);
+        assert_eq!(finished.progress.phase, "verify_export");
+        assert_eq!(finished.progress.completed, 2);
         let output = directory
             .path()
             .join("jobs/jp")
@@ -2146,6 +2148,15 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         assert!(summary.complete && summary.full_catalog && summary.full_export);
         assert_eq!(summary.cache_hits, expected_hits);
         assert_eq!(summary.output_files, 2);
+        let verification: sonic_rs::Value = sonic_rs::from_slice(
+            &std::fs::read(output.parent().unwrap().join("export-verification.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verification["files_verified"].as_u64(), Some(2));
+        assert_eq!(
+            verification["bytes_verified"].as_u64(),
+            Some(summary.output_bytes)
+        );
         let wav = std::fs::read(output.join("00000/00000.wav")).unwrap();
         if let Some(previous) = previous {
             assert_eq!(wav, previous);

@@ -373,6 +373,26 @@ impl Service {
                 if !summary.complete || summary.failed > 0 {
                     return Err(Error::Verification);
                 }
+                if summary.retained {
+                    self.phase(&job.id, "verify_export").await?;
+                    let report = tokio::select! {
+                        result = crate::export_verify::verify(&output, profile.region) => result?,
+                        _ = cancelled(&mut stop) => return Err(Error::Cancelled),
+                    };
+                    tokio::fs::write(
+                        root.join("export-verification.json"),
+                        sonic_rs::to_vec_pretty(&report).map_err(|_| Error::Io)?,
+                    )
+                    .await
+                    .map_err(|_| Error::Io)?;
+                    final_progress = Progress {
+                        phase: "verify_export".into(),
+                        completed: report.files_verified as u64,
+                        failed: 0,
+                        total: Some(report.files_verified as u64),
+                        bytes: report.bytes_verified,
+                    };
+                }
             }
         }
         if *stop.borrow() {
