@@ -1,0 +1,17 @@
+# Run: sirius-asset-updater serve sirius-service-config.yaml
+# Relative paths are resolved from the process working directory.
+listen: 127.0.0.1:12345
+token_env: SIRIUS_ASSET_SERVICE_TOKEN
+state_directory: ./service-state
+output_directory: ./service-output
+max_concurrent_jobs: 4
+max_queued_jobs: 64
+retain_terminal_jobs: 256
+timeout_seconds: 3600
+profiles:
+  jp-full:
+    region: jp
+    download_config: ./sirius-asset-config.yaml
+    export_config: ./export-config.yaml
+    # Optional verified publication for standalone export/verify operations:
+    # input: ./downloads/catalogs/PUBLISHED_DIRECTORY

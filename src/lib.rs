@@ -482,3 +482,5 @@ mod tests;
 pub mod region;
 
 pub mod jobs;
+
+pub mod service;

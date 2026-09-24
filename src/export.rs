@@ -42,7 +42,7 @@ fn default_workers() -> usize {
 fn max_output() -> u64 {
     2 * 1024 * 1024 * 1024
 }
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct ExportSummary {
     pub schema_version: u8,
     pub region: crate::region::Region,
@@ -93,6 +93,27 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
 }
 impl ExportConfig {
     pub async fn run(self) -> Result<ExportSummary, Error> {
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let work = self.run_controlled(receiver);
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(err)?;
+                let _ = stop.send(true);
+                work.await
+            }
+        }
+    }
+    /// The caller must await this future after requesting cancellation. The exporter
+    /// joins its blocking workers (and their media subprocesses) before returning.
+    pub async fn run_controlled(
+        self,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<ExportSummary, Error> {
+        if *stop.borrow() {
+            return Err(Error::Cancelled);
+        }
         if !(1..=3600).contains(&self.media_timeout_seconds)
             || !(1..=4).contains(&self.concurrency)
             || self.max_resource_output_bytes == 0
@@ -105,7 +126,10 @@ impl ExportConfig {
             .parse::<u64>()
             .map_err(|_| Error::Secret)?;
         let input = fs::canonicalize(&self.input).map_err(err)?;
-        let verified = crate::verify::verify(&input).await?;
+        let verified = tokio::select! {
+            result = crate::verify::verify(&input) => result?,
+            _ = crate::service::cancelled(&mut stop) => return Err(Error::Cancelled),
+        };
         if verified.asset_files_verified != verified.planned_remote_files
             || verified.asset_files_verified == 0
         {
@@ -133,8 +157,7 @@ impl ExportConfig {
         let mut job = tokio::task::spawn_blocking(move || self.execute(input, root, receipt, key));
         tokio::select! {
             result = &mut job => result.map_err(err)?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(err)?;
+            _ = crate::service::cancelled(&mut stop) => {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = job.await;
                 Err(Error::Cancelled)

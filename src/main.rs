@@ -19,6 +19,9 @@ async fn run() -> Result<(), Error> {
         println!("sirius-asset-updater {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.len() == 2 && args[0] == "serve" {
+        return sirius_asset_updater::service::run_file(std::path::Path::new(&args[1])).await;
+    }
     if args.len() == 2 && args[0] == "export" {
         let config: sirius_asset_updater::export::ExportConfig =
             yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
@@ -37,7 +40,7 @@ async fn run() -> Result<(), Error> {
         };
     }
     if args == ["--help"] {
-        println!("usage: sirius-asset-updater [check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
         return Ok(());
     }
     if args.len() == 2 && args[0] == "verify" {
@@ -65,7 +68,7 @@ async fn run() -> Result<(), Error> {
     }
     if !args.is_empty() && args != ["check"] && args != ["probe"] {
         eprintln!(
-            "usage: sirius-asset-updater [check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]"
+            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]"
         );
         return Err(Error::Config);
     }

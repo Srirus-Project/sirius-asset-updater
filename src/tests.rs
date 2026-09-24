@@ -1481,3 +1481,147 @@ fn persisted_identity_accepts_legacy_jp_and_rejects_ambiguous_or_reserved_region
     s.schema_version = 1;
     assert!(s.region_identity().is_err());
 }
+
+#[tokio::test]
+async fn job_service_auth_queue_and_real_offline_verification() {
+    use crate::{
+        jobs::{Job, Status},
+        service::{Profile, Service, ServiceConfig},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = directory.path().join("input");
+    let (client, _, upstream) = serve(cfg, StatusCode::OK, catalog(), Duration::ZERO).await;
+    let publication = client.fetch().await.unwrap();
+    upstream.abort();
+    let env = format!("SERVICE_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, "service-only-token");
+    let service = Service::open(ServiceConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        token_env: env,
+        state_directory: directory.path().join("state"),
+        output_directory: directory.path().join("jobs"),
+        max_concurrent_jobs: 1,
+        max_queued_jobs: 1,
+        retain_terminal_jobs: 10,
+        timeout_seconds: 30,
+        profiles: BTreeMap::from([(
+            "verify".into(),
+            Profile {
+                region: region::Region::Jp,
+                download_config: None,
+                export_config: None,
+                input: Some(publication),
+            },
+        )]),
+    })
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = service.router();
+    let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let endpoint = format!("{url}/api/v1/jobs");
+    assert_eq!(
+        client.get(&endpoint).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let body = r#"{"region":"jp","profile":"verify","operation":"verify"}"#;
+    let response = client
+        .post(&endpoint)
+        .bearer_auth("service-only-token")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let queued: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .body(body.replace("jp", "en"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .body(body.replace("verify\"}", "update\"}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let cancel = format!("{endpoint}/{}/cancel", queued.id);
+    let cancelled: Job = sonic_rs::from_str(
+        &client
+            .post(cancel)
+            .bearer_auth("service-only-token")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancelled.status, Status::Cancelled);
+    let response = client
+        .post(format!("{endpoint}/{}/retry", queued.id))
+        .bearer_auth("service-only-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let workers = tokio::spawn(async move { service.run_workers(rx).await });
+    let complete = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let text = client
+                .get(format!("{endpoint}/{}", job.id))
+                .bearer_auth("service-only-token")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!text.contains("service-only-token") && !text.contains("cdn-fixture"));
+            let job: Job = sonic_rs::from_str(&text).unwrap();
+            if job.status.terminal() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(complete.status, Status::Completed);
+    assert!(directory
+        .path()
+        .join("jobs/jp")
+        .join(&job.id)
+        .join("verification.json")
+        .is_file());
+    stop.send(true).unwrap();
+    workers.await.unwrap().unwrap();
+    http.abort();
+}

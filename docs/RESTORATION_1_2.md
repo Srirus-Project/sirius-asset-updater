@@ -41,3 +41,5 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Implementation begins with the updater's durable job lifecycle and service orchestration; API restoration follows against the same ledger.
 
 - Updater durable job ledger implemented and five lifecycle tests passed: restart interruption, exclusive state ownership, queue/retention bounds, per-region scheduling, cancellation acknowledgement, storage failure atomicity and reserved-region rejection. HTTP and pipeline integration remain pending; this does not satisfy the service gate yet.
+
+- User requires category investigation before adapting filters. Verified Sirius catalog labels: InitialDownload, Everything, MV; use native key/dependency membership, not Sekai start_app/on_demand. Everything is a subset of full catalog (JP baseline: 13,364 versus 13,367 remote files). Exact tutorial/runtime required-address composition remains unverified; no invented preset.
