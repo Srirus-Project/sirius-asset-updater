@@ -2,7 +2,11 @@ use sirius_asset_updater::{CatalogClient, Config, Error};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let path = if args.len() == 2 && matches!(args[0].as_str(), "serve" | "export" | "publish") {
+    let path = if args.len() == 2
+        && matches!(
+            args[0].as_str(),
+            "serve" | "export" | "publish" | "plan-storage"
+        ) {
         Some(std::path::PathBuf::from(&args[1]))
     } else if args.is_empty() || args == ["check"] || args == ["probe"] {
         Some(std::path::PathBuf::from(
@@ -43,10 +47,18 @@ async fn run() -> Result<(), Error> {
     if args.len() == 2 && args[0] == "serve" {
         return sirius_asset_updater::service::run_file(std::path::Path::new(&args[1])).await;
     }
-    if args.len() == 2 && args[0] == "publish" {
+    if args.len() == 2 && matches!(args[0].as_str(), "publish" | "plan-storage") {
         let config: sirius_asset_updater::storage::Command =
             yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
                 .map_err(|_| Error::Config)?;
+        if args[0] == "plan-storage" {
+            println!(
+                "{}",
+                sonic_rs::to_string_pretty(&config.storage.plan(config.region)?)
+                    .map_err(|_| Error::Verification)?
+            );
+            return Ok(());
+        }
         let publication = config.storage.run(&config.input, config.region).await?;
         println!(
             "{}",
@@ -72,7 +84,7 @@ async fn run() -> Result<(), Error> {
         };
     }
     if args == ["--help"] {
-        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG | plan-storage CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
         return Ok(());
     }
     if args.len() == 3 && args[0] == "verify-export" {
@@ -120,7 +132,7 @@ async fn run() -> Result<(), Error> {
     }
     if !args.is_empty() && args != ["check"] && args != ["probe"] {
         eprintln!(
-            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG]"
+            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG | plan-storage CONFIG]"
         );
         return Err(Error::Config);
     }

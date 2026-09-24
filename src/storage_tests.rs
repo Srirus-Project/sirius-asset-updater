@@ -15,6 +15,7 @@ fn local(directory: PathBuf) -> Provider {
     Provider {
         name: "local".into(),
         prefix: "assets".into(),
+        public_base_url: None,
         backend: Backend::Local { directory },
     }
 }
@@ -237,6 +238,7 @@ async fn server() -> Server {
     let config = config(Provider {
         name: "s3".into(),
         prefix: "assets".into(),
+        public_base_url: None,
         backend: Backend::S3 {
             endpoint,
             path_style: true,
@@ -606,4 +608,53 @@ async fn s3_public_read_rules_apply_to_uploads_and_markers() {
         .unwrap()
         .keys()
         .any(|key| key.ends_with("complete.json")));
+}
+
+#[tokio::test]
+async fn storage_plan_and_publication_urls_share_region_scoped_targets_without_writes() {
+    let source = fixture();
+    let destination = tempfile::tempdir().unwrap();
+    let missing = destination.path().join("not-created-by-plan");
+    let mut provider = local(missing.clone());
+    provider.public_base_url = Some("https://cdn.example/root%20path/".into());
+    let mut config = config(provider);
+    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+        let plan = config.plan(region).unwrap();
+        let target = &plan.providers[0];
+        assert!(plan.preview);
+        assert_eq!(
+            target.public_url.as_deref(),
+            Some(format!("https://cdn.example/root%20path/{}/", target.prefix).as_str())
+        );
+        assert!(target
+            .prefix
+            .starts_with(&format!("assets/{}/publications/", region.name())));
+        assert!(!missing.exists());
+        let json = sonic_rs::to_string(&plan).unwrap();
+        assert!(!json.contains("directory") && !json.contains("backend"));
+    }
+    assert!(config.plan(Region::Cn).is_err());
+    let (_tx, rx) = watch::channel(false);
+    let publication = config.publish(source.path(), Region::Jp, rx).await.unwrap();
+    let target = &publication.providers[0];
+    assert_eq!(
+        target.public_url.as_deref(),
+        Some(format!("https://cdn.example/root%20path/{}/", target.prefix).as_str())
+    );
+    assert!(missing.join(&target.prefix).join("complete.json").is_file());
+    for invalid in [
+        "http://cdn.example",
+        "https://user:secret@cdn.example",
+        "https://cdn.example/?token=secret",
+        "https://cdn.example/#secret",
+        "https://cdn.example/ space",
+        "file:///tmp/assets",
+    ] {
+        config.providers[0].public_base_url = Some(invalid.into());
+        assert!(config.plan(Region::Jp).is_err());
+    }
+    config.providers[0].public_base_url = None;
+    assert!(!sonic_rs::to_string(&config.plan(Region::Jp).unwrap())
+        .unwrap()
+        .contains("public_url"));
 }

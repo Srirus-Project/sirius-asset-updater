@@ -55,6 +55,8 @@ pub struct Provider {
     pub name: String,
     #[serde(default = "prefix")]
     pub prefix: String,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     pub backend: Backend,
 }
 fn path_style() -> bool {
@@ -129,6 +131,15 @@ pub struct Publication {
 pub struct Target {
     pub name: String,
     pub prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+}
+#[derive(Serialize)]
+pub struct Plan {
+    pub preview: bool,
+    pub region: Region,
+    pub example_publication_id: String,
+    pub providers: Vec<Target>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,6 +190,7 @@ impl Config {
         let mut names = HashSet::new();
         for p in &self.providers {
             p.public_read_policy()?;
+            p.public_base()?;
             if !component(&p.name)
                 || !names.insert(&p.name)
                 || p.prefix.len() > 512
@@ -244,6 +256,24 @@ impl Config {
         }
         Ok(())
     }
+    pub fn plan(&self, region: Region) -> Result<Plan, Error> {
+        if region == Region::Cn {
+            return Err(Error::ReservedRegion);
+        }
+        self.validate()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let providers = self
+            .providers
+            .iter()
+            .map(|p| p.target(region, &id))
+            .collect::<Result<_, _>>()?;
+        Ok(Plan {
+            preview: true,
+            region,
+            example_publication_id: id,
+            providers,
+        })
+    }
     pub async fn run(&self, input: &Path, region: Region) -> Result<Publication, Error> {
         let (tx, rx) = watch::channel(false);
         let work = self.publish(input, region, rx);
@@ -280,16 +310,8 @@ impl Config {
             } else {
                 None
             };
-            let prefix = format!("{}/{}/publications/{id}", provider.prefix, region.name());
-            operators.push((
-                op,
-                public_op,
-                policy,
-                Target {
-                    name: provider.name.clone(),
-                    prefix,
-                },
-            ));
+            let target = provider.target(region, &id)?;
+            operators.push((op, public_op, policy, target));
         }
         let mut total_bytes = 0_u64;
         let mut total_files = 0_usize;
@@ -567,6 +589,42 @@ async fn check_remote(op: &Operator, key: &str, bytes: u64, hash: &str) -> Resul
     Ok(())
 }
 impl Provider {
+    fn public_base(&self) -> Result<Option<reqwest::Url>, Error> {
+        let Some(value) = &self.public_base_url else {
+            return Ok(None);
+        };
+        let url = reqwest::Url::parse(value).map_err(|_| Error::Config)?;
+        if value.len() > 2048
+            || value.chars().any(char::is_whitespace)
+            || value.contains('\\')
+            || url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Error::Config);
+        }
+        Ok(Some(url))
+    }
+    fn target(&self, region: Region, id: &str) -> Result<Target, Error> {
+        let prefix = format!("{}/{}/publications/{id}", self.prefix, region.name());
+        let public_url = self.public_base()?.map(|mut url| {
+            url.path_segments_mut()
+                .expect("validated HTTPS URL")
+                .pop_if_empty()
+                .extend(prefix.split('/'))
+                .push("");
+            url.to_string()
+        });
+        Ok(Target {
+            name: self.name.clone(),
+            prefix,
+            public_url,
+        })
+    }
+
     fn public_read_policy(&self) -> Result<PublicReadPolicy, Error> {
         match &self.backend {
             Backend::S3 {

@@ -21,7 +21,7 @@ Original `src/core/storage.rs` and `src/core/config/schema.rs` expose additional
 | Streaming upload, concurrency, retry, upload-before-cleanup | Implemented with read-back verification | Fine upload progress and production resource tests |
 | Path-style / virtual-host-style S3 addressing | Explicit path_style, legacy default true; both signed request targets tested | Production endpoint acceptance |
 | S3 public-read policy and per-file include/exclude rules | Explicit opt-in with exclusion precedence; write/multipart/marker tests | Production bucket-policy acceptance |
-| Public base URL / planned storage target information | Absent | Connect configured URLs to publication receipts/registry |
+| Public base URL / planned storage target information | Offline target preview and per-provider publication URL receipts | Registry integration and production CDN verification |
 | Region templates in bucket/root/prefix/options | Explicit profile providers plus mandatory region prefix | Audit equivalent multi-region configuration and migration |
 | Generic scalar OpenDAL options | Typed subset only | Map supported non-game options; do not silently accept ignored options |
 

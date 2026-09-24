@@ -1,3 +1,4 @@
+# Preview: sirius-asset-updater plan-storage publish-config.yaml
 # Run: sirius-asset-updater publish publish-config.yaml
 input: ./exports/retained-export
 region: jp

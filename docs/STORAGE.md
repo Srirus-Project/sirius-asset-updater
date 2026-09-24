@@ -19,6 +19,30 @@ redirects. No credentials, endpoints or signed requests appear in publication re
 Local destination roots must not overlap the export tree. Both trees must be owned by the updater
 and immutable to other writers; these checks are not a filesystem security boundary.
 
+## Target preview and public URLs
+
+Run `sirius-asset-updater plan-storage publish-config.yaml` with the same command configuration
+as `publish`. It validates storage configuration and required credential environment variables,
+but does not read the input export, create provider directories or make storage/network requests.
+Configured application logging still applies. JSON output is explicitly marked `preview: true`;
+its `example_publication_id` is illustrative, not a reserved ID or a verified publication.
+It reports provider names, region-scoped key prefixes and optional public URLs, without backend
+credentials, origin endpoints or local directory paths. Reserved CN fails before planning.
+
+Each provider may set `public_base_url`, an HTTPS URL rooted at its bucket/filesystem root as
+served by your CDN. It supports a path prefix and rejects userinfo, query strings and fragments.
+The publication's provider receipt then includes `public_url`, formed by appending the complete
+`PREFIX/REGION/publications/UUID/` key prefix to that base. The trailing slash allows consumers
+to append URL-encoded relative object paths (including `complete.json`). Omitted configuration
+omits the field. For example, base `https://cdn.example/storage/` with prefix `assets` produces
+`https://cdn.example/storage/assets/jp/publications/UUID/`.
+
+This URL is configured routing information, not proof of anonymous availability. No CDN probe
+or public-access change is performed; configure matching CDN paths and ACL/bucket policies.
+Sirius profiles use explicit provider URLs rather than interpolating Sekai region templates;
+the region is always added to the immutable publication key by the updater. Mutable publication
+registries and notifications remain separate restoration work.
+
 ## S3 public-read policy
 
 S3 providers accept `public_read` (default false), `public_read_include` and
@@ -85,5 +109,5 @@ Do not delete prefixes merely because an active transfer has not written a marke
   export. Once verified cleanup begins it runs to completion without cancellation; a filesystem
   deletion error can leave a partially removed local tree, while all remote copies are complete.
 
-This restores the local/S3 publication path. Publication URLs, mutable registries,
+This restores the local/S3 publication path. Mutable registries,
 notifications, scheduling and production storage acceptance remain in the restoration audit.

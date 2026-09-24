@@ -7,6 +7,7 @@ providers:
       directory: ./published-assets
   # - name: s3
   #   prefix: assets
+  #   public_base_url: https://cdn.example.com/ # optional bucket-root URL
   #   backend:
   #     type: s3
   #     endpoint: https://s3.example.com
