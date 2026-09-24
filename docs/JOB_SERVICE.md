@@ -43,6 +43,29 @@ new work each time and does not inherit or accept this submission idempotency co
 A submission key does not pin a catalog version: `update` still obtains and validates the current
 snapshot when it executes. An owner integration must reconcile the resulting receipt identity.
 
+Successful new jobs include an `outcome` saved in the same ledger transaction as `completed`:
+
+- `verification`: verified catalog SHA-256, receipt environment/resource version/platform hash,
+  region/platform, full-catalog scope and verified input counters.
+- `export`: null when no export ran; otherwise full-export scope, final local-retention state,
+  output file count and output bytes. Validation-only export is not retained publication.
+- `publication_id`: null when no storage publication ran; otherwise the UUID of the verified
+  storage publication described by the job's `publication.json`.
+
+Queued/running/failed/cancelled jobs have no outcome. An interrupted worker cannot leave a
+successful outcome; ledger write failure cannot acknowledge completion. Older completed records
+without this field remain readable but cannot prove catalog identity for automated reconciliation.
+Export catalog digest, region, platform and full-catalog scope must match the earlier input
+verification before the pipeline can complete. A successful subset or catalog-only job remains a
+subset: consumers must check `verification.full_catalog`, `export.full_export` and the requested
+retention/publication requirements, rather than trusting `completed` alone.
+
+The result excludes filesystem paths, CDN URLs and credential references. Version labels come
+from the verified local receipt; offline verification is not an independent assertion that the
+server currently advertises that version. Trigger owners must compare the outcome with their
+requested region/environment/platform/resource version/platform hash and reconcile newer work.
+The publication UUID identifies a receipt; it does not provide a public download URL.
+
 Outputs are separated under `output_directory/<region>/<job-id>/`. Download output and export
 input/output paths are set by the service; other pipeline options come from the configured files.
 Use `assets` in the download configuration to request all remote resources. Omitting it remains

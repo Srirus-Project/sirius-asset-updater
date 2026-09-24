@@ -1,6 +1,9 @@
 //! Authenticated, bounded job service around the Sirius pipeline.
 use crate::{
-    jobs::{Job, JobError, JobStore, Limits, Operation, Progress, Request, Status},
+    jobs::{
+        ExportOutcome, Job, JobError, JobStore, Limits, Operation, Outcome, Progress, Request,
+        Status,
+    },
     region::Region,
     Error,
 };
@@ -227,14 +230,14 @@ impl Service {
                                     std::panic::AssertUnwindSafe(service.execute(&job, tx, rx))
                                         .catch_unwind()
                                         .await;
-                                let code = match result {
-                                    Ok(Ok(())) => None,
-                                    Ok(Err(Error::JobTimeout)) => Some("job_timeout"),
-                                    Ok(Err(Error::Cancelled)) => Some("cancelled"),
-                                    Ok(Err(_)) => Some("pipeline_failed"),
-                                    Err(_) => Some("worker_panicked"),
+                                let (code, outcome) = match result {
+                                    Ok(Ok(outcome)) => (None, Some(outcome)),
+                                    Ok(Err(Error::JobTimeout)) => (Some("job_timeout"), None),
+                                    Ok(Err(Error::Cancelled)) => (Some("cancelled"), None),
+                                    Ok(Err(_)) => (Some("pipeline_failed"), None),
+                                    Err(_) => (Some("worker_panicked"), None),
                                 };
-                                (job.id, code)
+                                (job.id, code, outcome)
                             });
                         }
                         Ok(None) => break,
@@ -252,9 +255,9 @@ impl Service {
             }
             tokio::select! {
                 value=tasks.join_next(),if !tasks.is_empty()=>{
-                    if let Some(Ok((id,code)))=value {
+                    if let Some(Ok((id,code,outcome)))=value {
                         controls.remove(&id);
-                        match self.inner.store.lock().await.finish(&id,code) {
+                        match self.inner.store.lock().await.finish_with_outcome(&id,code,outcome) {
                             Ok(job) => {
                                 if job.status == Status::Failed { tracing::warn!(job_id=%job.id, region=job.request.region.name(), status=?job.status, error_code=job.failure.as_deref(), "Job ended"); }
                                 else { tracing::info!(job_id=%job.id, region=job.request.region.name(), status=?job.status, "Job ended"); }
@@ -280,7 +283,7 @@ impl Service {
         job: &Job,
         stop: watch::Sender<bool>,
         receiver: watch::Receiver<bool>,
-    ) -> Result<(), Error> {
+    ) -> Result<Outcome, Error> {
         let work = self.pipeline(job, stop.clone(), receiver);
         tokio::pin!(work);
         tokio::select! {
@@ -311,7 +314,7 @@ impl Service {
         job: &Job,
         cancel: watch::Sender<bool>,
         mut stop: watch::Receiver<bool>,
-    ) -> Result<(), Error> {
+    ) -> Result<Outcome, Error> {
         if *stop.borrow() {
             return Err(Error::Cancelled);
         }
@@ -357,6 +360,11 @@ impl Service {
         )
         .await
         .map_err(|_| Error::Io)?;
+        let mut outcome = Outcome {
+            verification: verified.clone(),
+            export: None,
+            publication_id: None,
+        };
         let mut final_progress = Progress {
             phase: "verify".into(),
             completed: verified.asset_files_verified as u64 + 1,
@@ -405,6 +413,20 @@ impl Service {
                 if !summary.complete || summary.failed > 0 {
                     return Err(Error::Verification);
                 }
+                // Export must describe the catalog already verified by this job.
+                if summary.catalog_sha256 != verified.catalog_sha256
+                    || summary.region != verified.region
+                    || summary.platform != verified.platform
+                    || summary.full_catalog != verified.full_catalog
+                {
+                    return Err(Error::Verification);
+                }
+                outcome.export = Some(ExportOutcome {
+                    full_export: summary.full_export,
+                    retained: summary.retained,
+                    files: summary.output_files,
+                    bytes: summary.output_bytes,
+                });
                 if summary.retained {
                     self.phase(&job.id, "verify_export").await?;
                     let report = tokio::select! {
@@ -436,6 +458,12 @@ impl Service {
                         )
                         .await
                         .map_err(|_| Error::Io)?;
+                        outcome.publication_id = Some(publication.id.clone());
+                        if publication.local_removed {
+                            if let Some(export) = &mut outcome.export {
+                                export.retained = false;
+                            }
+                        }
                         final_progress = Progress {
                             phase: "publish".into(),
                             completed: publication.files as u64,
@@ -456,7 +484,7 @@ impl Service {
             .await
             .progress(&job.id, final_progress)
             .map_err(|_| Error::Io)?;
-        Ok(())
+        Ok(outcome)
     }
 }
 fn read_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {

@@ -1,19 +1,23 @@
 //! Offline receipt verification; never follows asset symlinks or contacts a server.
 use crate::{assets::Provider, catalog::Catalog, Error, Receipt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 use tokio::io::AsyncReadExt;
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Verification {
     pub full_catalog: bool,
     pub catalog_remote_files: usize,
     pub catalog_verified: bool,
     pub region: crate::region::Region,
     pub platform: String,
+    pub environment: String,
+    pub resource_version: String,
+    pub platform_hash: String,
+    pub catalog_sha256: String,
     pub asset_files_verified: usize,
     pub asset_bytes_verified: u64,
     pub planned_remote_files: usize,
@@ -126,6 +130,10 @@ pub async fn verify(directory: &Path) -> Result<Verification, Error> {
         catalog_verified: true,
         region,
         platform: receipt.snapshot.platform.clone(),
+        environment: receipt.snapshot.environment.clone(),
+        resource_version: receipt.snapshot.resource_version.clone(),
+        platform_hash: receipt.snapshot.platform_hash.clone(),
+        catalog_sha256: receipt.sha256.clone(),
         asset_files_verified: 0,
         asset_bytes_verified: 0,
         planned_remote_files: plan.assets.len(),

@@ -1500,6 +1500,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
         jobs::{Job, Status},
         service::{Profile, Service, ServiceConfig},
     };
+    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
     let directory = tempfile::tempdir().unwrap();
     let mut cfg = config();
     cfg.output = directory.path().join("input");
@@ -1669,6 +1670,25 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     .await
     .unwrap();
     assert_eq!(complete.status, Status::Completed);
+    let outcome = complete.outcome.as_ref().unwrap();
+    assert_eq!(
+        outcome.verification.catalog_sha256,
+        hex::encode(Sha256::digest(catalog()))
+    );
+    assert_eq!(outcome.verification.region, region::Region::Jp);
+    assert!(!outcome.verification.full_catalog); // This fixture is catalog-only.
+    assert!(outcome.export.is_none() && outcome.publication_id.is_none());
+    assert!(queued.outcome.is_none() && cancelled.outcome.is_none());
+    let persisted: sonic_rs::Value =
+        sonic_rs::from_slice(&std::fs::read(directory.path().join("state/jobs.json")).unwrap())
+            .unwrap();
+    assert!(persisted["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|j| j["id"].as_str() == Some(complete.id.as_str())
+            && j["outcome"]["verification"]["catalog_sha256"].as_str()
+                == Some(outcome.verification.catalog_sha256.as_str())));
     assert_eq!(complete.progress.phase, "verify");
     assert_eq!(Some(complete.progress.completed), complete.progress.total);
     assert!(complete.progress.completed > 0);
@@ -2230,10 +2250,19 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         let wav = std::fs::read(output.join("00000/00000.wav")).unwrap();
         let receipt = output.parent().unwrap().join("publication.json");
         if failed {
+            assert!(finished.outcome.is_none());
             assert!(!receipt.exists());
         } else {
             let value: sonic_rs::Value =
                 sonic_rs::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+            let outcome = finished.outcome.as_ref().unwrap();
+            assert_eq!(outcome.verification.catalog_sha256, summary.catalog_sha256);
+            assert!(outcome.verification.full_catalog);
+            let exported = outcome.export.as_ref().unwrap();
+            assert!(exported.full_export && exported.retained);
+            assert_eq!(exported.files, summary.output_files);
+            assert_eq!(exported.bytes, summary.output_bytes);
+            assert_eq!(outcome.publication_id.as_deref(), value["id"].as_str());
             let prefix = value["providers"][0]["prefix"].as_str().unwrap();
             assert_eq!(
                 std::fs::read(destination.join(prefix).join("00000/00000.wav")).unwrap(),

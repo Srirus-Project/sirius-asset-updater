@@ -21,8 +21,10 @@ same version. Native Sirius label selection remains documented in SELECTION.md.
 The updater's durable job submission supports optional idempotency keys. Concurrent retries,
 queue saturation and restart retain the same acknowledged job identity while its record is
 retained. See JOB_SERVICE.md for the exact boundary, terminal-job behavior and retention limit.
-This is infrastructure for reliable dispatch, not a claim that owner-to-updater integration is
-already complete.
+Successful jobs also persist a credential-free catalog/export/publication outcome atomically with
+completion. API consumers can reconcile actual processed identity and scope without access to the
+updater filesystem. This is infrastructure for reliable dispatch, not a claim that owner-to-updater
+integration is already complete.
 
 ## Remaining owner integration
 

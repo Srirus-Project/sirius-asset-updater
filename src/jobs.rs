@@ -65,6 +65,20 @@ pub struct Progress {
     pub total: Option<u64>,
     pub bytes: u64,
 }
+/// Present only after the complete configured pipeline succeeds.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Outcome {
+    pub verification: crate::verify::Verification,
+    pub export: Option<ExportOutcome>,
+    pub publication_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExportOutcome {
+    pub full_export: bool,
+    pub retained: bool,
+    pub files: usize,
+    pub bytes: u64,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Job {
     pub id: String,
@@ -76,6 +90,8 @@ pub struct Job {
     /// Stable sanitized error code, never a raw upstream response or secret-bearing log.
     pub failure: Option<String>,
     pub retry_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
     /// Digest only: the raw caller key is never stored or returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_sha256: Option<String>,
@@ -144,6 +160,7 @@ impl JobStore {
             }
             if job.status.occupies_slot() {
                 job.status = Status::Failed;
+                job.outcome = None;
                 job.failure = Some("service_interrupted".into());
                 job.updated_at = Utc::now();
             }
@@ -221,6 +238,7 @@ impl JobStore {
             progress: Progress::default(),
             failure: None,
             retry_of,
+            outcome: None,
             idempotency_sha256,
         };
         let mut ledger = self.ledger.clone();
@@ -295,12 +313,26 @@ impl JobStore {
     }
     /// Called only after the worker (including media subprocesses) has stopped.
     pub fn finish(&mut self, id: &str, failure_code: Option<&str>) -> Result<Job, JobError> {
+        self.finish_with_outcome(id, failure_code, None)
+    }
+    pub fn finish_with_outcome(
+        &mut self,
+        id: &str,
+        failure_code: Option<&str>,
+        outcome: Option<Outcome>,
+    ) -> Result<Job, JobError> {
         if failure_code.is_some_and(|s| {
             s.is_empty() || s.len() > 64 || !s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
         }) {
             return Err(JobError::Invalid);
         }
         self.mutate(id, |job| {
+            if outcome
+                .as_ref()
+                .is_some_and(|o| o.verification.region != job.request.region)
+            {
+                return Err(JobError::Invalid);
+            }
             job.status = match job.status {
                 Status::Cancelling => Status::Cancelled,
                 Status::Running if failure_code.is_some() || job.progress.failed > 0 => {
@@ -308,6 +340,11 @@ impl JobStore {
                 }
                 Status::Running => Status::Completed,
                 _ => return Err(JobError::Conflict),
+            };
+            job.outcome = if job.status == Status::Completed {
+                outcome
+            } else {
+                None
             };
             job.failure = if job.status == Status::Failed {
                 Some(failure_code.unwrap_or("partial_failure").into())
@@ -505,6 +542,90 @@ mod tests {
             JobStore::open(d.path(), limits),
             Err(JobError::Storage)
         ));
+    }
+    #[test]
+    fn outcome_is_atomic_with_completion_and_absent_on_cancel_failure_and_retry() {
+        let d = tempfile::tempdir().unwrap();
+        let mut store = JobStore::open(d.path(), limits()).unwrap();
+        let outcome = Outcome {
+            verification: crate::verify::Verification {
+                full_catalog: false,
+                catalog_remote_files: 0,
+                catalog_verified: true,
+                region: Region::Jp,
+                platform: "iOS".into(),
+                environment: "production".into(),
+                resource_version: "catalog-1".into(),
+                platform_hash: "hash-1".into(),
+                catalog_sha256: "a".repeat(64),
+                asset_files_verified: 0,
+                asset_bytes_verified: 0,
+                planned_remote_files: 0,
+                embedded_locations: 0,
+                decrypted_bundles: 0,
+            },
+            export: None,
+            publication_id: None,
+        };
+        for failure in [false, true] {
+            let job = store.submit(request(Region::Jp)).unwrap();
+            store.claim().unwrap();
+            if !failure {
+                store.cancel(&job.id).unwrap();
+            }
+            let ended = store
+                .finish_with_outcome(
+                    &job.id,
+                    failure.then_some("pipeline_failed"),
+                    Some(outcome.clone()),
+                )
+                .unwrap();
+            assert!(ended.outcome.is_none());
+            assert_eq!(
+                ended.status,
+                if failure {
+                    Status::Failed
+                } else {
+                    Status::Cancelled
+                }
+            );
+            let retry = store.retry(&job.id).unwrap();
+            assert!(retry.outcome.is_none());
+            store.cancel(&retry.id).unwrap();
+        }
+        let job = store.submit(request(Region::Jp)).unwrap();
+        store.claim().unwrap();
+        let mut wrong = outcome.clone();
+        wrong.verification.region = Region::En;
+        assert!(matches!(
+            store.finish_with_outcome(&job.id, None, Some(wrong)),
+            Err(JobError::Invalid)
+        ));
+        fs::remove_file(d.path().join("jobs.json")).unwrap();
+        fs::create_dir(d.path().join("jobs.json")).unwrap();
+        assert!(matches!(
+            store.finish_with_outcome(&job.id, None, Some(outcome.clone())),
+            Err(JobError::Storage)
+        ));
+        assert_eq!(store.get(&job.id).unwrap().status, Status::Running);
+        assert!(store.get(&job.id).unwrap().outcome.is_none());
+        fs::remove_dir(d.path().join("jobs.json")).unwrap();
+        store
+            .finish_with_outcome(&job.id, None, Some(outcome))
+            .unwrap();
+        drop(store);
+        let store = JobStore::open(d.path(), limits()).unwrap();
+        let restored = store.get(&job.id).unwrap();
+        assert_eq!(restored.status, Status::Completed);
+        assert_eq!(
+            restored
+                .outcome
+                .as_ref()
+                .unwrap()
+                .verification
+                .catalog_sha256,
+            "a".repeat(64)
+        );
     }
     #[test]
     fn cancellation_holds_region_and_slot_until_worker_exit() {
