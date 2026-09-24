@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 — prepared, not published
+## 1.0.0
 
 - Initial public-release candidate for BanG Dream! Our Notes.
 - Replace the pre-release Viola codename with Sirius configuration filenames,
