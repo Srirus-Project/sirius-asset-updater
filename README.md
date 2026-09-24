@@ -112,3 +112,5 @@ Exit code 0 means success, 1 means failure, and 130 means cancellation.
 See [deployment checks](docs/DEPLOYMENT_CHECKS.md), [architecture](docs/ARCHITECTURE.md)
 and [release preparation](docs/RELEASING.md). Repository visibility and workflow activation
 are separate operations from release preparation.
+
+For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).

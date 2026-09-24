@@ -30,6 +30,8 @@ use tokio::sync::{watch, Mutex, Notify};
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub tls: Option<crate::server::TlsConfig>,
     pub token_env: String,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
@@ -86,6 +88,9 @@ struct Inner {
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
+        if let Some(tls) = &config.tls {
+            tls.validate().map_err(|_| Error::Config)?;
+        }
         if config.profiles.is_empty()
             || config.max_concurrent_jobs == 0
             || config.max_concurrent_jobs > 64
@@ -484,6 +489,12 @@ async fn retry(State(service): State<Service>, HttpPath(id): HttpPath<String>) -
 pub async fn run_file(path: &Path) -> Result<(), Error> {
     let config: ServiceConfig = read_yaml(path)?;
     let listen = config.listen;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(crate::server::TlsConfig::load)
+        .transpose()
+        .map_err(|_| Error::Config)?;
     let service = Service::open(config)?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -492,10 +503,9 @@ pub async fn run_file(path: &Path) -> Result<(), Error> {
     let worker = service.clone();
     let mut workers = tokio::spawn(async move { worker.run_workers(rx).await });
     let mut http_stop = tx.subscribe();
-    let http = axum::serve(listener, service.router()).with_graceful_shutdown(async move {
+    let http = crate::server::serve(listener, service.router(), tls, async move {
         cancelled(&mut http_stop).await;
     });
-    let http = std::future::IntoFuture::into_future(http);
     tokio::pin!(http);
     tokio::select! {
         result=&mut http=>{let _=tx.send(true);workers.await.map_err(|_|Error::Io)??;result.map_err(|_|Error::Io)},
@@ -569,6 +579,7 @@ mod lifecycle_tests {
         });
         std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
         let config = ServiceConfig {
+            tls: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             token_env: env,
             state_directory: root.path().join("ledger"),

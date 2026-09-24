@@ -15,3 +15,9 @@ profiles:
     export_config: ./export-config.yaml
     # Optional verified publication for standalone export/verify operations:
     # input: ./downloads/catalogs/PUBLISHED_DIRECTORY
+
+# Optional HTTPS listener; see docs/LISTENER_TLS.md. Restart after certificate renewal.
+# tls:
+#   certificate_file: /etc/sirius/tls/fullchain.pem
+#   private_key_file: /etc/sirius/tls/key.pem
+#   handshake_timeout_ms: 10000

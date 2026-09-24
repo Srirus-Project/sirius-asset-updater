@@ -1508,6 +1508,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     let env = format!("SERVICE_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&env, "service-only-token");
     let service = Service::open(ServiceConfig {
+        tls: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         token_env: env,
         state_directory: directory.path().join("state"),
@@ -2073,6 +2074,7 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
     let yaml = format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {key}\nffmpeg: {:?}\ncache_directory: {:?}\n", std::env::var("SIRIUS_TEST_FFMPEG").unwrap(), cache);
     std::fs::write(&export, yaml).unwrap();
     let config = || ServiceConfig {
+        tls: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         token_env: token.clone(),
         state_directory: directory.path().join("state"),
@@ -2154,4 +2156,221 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
     }
     std::env::remove_var(token);
     std::env::remove_var(key);
+}
+
+fn listener_tls_config(root: &std::path::Path) -> crate::server::TlsConfig {
+    let cert = root.join("cert.pem");
+    let key = root.join("key.pem");
+    std::fs::write(&cert, include_bytes!("../tests/fixtures/listener-cert.pem")).unwrap();
+    std::fs::write(&key, include_bytes!("../tests/fixtures/listener-key.pem")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    crate::server::TlsConfig {
+        certificate_file: cert,
+        private_key_file: key,
+        handshake_timeout_ms: 100,
+    }
+}
+#[test]
+fn listener_tls_rejects_invalid_mismatched_oversized_and_unsafe_key_files() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = listener_tls_config(root.path());
+    assert!(cfg.load().is_ok());
+    cfg.handshake_timeout_ms = 0;
+    assert!(cfg.load().is_err());
+    cfg.handshake_timeout_ms = 100;
+    std::fs::write(
+        &cfg.certificate_file,
+        include_bytes!("../tests/fixtures/listener-other-cert.pem"),
+    )
+    .unwrap();
+    assert!(cfg.load().is_err()); // Valid PEM, but its public key does not match.
+    std::fs::write(
+        &cfg.certificate_file,
+        include_bytes!("../tests/fixtures/listener-cert.pem"),
+    )
+    .unwrap();
+    std::fs::write(&cfg.private_key_file, b"invalid private key").unwrap();
+    let error = cfg.load().err().unwrap().to_string();
+    assert!(
+        !error.contains("invalid private key") && !error.contains(root.path().to_str().unwrap())
+    );
+    std::fs::write(&cfg.private_key_file, vec![b'x'; 128 * 1024 + 1]).unwrap();
+    assert!(cfg.load().is_err());
+    let cfg = listener_tls_config(root.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &cfg.private_key_file,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(cfg.load().is_err());
+        std::fs::set_permissions(
+            &cfg.private_key_file,
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        assert!(cfg.load().is_ok());
+    }
+    std::fs::remove_file(&cfg.private_key_file).unwrap();
+    assert!(cfg.load().is_err());
+}
+#[tokio::test]
+async fn https_listener_preserves_auth_http2_peer_address_and_graceful_shutdown() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let cfg = listener_tls_config(root.path());
+    let tls = cfg.load().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_entered = entered.clone();
+    let handler_release = release.clone();
+    let router = axum::Router::new()
+        .route(
+            "/slow",
+            axum::routing::get(move || {
+                let entered = handler_entered.clone();
+                let release = handler_release.clone();
+                async move {
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    "drained"
+                }
+            }),
+        )
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/private",
+            axum::routing::get(
+                |headers: axum::http::HeaderMap,
+                 axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| async move {
+                    if headers
+                        .get("authorization")
+                        .is_some_and(|v| v == "Bearer listener-test")
+                    {
+                        (axum::http::StatusCode::OK, peer.ip().to_string())
+                    } else {
+                        (axum::http::StatusCode::UNAUTHORIZED, "unauthorized".into())
+                    }
+                },
+            ),
+        );
+    let (stop, signal) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(crate::server::serve(listener, router, Some(tls), async {
+        let _ = signal.await;
+    }));
+    let certificate =
+        reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/listener-cert.pem"))
+            .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .tls_certs_only([certificate])
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("https://{address}");
+    assert_eq!(
+        client
+            .get(format!("{url}/health"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        client
+            .get(format!("{url}/private"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let response = client
+        .get(format!("{url}/private"))
+        .bearer_auth("listener-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.text().await.unwrap(), "127.0.0.1");
+    let untrusted = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    assert!(untrusted.get(format!("{url}/health")).send().await.is_err());
+    assert!(client
+        .get(format!("http://{address}/health"))
+        .send()
+        .await
+        .is_err());
+    // A silent TCP peer cannot occupy a TLS handshake indefinitely.
+    let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    let request = client.get(format!("{url}/slow"));
+    let pending = tokio::spawn(async move { request.send().await.unwrap().text().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!task.is_finished(), "shutdown must drain an active request");
+    release.add_permits(1);
+    assert_eq!(pending.await.unwrap(), "drained");
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+#[tokio::test]
+async fn plain_listener_remains_available_without_tls_configuration() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, signal) = tokio::sync::oneshot::channel();
+    let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+    let task = tokio::spawn(crate::server::serve(listener, router, None, async {
+        let _ = signal.await;
+    }));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .get(format!("http://{address}/health"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "ok"
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
