@@ -1509,6 +1509,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     std::env::set_var(&env, "service-only-token");
     let service = Service::open(ServiceConfig {
         tls: None,
+        access_log: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         token_env: env,
         state_directory: directory.path().join("state"),
@@ -2075,6 +2076,7 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
     std::fs::write(&export, yaml).unwrap();
     let config = || ServiceConfig {
         tls: None,
+        access_log: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         token_env: token.clone(),
         state_directory: directory.path().join("state"),
@@ -2264,6 +2266,9 @@ async fn https_listener_preserves_auth_http2_peer_address_and_graceful_shutdown(
                 },
             ),
         );
+    let log_path = root.path().join("listener-access.log");
+    let access = crate::access_log::AccessLog::new(access_log_config(log_path.clone())).unwrap();
+    let router = access.wrap(router);
     let (stop, signal) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(crate::server::serve(listener, router, Some(tls), async {
         let _ = signal.await;
@@ -2301,6 +2306,7 @@ async fn https_listener_preserves_auth_http2_peer_address_and_graceful_shutdown(
     let response = client
         .get(format!("{url}/private"))
         .bearer_auth("listener-test")
+        .header("x-forwarded-for", "198.51.100.44")
         .send()
         .await
         .unwrap();
@@ -2345,6 +2351,21 @@ async fn https_listener_preserves_auth_http2_peer_address_and_graceful_shutdown(
         .unwrap()
         .unwrap();
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    drop(access);
+    let raw = std::fs::read_to_string(log_path).unwrap();
+    let rows: Vec<AccessRecord> = raw
+        .lines()
+        .map(|s| sonic_rs::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert!(rows
+        .iter()
+        .all(|r| r.peer_ip.as_deref() == Some("127.0.0.1")));
+    assert!(rows.iter().any(|r| r.status == Some(401)));
+    assert!(rows
+        .iter()
+        .any(|r| r.client_ip.as_deref() == Some("198.51.100.44")));
+    assert!(!raw.contains("listener-test"));
 }
 #[tokio::test]
 async fn plain_listener_remains_available_without_tls_configuration() {
@@ -2373,4 +2394,204 @@ async fn plain_listener_remains_available_without_tls_configuration() {
     );
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+fn access_log_config(path: std::path::PathBuf) -> crate::access_log::Config {
+    crate::access_log::Config {
+        output: crate::access_log::Output::File {
+            path,
+            rotation: crate::access_log::Rotation::Never,
+            max_files: 7,
+        },
+        trusted_proxies: vec![
+            "127.0.0.0/8".into(),
+            "10.0.0.0/8".into(),
+            "::1/128".into(),
+            "fd00::/8".into(),
+        ],
+        ..Default::default()
+    }
+}
+#[derive(serde::Deserialize)]
+struct AccessRecord {
+    request_id: String,
+    method: String,
+    route: String,
+    peer_ip: Option<String>,
+    client_ip: Option<String>,
+    status: Option<u16>,
+    outcome: String,
+}
+#[tokio::test]
+async fn access_log_redacts_identifiers_and_resolves_only_trusted_forwarding_chains() {
+    use tower::ServiceExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("access.log");
+    let log = crate::access_log::AccessLog::new(access_log_config(path.clone())).unwrap();
+    let app = log.wrap(
+        axum::Router::new()
+            .route(
+                "/players/{id}",
+                axum::routing::get(
+                    |axum::Extension(ip): axum::Extension<crate::access_log::ClientIp>| async move {
+                        ip.0.map(|p| p.to_string()).unwrap_or_default()
+                    },
+                ),
+            )
+            .route(
+                "/denied",
+                axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+            ),
+    );
+    let mut ids = vec![];
+    for (peer, forwarded, expected) in [
+        ("203.0.113.9:123", "198.51.100.1", "203.0.113.9"),
+        ("127.0.0.1:123", "198.51.100.1, 10.0.0.2", "198.51.100.1"),
+        (
+            "127.0.0.1:123",
+            "192.0.2.66, 203.0.113.7, 10.0.0.2",
+            "203.0.113.7",
+        ),
+        ("127.0.0.1:123", "unknown, 10.0.0.2", "127.0.0.1"),
+        ("[::ffff:127.0.0.1]:123", "198.51.100.1", "198.51.100.1"),
+        ("[::1]:123", "2001:db8::2, fd00::1", "2001:db8::2"),
+    ] {
+        let mut request = axum::http::Request::get("/players/private-player-id?token=query-secret")
+            .header("authorization", "Bearer secret-token")
+            .header("cookie", "secret-cookie")
+            .header("x-request-id", "attacker-request-id")
+            .header("x-forwarded-for", forwarded)
+            .body(axum::body::Body::from("secret-body"))
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_bytes()
+        );
+    }
+    // Ambiguous repeated forwarding headers are ignored rather than concatenated.
+    let mut request = axum::http::Request::get("/denied")
+        .header("x-forwarded-for", "198.51.100.1")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .headers_mut()
+        .append("x-forwarded-for", "192.0.2.1".parse().unwrap());
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:123".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 401);
+    let request = axum::http::Request::get("/unmatched-secret?token=query-secret")
+        .header("x-forwarded-for", "198.51.100.1")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 404);
+    drop(app);
+    drop(log); // Worker guard flushes queued lines.
+    let raw = std::fs::read_to_string(path).unwrap();
+    for secret in [
+        "private-player-id",
+        "query-secret",
+        "secret-token",
+        "secret-cookie",
+        "secret-body",
+        "attacker-request-id",
+        "unmatched-secret",
+    ] {
+        assert!(!raw.contains(secret));
+    }
+    let rows: Vec<AccessRecord> = raw
+        .lines()
+        .map(|s| sonic_rs::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 8);
+    for (i, row) in rows[..6].iter().enumerate() {
+        assert_eq!(row.request_id, ids[i]);
+        assert!(uuid::Uuid::parse_str(&row.request_id).is_ok());
+        assert_eq!(row.route, "/players/{id}");
+        assert_eq!(row.method, "GET");
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.outcome, "response");
+    }
+    assert_eq!(rows[0].client_ip.as_deref(), Some("203.0.113.9"));
+    assert_eq!(rows[2].client_ip.as_deref(), Some("203.0.113.7"));
+    assert_eq!(rows[4].peer_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rows[6].client_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rows[7].route, "<unmatched>");
+    assert!(rows[7].client_ip.is_none());
+}
+#[tokio::test]
+async fn cancelled_access_request_is_recorded_and_text_files_append() {
+    use tower::ServiceExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("access.log");
+    std::fs::write(&path, "previous\n").unwrap();
+    let mut config = access_log_config(path.clone());
+    config.format = crate::access_log::Format::Text;
+    let log = crate::access_log::AccessLog::new(config).unwrap();
+    let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = entered.clone();
+    let app = log.wrap(axum::Router::new().route(
+        "/pending",
+        axum::routing::get(move || {
+            let signal = signal.clone();
+            async move {
+                signal.add_permits(1);
+                std::future::pending::<()>().await;
+                "unreachable"
+            }
+        }),
+    ));
+    let task = tokio::spawn(
+        app.oneshot(
+            axum::http::Request::get("/pending?ignored-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(log);
+    let lines = std::fs::read_to_string(path).unwrap();
+    assert!(lines.starts_with("previous\n"));
+    assert_eq!(lines.lines().count(), 2);
+    assert!(lines.contains("outcome=cancelled"));
+    assert!(lines.contains("status=-"));
+    assert!(!lines.contains("ignored-secret"));
+}
+#[test]
+fn access_log_configuration_rejects_bad_trust_headers_and_unbounded_queues() {
+    for text in [
+        "queue_capacity: 0",
+        "queue_capacity: 65537",
+        "trusted_proxies: [not-a-cidr]",
+        "proxy_header: authorization",
+        "proxy_header: 'invalid header'",
+        "output: {type: file, path: /, max_files: 7}",
+        "output: {type: file, path: access.log, max_files: 0}",
+    ] {
+        let config: crate::access_log::Config = yaml_serde::from_str(text).unwrap();
+        assert!(config.validate().is_err(), "{text}");
+    }
+    assert!(yaml_serde::from_str::<crate::access_log::Config>(
+        "output: {type: stdout, path: ignored}"
+    )
+    .is_err());
 }

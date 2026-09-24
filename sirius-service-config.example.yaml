@@ -21,3 +21,11 @@ profiles:
 #   certificate_file: /etc/sirius/tls/fullchain.pem
 #   private_key_file: /etc/sirius/tls/key.pem
 #   handshake_timeout_ms: 10000
+
+# Optional access logging. Omitted means disabled. See docs/ACCESS_LOG.md.
+# access_log:
+#   format: json
+#   output: {type: file, path: ./logs/access.log, rotation: daily, max_files: 7}
+#   queue_capacity: 4096
+#   trusted_proxies: [] # only configured CIDRs may supply forwarding headers
+#   proxy_header: x-forwarded-for

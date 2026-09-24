@@ -32,6 +32,8 @@ pub struct ServiceConfig {
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: Option<crate::server::TlsConfig>,
+    #[serde(default)]
+    pub access_log: Option<crate::access_log::Config>,
     pub token_env: String,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
@@ -80,6 +82,7 @@ pub struct Service {
     inner: Arc<Inner>,
 }
 struct Inner {
+    access_log: Option<crate::access_log::AccessLog>,
     config: ServiceConfig,
     token: String,
     store: Mutex<JobStore>,
@@ -125,6 +128,12 @@ impl Service {
         if token.trim().is_empty() || token.contains(['\r', '\n']) {
             return Err(Error::Config);
         }
+        let access_log = config
+            .access_log
+            .clone()
+            .map(crate::access_log::AccessLog::new)
+            .transpose()
+            .map_err(|_| Error::Config)?;
         std::fs::create_dir_all(&config.output_directory).map_err(|_| Error::Io)?;
         let store = JobStore::open(
             &config.state_directory,
@@ -137,6 +146,7 @@ impl Service {
         .map_err(|_| Error::Io)?;
         Ok(Self {
             inner: Arc::new(Inner {
+                access_log,
                 config,
                 token,
                 store: Mutex::new(store),
@@ -152,11 +162,15 @@ impl Service {
             .route("/api/v1/jobs/{id}/cancel", post(cancel))
             .route("/api/v1/jobs/{id}/retry", post(retry))
             .route_layer(middleware::from_fn_with_state(self.clone(), authorize));
-        Router::new()
+        let router = Router::new()
             .route("/health", get(|| async { "ok" }))
             .merge(protected)
             .layer(DefaultBodyLimit::max(8192))
-            .with_state(self.clone())
+            .with_state(self.clone());
+        match &self.inner.access_log {
+            Some(log) => log.wrap(router),
+            None => router,
+        }
     }
     pub async fn run_workers(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
         let mut tasks = tokio::task::JoinSet::new();
@@ -580,6 +594,7 @@ mod lifecycle_tests {
         std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
         let config = ServiceConfig {
             tls: None,
+            access_log: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             token_env: env,
             state_directory: root.path().join("ledger"),

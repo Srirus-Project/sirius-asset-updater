@@ -114,3 +114,5 @@ and [release preparation](docs/RELEASING.md). Repository visibility and workflow
 are separate operations from release preparation.
 
 For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
+
+Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
