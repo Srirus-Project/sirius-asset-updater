@@ -1509,6 +1509,52 @@ mod tests {
             .iter()
             .all(|o| o.object.as_ref().unwrap().class_id == 142));
     }
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_or_timed_out_media_process_is_killed_and_reaped() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::atomic::Ordering,
+            time::{Duration, Instant},
+        };
+        for cancel_requested in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut cfg = config(root.path());
+            let executable = root.path().join("media-fixture");
+            let pid_file = root.path().join("pid");
+            // exec preserves the PID, so the test observes the actual long-running child.
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            cfg.ffmpeg = executable;
+            cfg.media_timeout_seconds = 1;
+            let cancel = cfg.cancel.clone();
+            let started = Instant::now();
+            let worker = std::thread::spawn(move || cfg.ffmpeg(&[]));
+            while !pid_file.exists() {
+                assert!(started.elapsed() < Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if cancel_requested {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            assert!(worker.join().unwrap().is_err());
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid = fs::read_to_string(pid_file).unwrap();
+            assert!(!Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
     // Synthesized 440 Hz PCM, encoded by cridecoder. No game bytes or real keys.
     fn synthetic_acb(key: u64) -> Vec<u8> {
         let samples: Vec<f32> = (0..4096)

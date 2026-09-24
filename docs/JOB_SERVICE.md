@@ -33,7 +33,12 @@ The ledger is persisted before submission is acknowledged. Queue overflow return
 job per region executes at once, with a configurable total execution limit. A running cancellation
 stays `cancelling` until its worker actually exits. Export cancellation waits for active resources
 and bounded media subprocesses; it is not an immediate process kill. Never remove a job's files
-while cancellation is pending. Export progress is read from its summary once per second.
+while cancellation is pending. Export progress is read from its summary once per second; final counts are persisted even for
+short jobs. Verify progress counts the catalog plus the downloaded assets actually verified;
+full-catalog scope remains in verification.json. A job deadline reports `failed` with
+`job_timeout`, distinct from an acknowledged user cancellation. Deadlines send a cancellation
+signal and wait for workers to exit before releasing the region slot. A progress-storage failure
+also signals cancellation and drains the exporter.
 
 SIGINT/SIGTERM stop admission and cancel/drain running workers. Queued jobs survive restart;
 interrupted running jobs become failed and can be retried explicitly. Completed publications

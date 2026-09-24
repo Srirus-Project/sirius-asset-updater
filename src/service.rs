@@ -190,6 +190,7 @@ impl Service {
                                         .await;
                                 let code = match result {
                                     Ok(Ok(())) => None,
+                                    Ok(Err(Error::JobTimeout)) => Some("job_timeout"),
                                     Ok(Err(Error::Cancelled)) => Some("cancelled"),
                                     Ok(Err(_)) => Some("pipeline_failed"),
                                     Err(_) => Some("worker_panicked"),
@@ -235,12 +236,12 @@ impl Service {
         stop: watch::Sender<bool>,
         receiver: watch::Receiver<bool>,
     ) -> Result<(), Error> {
-        let work = self.pipeline(job, receiver);
+        let work = self.pipeline(job, stop.clone(), receiver);
         tokio::pin!(work);
         tokio::select! {
             result=&mut work=>result,
             _=tokio::time::sleep(Duration::from_secs(self.inner.config.timeout_seconds))=>{
-                let _=stop.send(true);let _=work.await;Err(Error::Cancelled)
+                let _=stop.send(true);let _=work.await;Err(Error::JobTimeout)
             }
         }
     }
@@ -259,7 +260,12 @@ impl Service {
             .map_err(|_| Error::Io)?;
         Ok(())
     }
-    async fn pipeline(&self, job: &Job, mut stop: watch::Receiver<bool>) -> Result<(), Error> {
+    async fn pipeline(
+        &self,
+        job: &Job,
+        cancel: watch::Sender<bool>,
+        mut stop: watch::Receiver<bool>,
+    ) -> Result<(), Error> {
         if *stop.borrow() {
             return Err(Error::Cancelled);
         }
@@ -305,6 +311,13 @@ impl Service {
         )
         .await
         .map_err(|_| Error::Io)?;
+        let mut final_progress = Progress {
+            phase: "verify".into(),
+            completed: verified.asset_files_verified as u64 + 1,
+            failed: 0,
+            total: Some(verified.asset_files_verified as u64 + 1),
+            bytes: verified.asset_bytes_verified,
+        };
         if job.request.operation != Operation::Verify {
             if let Some(path) = &profile.export_config {
                 self.phase(&job.id, "export").await?;
@@ -322,13 +335,21 @@ impl Service {
                                 if let Ok(s)=sonic_rs::from_slice::<crate::export::ExportSummary>(&bytes){
                                     let progress=Progress {phase:"export".into(),completed:s.succeeded as u64,failed:s.failed as u64,total:Some(s.input_files as u64),bytes:s.output_bytes};
                                     if self.inner.store.lock().await.progress(&job.id,progress).is_err(){
-                                        // Keep waiting for the exporter; dropping it would detach blocking workers.
+                                        // Signal cancellation and await the exporter; dropping it would detach blocking workers.
+                                        let _=cancel.send(true);
                                         let _=task.await;return Err(Error::Io);
                                     }
                                 }
                             }
                         }
                     }
+                };
+                final_progress = Progress {
+                    phase: "export".into(),
+                    completed: summary.succeeded as u64,
+                    failed: summary.failed as u64,
+                    total: Some(summary.input_files as u64),
+                    bytes: summary.output_bytes,
                 };
                 if !summary.complete || summary.failed > 0 {
                     return Err(Error::Verification);
@@ -338,6 +359,12 @@ impl Service {
         if *stop.borrow() {
             return Err(Error::Cancelled);
         }
+        self.inner
+            .store
+            .lock()
+            .await
+            .progress(&job.id, final_progress)
+            .map_err(|_| Error::Io)?;
         Ok(())
     }
 }
@@ -491,5 +518,236 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    struct Fixture {
+        _root: tempfile::TempDir,
+        config: ServiceConfig,
+        hits: Arc<AtomicUsize>,
+        gate: Arc<tokio::sync::Semaphore>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.gate.add_permits(100);
+            self.server.abort();
+        }
+    }
+    async fn fixture(timeout_seconds: u64) -> (Fixture, Service) {
+        let root = tempfile::tempdir().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let hit = hits.clone();
+        let blocked = gate.clone();
+        let router = Router::new().route(
+            "/internal/v1/resources/snapshot",
+            get(move || {
+                let hit = hit.clone();
+                let blocked = blocked.clone();
+                async move {
+                    hit.fetch_add(1, Ordering::SeqCst);
+                    blocked.acquire().await.unwrap().forget();
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let env = format!("SIRIUS_SERVICE_TEST_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&env, "synthetic-service-token");
+        let download = root.path().join("download.yaml");
+        let contents = sonic_rs::json!({
+            "region":"jp", "game_api_root":url, "internal_token_env":env,
+            "environment":"release", "client_version":"1.0.3", "output":"unused",
+            "cdn_roots":{"https://static.example":{"username_env":env,"credential_env":env}}
+        });
+        std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
+        let config = ServiceConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            token_env: env,
+            state_directory: root.path().join("ledger"),
+            output_directory: root.path().join("outputs"),
+            max_concurrent_jobs: 2,
+            max_queued_jobs: 8,
+            retain_terminal_jobs: 20,
+            timeout_seconds,
+            profiles: BTreeMap::from([(
+                "download".into(),
+                Profile {
+                    region: Region::Jp,
+                    download_config: Some(download),
+                    export_config: None,
+                    input: None,
+                },
+            )]),
+        };
+        let service = Service::open(config.clone()).unwrap();
+        (
+            Fixture {
+                _root: root,
+                config,
+                hits,
+                gate,
+                server,
+            },
+            service,
+        )
+    }
+    async fn submit(service: &Service) -> Job {
+        let job = service
+            .inner
+            .store
+            .lock()
+            .await
+            .submit(Request {
+                region: Region::Jp,
+                profile: "download".into(),
+                operation: Operation::Update,
+            })
+            .unwrap();
+        service.inner.wake.notify_one();
+        job
+    }
+    async fn status(service: &Service, id: &str) -> Job {
+        service.inner.store.lock().await.get(id).unwrap().clone()
+    }
+    async fn terminal(service: &Service, id: &str) -> Job {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = status(service, id).await;
+                if job.status.terminal() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    async fn hits(fixture: &Fixture, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.hits.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fn workers(
+        service: &Service,
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), Error>>,
+    ) {
+        let (stop, rx) = watch::channel(false);
+        let s = service.clone();
+        (stop, tokio::spawn(async move { s.run_workers(rx).await }))
+    }
+    async fn stop(stop: watch::Sender<bool>, worker: tokio::task::JoinHandle<Result<(), Error>>) {
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_cancel_releases_region_after_exit_and_shutdown_preserves_queue_for_restart() {
+        let (f, service) = fixture(30).await;
+        let first = submit(&service).await;
+        let second = submit(&service).await;
+        let third = submit(&service).await;
+        let (shutdown, worker) = workers(&service);
+        hits(&f, 1).await;
+        assert_eq!(status(&service, &first.id).await.status, Status::Running);
+        assert_eq!(status(&service, &second.id).await.status, Status::Queued);
+        assert_eq!(f.hits.load(Ordering::SeqCst), 1); // two slots, but one region
+        let cancelling = service.inner.store.lock().await.cancel(&first.id).unwrap();
+        assert_eq!(cancelling.status, Status::Cancelling);
+        service.inner.wake.notify_one();
+        assert_eq!(
+            terminal(&service, &first.id).await.status,
+            Status::Cancelled
+        );
+        hits(&f, 2).await;
+        assert_eq!(status(&service, &second.id).await.status, Status::Running);
+        stop(shutdown, worker).await;
+        assert!(!service.inner.accepting.load(Ordering::Acquire));
+        assert_eq!(status(&service, &second.id).await.status, Status::Failed);
+        assert_eq!(status(&service, &third.id).await.status, Status::Queued);
+        assert!(Service::open(f.config.clone()).is_err());
+        drop(service);
+        let restarted = Service::open(f.config.clone()).unwrap();
+        assert_eq!(status(&restarted, &third.id).await.status, Status::Queued);
+        let (shutdown, worker) = workers(&restarted);
+        hits(&f, 3).await;
+        restarted
+            .inner
+            .store
+            .lock()
+            .await
+            .cancel(&third.id)
+            .unwrap();
+        restarted.inner.wake.notify_one();
+        assert_eq!(
+            terminal(&restarted, &third.id).await.status,
+            Status::Cancelled
+        );
+        stop(shutdown, worker).await;
+        for job in [&first, &second, &third] {
+            let output = f
+                .config
+                .output_directory
+                .join("jp")
+                .join(&job.id)
+                .join("downloads");
+            assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn running_download_timeout_is_failed_with_distinct_code_and_can_retry() {
+        let (f, service) = fixture(1).await;
+        let first = submit(&service).await;
+        let (shutdown, worker) = workers(&service);
+        hits(&f, 1).await;
+        let failed = terminal(&service, &first.id).await;
+        assert_eq!(failed.status, Status::Failed);
+        assert_eq!(failed.failure.as_deref(), Some("job_timeout"));
+        let retry = service.inner.store.lock().await.retry(&first.id).unwrap();
+        service.inner.wake.notify_one();
+        hits(&f, 2).await;
+        assert_eq!(retry.retry_of.as_deref(), Some(first.id.as_str()));
+        service.inner.store.lock().await.cancel(&retry.id).unwrap();
+        service.inner.wake.notify_one();
+        let cancelled = terminal(&service, &retry.id).await;
+        assert_eq!(cancelled.status, Status::Cancelled);
+        assert!(cancelled.failure.is_none());
+        stop(shutdown, worker).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_is_failed_on_reopen_and_queued_work_is_preserved() {
+        let (f, service) = fixture(30).await;
+        let first = submit(&service).await;
+        let queued = submit(&service).await;
+        let (_shutdown, worker) = workers(&service);
+        hits(&f, 1).await;
+        // Simulate loss of the worker during async download; no blocking export is active.
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(service);
+        let restarted = Service::open(f.config.clone()).unwrap();
+        let interrupted = status(&restarted, &first.id).await;
+        assert_eq!(interrupted.status, Status::Failed);
+        assert_eq!(interrupted.failure.as_deref(), Some("service_interrupted"));
+        assert_eq!(status(&restarted, &queued.id).await.status, Status::Queued);
     }
 }

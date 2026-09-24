@@ -33,6 +33,8 @@ pub enum Error {
     Preflight,
     #[error("game service is unavailable or under maintenance")]
     Unavailable,
+    #[error("job execution deadline exceeded")]
+    JobTimeout,
     #[error("operation cancelled")]
     Cancelled,
     #[error("unsupported resource provider")]

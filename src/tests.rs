@@ -1625,6 +1625,9 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     .await
     .unwrap();
     assert_eq!(complete.status, Status::Completed);
+    assert_eq!(complete.progress.phase, "verify");
+    assert_eq!(Some(complete.progress.completed), complete.progress.total);
+    assert!(complete.progress.completed > 0);
     assert!(directory
         .path()
         .join("jobs/jp")
@@ -1633,6 +1636,17 @@ async fn job_service_auth_queue_and_real_offline_verification() {
         .is_file());
     stop.send(true).unwrap();
     workers.await.unwrap().unwrap();
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     http.abort();
 }
 
