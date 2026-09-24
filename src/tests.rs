@@ -517,6 +517,7 @@ fn enable_assets(cfg: &mut Config, decrypt: bool) {
     std::env::set_var(&key, "000102030405060708090a0b0c0d0e0f");
     std::env::set_var(&seed, "1011121314151617");
     cfg.assets = Some(assets::AssetConfig {
+        selection: Default::default(),
         concurrency: 1,
         cache_directory: None,
         max_file_bytes: 1024 * 1024,
@@ -1624,4 +1625,209 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     stop.send(true).unwrap();
     workers.await.unwrap().unwrap();
     http.abort();
+}
+
+// Independently encode the Addressables serialized string-object key table.
+fn add_catalog_keys(bytes: &mut Vec<u8>, named: &[(&str, Vec<u32>)]) {
+    fn block(b: &mut Vec<u8>, v: &[u8]) -> u32 {
+        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        let p = b.len() as u32;
+        b.extend_from_slice(v);
+        p
+    }
+    let old = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let n = u32::from_le_bytes(bytes[old - 4..old].try_into().unwrap()) as usize;
+    let mut entries = bytes[old..old + n].to_vec();
+    let assembly = block(bytes, b"mscorlib");
+    let typename = block(bytes, b"System.String");
+    let ty = bytes.len() as u32;
+    bytes.extend_from_slice(&assembly.to_le_bytes());
+    bytes.extend_from_slice(&typename.to_le_bytes());
+    for (name, ids) in named {
+        let name = block(bytes, name.as_bytes());
+        let data = bytes.len() as u32;
+        bytes.extend_from_slice(&name.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let object = bytes.len() as u32;
+        bytes.extend_from_slice(&ty.to_le_bytes());
+        bytes.extend_from_slice(&data.to_le_bytes());
+        let ids = block(
+            bytes,
+            &ids.iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        entries.extend_from_slice(&object.to_le_bytes());
+        entries.extend_from_slice(&ids.to_le_bytes());
+    }
+    let root = block(bytes, &entries);
+    bytes[8..12].copy_from_slice(&root.to_le_bytes());
+}
+fn labeled_catalog() -> Vec<u8> {
+    let mut bytes = catalog_fixture(
+        &[
+            ("{Fwk.Resource.RemoteAssetDir}/root.bundle", UNITY_PROVIDER),
+            (
+                "{Fwk.Resource.RemoteAssetDir}/shared.bundle",
+                UNITY_PROVIDER,
+            ),
+            ("{Fwk.Resource.RemoteAssetDir}/other.bundle", UNITY_PROVIDER),
+        ],
+        true,
+    );
+    let catalog = catalog::Catalog::parse(&bytes).unwrap();
+    let ids: Vec<_> = catalog.locations.iter().map(|l| l.id).collect();
+    add_catalog_keys(
+        &mut bytes,
+        &[
+            ("InitialDownload", vec![ids[0]]),
+            ("Everything", vec![ids[0], ids[1]]),
+            ("MV", vec![ids[2]]),
+        ],
+    );
+    bytes
+}
+#[test]
+fn native_keys_select_dependencies_deduplicate_and_reject_unknown_names() {
+    let c = catalog::Catalog::parse(&labeled_catalog()).unwrap();
+    let select = |keys: Vec<&str>| {
+        c.select(&catalog::Selection {
+            keys: keys.into_iter().map(String::from).collect(),
+            ..Default::default()
+        })
+    };
+    assert_eq!(select(vec!["InitialDownload"]).unwrap().locations.len(), 2);
+    assert_eq!(
+        select(vec!["InitialDownload", "Everything", "InitialDownload"])
+            .unwrap()
+            .locations
+            .len(),
+        2
+    );
+    assert_eq!(
+        select(vec!["InitialDownload", "MV"])
+            .unwrap()
+            .locations
+            .len(),
+        3
+    );
+    assert_eq!(select(vec![]).unwrap().locations.len(), 3);
+    assert!(matches!(select(vec!["StartApp"]), Err(Error::Selection)));
+    // The graph persisted by v1.1 stays byte-compatible; the native catalog remains the key authority.
+    assert!(!sonic_rs::to_string(&c).unwrap().contains("InitialDownload"));
+}
+#[tokio::test]
+async fn selected_download_receipt_verifies_exact_subset_without_claiming_full_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = dir.path().into();
+    enable_assets(&mut cfg, false);
+    cfg.assets.as_mut().unwrap().selection.keys = vec!["InitialDownload".into()];
+    let (client, fixture, task) =
+        serve(cfg, StatusCode::OK, labeled_catalog(), Duration::ZERO).await;
+    fixture.assets.lock().unwrap().extend([
+        (
+            "root.bundle".into(),
+            (StatusCode::OK, b"UnityFS\0root".to_vec()),
+        ),
+        (
+            "shared.bundle".into(),
+            (StatusCode::OK, b"UnityFS\0shared".to_vec()),
+        ),
+    ]);
+    let output = client.fetch().await.unwrap();
+    let checked = verify::verify(&output).await.unwrap();
+    assert_eq!(checked.asset_files_verified, 2);
+    assert_eq!(checked.catalog_remote_files, 3);
+    assert!(!checked.full_catalog);
+    assert!(!output.join("assets/other.bundle").exists());
+    let receipt_path = output.join("receipt.json");
+    let mut receipt: Receipt =
+        sonic_rs::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    receipt.update.as_mut().unwrap().selection.keys.clear();
+    std::fs::write(receipt_path, sonic_rs::to_vec(&receipt).unwrap()).unwrap();
+    assert!(
+        verify::verify(&output).await.is_err(),
+        "a subset cannot be relabeled as a complete publication"
+    );
+    task.abort();
+}
+#[test]
+#[ignore = "requires SIRIUS_CATALOG_SAMPLE pointing to the investigated JP catalog"]
+fn real_catalog_native_label_membership_matches_independent_reader() {
+    let bytes = std::fs::read(std::env::var("SIRIUS_CATALOG_SAMPLE").unwrap()).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        "7157fb3ea3962b02726248c8d37c0b498773ce4ad71b9673433dad2688af39cf"
+    );
+    let catalog = catalog::Catalog::parse(&bytes).unwrap();
+    let legacy_graph = std::path::PathBuf::from(std::env::var("SIRIUS_CATALOG_SAMPLE").unwrap())
+        .with_file_name("locations.json");
+    assert_eq!(
+        sonic_rs::to_vec(&catalog).unwrap(),
+        std::fs::read(legacy_graph).unwrap(),
+        "v1.1 graph receipts remain byte-compatible"
+    );
+    for (key, count) in [
+        ("InitialDownload", 3289),
+        ("Everything", 13364),
+        ("MV", 110),
+    ] {
+        let selected = catalog
+            .select(&catalog::Selection {
+                keys: vec![key.into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            selected
+                .plan("https://static.example/assets")
+                .unwrap()
+                .assets
+                .len(),
+            count
+        );
+    }
+    assert_eq!(
+        catalog
+            .plan("https://static.example/assets")
+            .unwrap()
+            .assets
+            .len(),
+        13367
+    );
+}
+
+#[test]
+fn root_filters_keep_required_dependencies_and_prioritize_selected_assets() {
+    let catalog = catalog::Catalog::parse(&labeled_catalog()).unwrap();
+    let selection = catalog::Selection {
+        include: vec!["/root\\.bundle$".into()],
+        exclude: vec!["/shared\\.bundle$".into()],
+        priority: vec!["^shared\\.bundle$".into()],
+        ..Default::default()
+    };
+    let mut plan = catalog
+        .select(&selection)
+        .unwrap()
+        .plan("https://static.example/assets")
+        .unwrap();
+    assert_eq!(
+        plan.assets.len(),
+        2,
+        "excluded roots still remain when required as dependencies"
+    );
+    selection.prioritize(&mut plan).unwrap();
+    assert_eq!(plan.assets[0].relative_path, "shared.bundle");
+    assert_eq!(plan.assets[1].relative_path, "root.bundle");
+    let empty = catalog::Selection {
+        include: vec!["^missing$".into()],
+        ..Default::default()
+    };
+    assert!(matches!(catalog.select(&empty), Err(Error::Selection)));
+    let invalid = catalog::Selection {
+        exclude: vec!["[".into()],
+        ..Default::default()
+    };
+    assert!(invalid.validate().is_err());
 }

@@ -17,6 +17,11 @@ cdn_roots:
 # Optional: download catalog-referenced remote resources in the same atomic run.
 # Without this section, only the catalog is downloaded.
 # assets:
+#   selection:
+#     keys: [] # all catalog entries; e.g. [InitialDownload] is a subset
+#     include: [] # regex over root primary keys/internal IDs
+#     exclude: [] # excludes roots, never required dependencies
+#     priority: [] # ordered regex over remote relative paths
 #   concurrency: 4 # range: 1–16
 #   cache_directory: ./downloads/cache
 #   max_file_bytes: 536870912

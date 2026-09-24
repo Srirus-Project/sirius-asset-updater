@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetConfig {
+    #[serde(default)]
+    pub selection: crate::catalog::Selection,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     #[serde(default)]
@@ -37,6 +39,7 @@ pub struct DecryptConfig {
 }
 impl AssetConfig {
     pub(crate) fn validate(&self) -> Result<(), Error> {
+        self.selection.validate()?;
         if self
             .cache_directory
             .as_ref()

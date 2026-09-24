@@ -19,6 +19,8 @@ use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("unknown or empty catalog selection key")]
+    Selection,
     #[error("cn is reserved; no verified endpoint or protocol is available")]
     ReservedRegion,
     #[error("export failed: {0}")]

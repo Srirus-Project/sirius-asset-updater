@@ -40,7 +40,7 @@ async fn run() -> Result<(), Error> {
         };
     }
     if args == ["--help"] {
-        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | inspect-keys FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
         return Ok(());
     }
     if args.len() == 2 && args[0] == "verify" {
@@ -51,7 +51,7 @@ async fn run() -> Result<(), Error> {
         );
         return Ok(());
     }
-    if args.len() == 2 && args[0] == "inspect-catalog" {
+    if args.len() == 2 && (args[0] == "inspect-catalog" || args[0] == "inspect-keys") {
         use std::io::Read;
         let mut input = Vec::new();
         std::fs::File::open(&args[1])
@@ -60,15 +60,17 @@ async fn run() -> Result<(), Error> {
             .read_to_end(&mut input)
             .map_err(|_| Error::Io)?;
         let catalog = sirius_asset_updater::catalog::Catalog::parse(&input)?;
-        println!(
-            "{}",
-            sonic_rs::to_string_pretty(&catalog).map_err(|_| Error::Catalog)?
-        );
+        let output = if args[0] == "inspect-keys" {
+            sonic_rs::to_string_pretty(&catalog.keys)
+        } else {
+            sonic_rs::to_string_pretty(&catalog)
+        };
+        println!("{}", output.map_err(|_| Error::Catalog)?);
         return Ok(());
     }
     if !args.is_empty() && args != ["check"] && args != ["probe"] {
         eprintln!(
-            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]"
+            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | inspect-catalog FILE | inspect-keys FILE | export CONFIG]"
         );
         return Err(Error::Config);
     }

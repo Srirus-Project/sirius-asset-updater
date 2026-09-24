@@ -44,6 +44,7 @@ fn max_output() -> u64 {
 }
 #[derive(Default, Deserialize, Serialize)]
 pub struct ExportSummary {
+    pub full_catalog: bool,
     pub schema_version: u8,
     pub region: crate::region::Region,
     pub platform: String,
@@ -203,8 +204,11 @@ impl ExportConfig {
                 }
             }
         }
-        let mut assets = receipt.update.ok_or(Error::Verification)?.assets;
-        let catalog_files = assets.len();
+        let update = receipt.update.ok_or(Error::Verification)?;
+        let complete_selection =
+            catalog.select(&update.selection)?.locations.len() == catalog.locations.len();
+        let mut assets = update.assets;
+        let catalog_files = plan.assets.len();
         if !self.paths.is_empty() {
             let selected: std::collections::BTreeSet<_> = self.paths.iter().collect();
             assets.retain(|a| selected.contains(&a.relative_path));
@@ -213,6 +217,7 @@ impl ExportConfig {
             }
         }
         let mut summary = ExportSummary {
+            full_catalog: complete_selection && assets.len() == catalog_files,
             schema_version: 2,
             region: receipt.snapshot.region.unwrap_or_default(),
             platform: receipt.snapshot.platform.clone(),

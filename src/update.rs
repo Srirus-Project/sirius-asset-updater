@@ -20,6 +20,8 @@ pub struct AssetReceipt {
 #[derive(Serialize, Deserialize)]
 pub struct UpdateReceipt {
     #[serde(default)]
+    pub selection: crate::catalog::Selection,
+    #[serde(default)]
     pub cache_hits: usize,
     pub assets: Vec<AssetReceipt>,
     pub embedded_locations: usize,
@@ -42,7 +44,8 @@ impl CatalogClient {
         let remote_dir = catalog_url
             .strip_suffix("/catalog_main.bin")
             .ok_or(Error::Snapshot)?;
-        let plan = catalog.plan(remote_dir)?;
+        let mut plan = catalog.select(&config.selection)?.plan(remote_dir)?;
+        config.selection.prioritize(&mut plan)?;
         let key = config
             .decrypt
             .as_ref()
@@ -56,6 +59,7 @@ impl CatalogClient {
         let username = secret(&auth.username_env)?;
         let password = secret(&auth.credential_env)?;
         let mut receipt = UpdateReceipt {
+            selection: config.selection.clone(),
             cache_hits: 0,
             assets: Vec::new(),
             embedded_locations: plan.embedded_locations,

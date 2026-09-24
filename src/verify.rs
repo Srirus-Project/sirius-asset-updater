@@ -9,6 +9,8 @@ use std::{
 use tokio::io::AsyncReadExt;
 #[derive(Serialize)]
 pub struct Verification {
+    pub full_catalog: bool,
+    pub catalog_remote_files: usize,
     pub catalog_verified: bool,
     pub region: crate::region::Region,
     pub platform: String,
@@ -109,8 +111,18 @@ pub async fn verify(directory: &Path) -> Result<Verification, Error> {
         .catalog_url
         .strip_suffix("/catalog_main.bin")
         .ok_or(Error::Verification)?;
-    let plan = catalog.plan(remote)?;
+    let full_plan = catalog.plan(remote)?;
+    let selection = receipt
+        .update
+        .as_ref()
+        .map(|u| u.selection.clone())
+        .unwrap_or_default();
+    let selected = catalog.select(&selection)?;
+    let plan = selected.plan(remote)?;
     let mut result = Verification {
+        full_catalog: receipt.update.is_some()
+            && selected.locations.len() == catalog.locations.len(),
+        catalog_remote_files: full_plan.assets.len(),
         catalog_verified: true,
         region,
         platform: receipt.snapshot.platform.clone(),
