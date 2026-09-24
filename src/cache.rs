@@ -179,6 +179,13 @@ impl Pending {
 pub(crate) struct Guard {
     _file: std::fs::File,
 }
+impl Drop for Guard {
+    fn drop(&mut self) {
+        // Release ownership explicitly before close. A concurrent child spawn can briefly
+        // inherit the open file description before exec closes its descriptors.
+        let _ = self._file.unlock();
+    }
+}
 impl Guard {
     pub(crate) fn acquire(root: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(root).map_err(|_| Error::Io)?;
@@ -195,5 +202,24 @@ impl Guard {
             .map_err(|_| Error::Io)?;
         file.try_lock().map_err(|_| Error::Busy)?;
         Ok(Self { _file: file })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod guard_tests {
+    use super::*;
+    #[test]
+    fn ownership_ends_even_if_a_duplicate_descriptor_remains_open() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = Guard::acquire(root.path()).unwrap();
+        // Models the shared open file description inherited between fork and exec.
+        let inherited = guard._file.try_clone().unwrap();
+        assert!(matches!(Guard::acquire(root.path()), Err(Error::Busy)));
+        drop(guard);
+        let next = Guard::acquire(root.path()).unwrap();
+        drop(inherited);
+        assert!(matches!(Guard::acquire(root.path()), Err(Error::Busy)));
+        drop(next);
+        assert!(Guard::acquire(root.path()).is_ok());
     }
 }

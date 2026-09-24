@@ -6,6 +6,8 @@ Set these optional fields in the export configuration used by the CLI or a job p
 retain_outputs: true
 cache_directory: ./cache/decoded
 cache_revision: ""
+cache_max_bytes: 53687091200 # optional 50 GiB of managed entries
+cache_max_entries: 20000    # optional retained resource count
 ```
 
 The default is no export cache. This directory must be separate from the input and
@@ -43,7 +45,7 @@ Storage errors fail the resource rather than pretending the cache was written.
 Successful entries survive other resource failures, job cancellation and restart;
 a retry creates a fresh output tree and can reuse those verified entries. Failed
 resources are decoded again. Interrupted `.pending-export-*` directories are never
-read as entries and can be removed while the cache is idle.
+read as entries and are removed on the next owned cache open.
 
 Cache copies check cancellation between 64 KiB reads. Active staging directories
 are removed on normal cancellation; previously completed outputs and cache entries
@@ -58,7 +60,33 @@ Consequently caching requires `retain_outputs: true`; validation-only exports mu
 leave the cache disabled to exercise decoders each time.
 
 The cache is private local state, not a signed manifest or an upload/publication
-backend. It consumes additional disk space and currently has no automatic pruning
-or total-size eviction. Removing an idle cache only causes future decoding work.
+backend. Removing an idle cache only causes future decoding work.
+
+## Capacity and eviction
+
+`cache_max_bytes` and `cache_max_entries` are optional. Omitted limits preserve unbounded
+legacy capacity; configured byte capacity must be positive and entry capacity accepts
+1..1000000. Limits require cache_directory and do not change resource identity. Bytes count
+logical file sizes, including entry metadata, rather than filesystem allocation or compression.
+
+After acquiring the exclusive process lock, opening a cache scans managed digest entries,
+removes abandoned `.pending-export-*` paths, and evicts least-recently-used entries until the
+limits hold. Last use is recorded through entry.json modification time; insertions and verified
+hits update ordering, and equal timestamps use digest order. Do not externally modify this
+private directory. Unknown non-cache names are left untouched and excluded from the budget;
+this is not a general disk cleanup command.
+
+Before insertion, old entries are evicted to make room. A single entry larger than the byte
+limit is not cached: its verified export remains successful. Copies, insertion and eviction
+share an in-process lock so an entry cannot disappear during a hit. Decoder workers still run
+concurrently, but cache copies are serialized within one cache. Symlinks are never traversed
+while counting or deleting managed entries. Publication/output copies are independent and
+survive eviction. Cancellation is checked while scanning/copying and between evictions; OS
+filesystem operations are not preemptible.
+
+The capacity bound covers committed managed entries. Atomic replacement can temporarily use
+one additional entry's staging space; exports, download caches, lock files, unknown paths,
+and filesystem directory overhead are separate. Reserve disk headroom accordingly. An IO
+failure while pruning/copying fails the resource/job rather than pretending limits were met.
 The yhm01 full and incremental production acceptance gates remain separate from
 the local HTTP service/restart and synthetic audio tests.

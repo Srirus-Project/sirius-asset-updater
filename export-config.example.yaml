@@ -31,6 +31,8 @@ audio: wav # Or a list: [wav, flac, mp3]. MP3 always retains WAV or verified FLA
 # cache_directory: ./cache/decoded
 # Bump after external shared-library/runtime changes without executable changes.
 # cache_revision: ""
+# cache_max_bytes: 53687091200 # optional 50 GiB of managed decoded entries
+# cache_max_entries: 20000
 
 # Optional application events; default is info/text on stderr. See docs/APPLICATION_LOG.md.
 # logging:

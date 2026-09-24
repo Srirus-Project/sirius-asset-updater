@@ -36,6 +36,10 @@ pub struct ExportConfig {
     pub cache_directory: Option<PathBuf>,
     #[serde(default)]
     pub cache_revision: String,
+    #[serde(default)]
+    pub cache_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub cache_max_entries: Option<usize>,
     pub cri_key_env: String,
     #[serde(default)]
     pub split_acb_xor_env: Option<String>,
@@ -147,6 +151,12 @@ impl ExportConfig {
                 .cache_directory
                 .as_ref()
                 .is_some_and(|p| p.as_os_str().is_empty())
+            || self.cache_max_bytes == Some(0)
+            || self
+                .cache_max_entries
+                .is_some_and(|n| n == 0 || n > 1_000_000)
+            || (self.cache_directory.is_none()
+                && (self.cache_max_bytes.is_some() || self.cache_max_entries.is_some()))
             || self.cache_revision.len() > 256
             || (self.cache_directory.is_none() && !self.cache_revision.is_empty())
         {
@@ -1524,6 +1534,8 @@ pub(crate) mod tests {
             retain_outputs: false,
             cache_directory: None,
             cache_revision: String::new(),
+            cache_max_bytes: None,
+            cache_max_entries: None,
             cri_key_env: "UNUSED_TEST_KEY".into(),
             split_acb_xor_env: None,
             concurrency: 1,
