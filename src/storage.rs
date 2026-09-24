@@ -57,6 +57,9 @@ pub struct Provider {
     pub prefix: String,
     pub backend: Backend,
 }
+fn path_style() -> bool {
+    true
+}
 fn prefix() -> String {
     "assets".into()
 }
@@ -68,6 +71,8 @@ pub enum Backend {
     },
     S3 {
         endpoint: String,
+        #[serde(default = "path_style")]
+        path_style: bool,
         bucket: String,
         region: String,
         access_key_id_env: String,
@@ -154,6 +159,7 @@ impl Config {
                 }
                 Backend::S3 {
                     endpoint,
+                    path_style,
                     bucket,
                     region,
                     access_key_id_env,
@@ -176,6 +182,13 @@ impl Config {
                         || url.query().is_some()
                         || url.fragment().is_some()
                         || url.path() != "/"
+                        || (!path_style
+                            && (bucket.contains('.')
+                                || url.host_str().is_some_and(|host| {
+                                    host.trim_matches(['[', ']'])
+                                        .parse::<std::net::IpAddr>()
+                                        .is_ok()
+                                })))
                         || bucket.is_empty()
                         || bucket.len() > 63
                         || !bucket.bytes().all(|b| {
@@ -539,6 +552,7 @@ impl Provider {
             }
             Backend::S3 {
                 endpoint,
+                path_style,
                 bucket,
                 region,
                 access_key_id_env,
@@ -553,6 +567,9 @@ impl Provider {
                     .secret_access_key(&secret(secret_access_key_env)?)
                     .disable_config_load()
                     .disable_ec2_metadata();
+                if !path_style {
+                    builder = builder.enable_virtual_host_style();
+                }
                 if let Some(name) = session_token_env {
                     builder = builder.session_token(&secret(name)?);
                 }

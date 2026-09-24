@@ -19,7 +19,7 @@ Original `src/core/storage.rs` and `src/core/config/schema.rs` expose additional
 | Local filesystem and S3 providers | Implemented with verified publication | Production acceptance |
 | Multiple destinations and provider selection | Per-profile storage configuration lists required providers | Document migration from global provider registry |
 | Streaming upload, concurrency, retry, upload-before-cleanup | Implemented with read-back verification | Fine upload progress and production resource tests |
-| Path-style / virtual-host-style S3 addressing | Path-style only | Restore explicit addressing choice and test the signed request target |
+| Path-style / virtual-host-style S3 addressing | Explicit path_style, legacy default true; both signed request targets tested | Production endpoint acceptance |
 | S3 public-read policy and per-file include/exclude rules | Absent | Restore explicit policy without changing private defaults |
 | Public base URL / planned storage target information | Absent | Connect configured URLs to publication receipts/registry |
 | Region templates in bucket/root/prefix/options | Explicit profile providers plus mandatory region prefix | Audit equivalent multi-region configuration and migration |

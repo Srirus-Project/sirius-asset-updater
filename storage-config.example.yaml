@@ -10,6 +10,7 @@ providers:
   #   backend:
   #     type: s3
   #     endpoint: https://s3.example.com
+  #     path_style: true # false for bucket.endpoint virtual-host addressing
   #     bucket: sirius-assets
   #     region: auto
   #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID

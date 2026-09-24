@@ -10,7 +10,10 @@ The command takes `input`, the expected `region`, and a `storage` configuration.
 OpenDAL 0.58.2 provides local filesystem and S3-compatible backends. All configured destinations
 are required. Names must be unique and providers are processed in order; per-provider object
 concurrency is bounded. Credentials are explicit environment-variable references. S3 requires
-HTTPS, except literal loopback IPs for local testing. It uses path-style bucket addressing,
+HTTPS, except literal loopback IPs for local testing. `backend.path_style` defaults to true for
+existing configurations (`https://endpoint/bucket/key`). Set it to false for virtual-host-style
+requests (`https://bucket.endpoint/key`), including signing against that request target. Virtual-host
+mode requires a DNS endpoint and a bucket without dots, matching the backend/TLS constraints. It
 disables implicit AWS configuration/metadata credentials and proxy discovery, and never follows
 redirects. No credentials, endpoints or signed requests appear in publication receipts or errors.
 Local destination roots must not overlap the export tree. Both trees must be owned by the updater
@@ -60,5 +63,5 @@ Do not delete prefixes merely because an active transfer has not written a marke
   export. Once verified cleanup begins it runs to completion without cancellation; a filesystem
   deletion error can leave a partially removed local tree, while all remote copies are complete.
 
-This restores the local/S3 publication path. Other OpenDAL backends, mutable registries,
+This restores the local/S3 publication path. Public ACL rules, publication URLs, mutable registries,
 notifications, scheduling and production storage acceptance remain in the restoration audit.

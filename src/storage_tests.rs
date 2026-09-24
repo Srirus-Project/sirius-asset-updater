@@ -227,6 +227,7 @@ async fn server() -> Server {
         prefix: "assets".into(),
         backend: Backend::S3 {
             endpoint,
+            path_style: true,
             bucket: "synthetic-bucket".into(),
             region: "test-region".into(),
             access_key_id_env: env[0].clone(),
@@ -395,4 +396,90 @@ async fn storage_timeouts_are_bounded_and_zero_byte_objects_roundtrip() {
     check_remote(&op, "empty", 0, &hex::encode(Sha256::digest([])))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn s3_address_style_changes_signed_request_and_preserves_legacy_default() {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<axum::http::Request<opendal::Buffer>>>>);
+    impl opendal::HttpTransport for Capture {
+        async fn fetch(
+            &self,
+            request: axum::http::Request<opendal::Buffer>,
+        ) -> opendal::Result<axum::http::Response<opendal::HttpBody>> {
+            self.0.lock().unwrap().push(request);
+            Err(opendal::Error::new(
+                opendal::ErrorKind::PermissionDenied,
+                "synthetic capture",
+            ))
+        }
+    }
+    let mut server = server().await;
+    let source = fixture();
+    for style in [true, false] {
+        if let Backend::S3 {
+            endpoint,
+            path_style,
+            ..
+        } = &mut server.config.providers[0].backend
+        {
+            *endpoint = "https://objects.example:9443".into();
+            *path_style = style;
+        }
+        server.config.validate().unwrap();
+        let capture = Capture::default();
+        let operator = server.config.providers[0]
+            .operator(source.path())
+            .unwrap()
+            .with_context(
+                OperationContext::new().with_http_transport(HttpTransporter::new(capture.clone())),
+            );
+        assert!(operator
+            .write("assets/jp/a b.bin", "synthetic")
+            .await
+            .is_err());
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        let (host, path) = if style {
+            (
+                "objects.example:9443",
+                "/synthetic-bucket/assets/jp/a%20b.bin",
+            )
+        } else {
+            (
+                "synthetic-bucket.objects.example:9443",
+                "/assets/jp/a%20b.bin",
+            )
+        };
+        assert_eq!(req.uri().authority().unwrap().as_str(), host);
+        assert_eq!(req.uri().path(), path);
+        let signature = req.headers()[header::AUTHORIZATION].to_str().unwrap();
+        assert!(signature.starts_with("AWS4-HMAC-SHA256 "));
+        assert!(signature.contains("/test-region/s3/aws4_request"));
+        assert!(signature.contains("host"));
+    }
+    let yaml = format!("type: s3\nendpoint: https://objects.example\nbucket: synthetic-bucket\nregion: test-region\naccess_key_id_env: {}\nsecret_access_key_env: {}\n", server.env[0], server.env[1]);
+    let legacy: Backend = yaml_serde::from_str(&yaml).unwrap();
+    assert!(matches!(
+        legacy,
+        Backend::S3 {
+            path_style: true,
+            ..
+        }
+    ));
+    for (endpoint_value, bucket_value) in [
+        ("https://127.0.0.1", "synthetic-bucket"),
+        ("https://[::1]", "synthetic-bucket"),
+        ("https://objects.example", "dotted.bucket"),
+    ] {
+        if let Backend::S3 {
+            endpoint, bucket, ..
+        } = &mut server.config.providers[0].backend
+        {
+            *endpoint = endpoint_value.into();
+            *bucket = bucket_value.into();
+        }
+        assert!(server.config.validate().is_err());
+    }
 }
