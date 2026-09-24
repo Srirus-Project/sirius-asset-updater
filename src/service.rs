@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::{
     extract::{DefaultBodyLimit, Path as HttpPath, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -514,7 +514,11 @@ async fn detail(State(service): State<Service>, HttpPath(id): HttpPath<String>) 
         None => failure(JobError::NotFound),
     }
 }
-async fn submit(State(service): State<Service>, body: axum::body::Bytes) -> Response {
+async fn submit(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if !service.inner.accepting.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -530,7 +534,20 @@ async fn submit(State(service): State<Service>, body: axum::body::Bytes) -> Resp
     {
         return failure(JobError::Invalid);
     }
-    let result = service.inner.store.lock().await.submit(request);
+    let mut keys = headers.get_all("idempotency-key").iter();
+    let key = match keys.next() {
+        Some(value) => match value.to_str() {
+            Ok(key) if keys.next().is_none() => Some(key),
+            _ => return failure(JobError::Invalid),
+        },
+        None => None,
+    };
+    let mut store = service.inner.store.lock().await;
+    let result = match key {
+        Some(key) => store.submit_idempotent(request, key),
+        None => store.submit(request),
+    };
+    drop(store);
     match result {
         Ok(job) => {
             service.inner.wake.notify_one();

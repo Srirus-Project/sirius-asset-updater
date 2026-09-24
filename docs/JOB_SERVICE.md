@@ -24,6 +24,25 @@ publication and, when `export_config` is set, exports it. Standalone `verify` an
 a configured `input`; standalone export also requires `export_config`. Region must match the
 profile and source receipt. CN remains reserved. Global capabilities remain those in REGIONS.md.
 
+Submission accepts an optional `Idempotency-Key` header (1–128 ASCII letters, digits, `-`,
+`_`, `.`, or `:`). Reuse the key with the same region/profile/operation after a lost response:
+the service returns 202 with the original job's **current** state, without queuing another job.
+This also works when the queue is full and after a process restart. A retained key reused with a
+different valid request returns 409; malformed or duplicate headers return 400. Authentication,
+profile validation and shutdown admission checks still apply. Requests without a key keep their
+existing behavior and always submit new work.
+
+The key is scoped to the entire service ledger, so trigger clients should include the region,
+profile, operation and catalog identity in their key derivation. Only its SHA-256 digest is stored
+and returned as `idempotency_sha256`; keys must not contain secrets. Terminal jobs continue to
+reserve their key until ledger retention removes the record. After pruning, the same key can
+create a new job: this is not an indefinite exactly-once guarantee. Trigger owners must persist
+the acknowledged job ID and completion state. Failed/cancelled submissions return the original
+job on replay; use the explicit retry route to request new execution. The retry route creates
+new work each time and does not inherit or accept this submission idempotency contract.
+A submission key does not pin a catalog version: `update` still obtains and validates the current
+snapshot when it executes. An owner integration must reconcile the resulting receipt identity.
+
 Outputs are separated under `output_directory/<region>/<job-id>/`. Download output and export
 input/output paths are set by the service; other pipeline options come from the configured files.
 Use `assets` in the download configuration to request all remote resources. Omitting it remains
@@ -52,5 +71,5 @@ Profiles can set `storage_config` to publish retained exports to configured [loc
 All destinations must pass upload/read-back before optional local export cleanup.
 
 This is an implementation milestone, not the complete 1.2.0 platform restoration. Additional publication,
-stage tuning, scheduling, application logging and remaining acceptance requirements
+stage tuning, version-trigger integration and remaining acceptance requirements
 are tracked separately in RESTORATION_1_2.md. Do not publish 1.2.0 from this milestone alone.

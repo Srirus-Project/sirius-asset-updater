@@ -1546,12 +1546,50 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     let response = client
         .post(&endpoint)
         .bearer_auth("service-only-token")
+        .header("Idempotency-Key", "verify-catalog-1")
         .body(body)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let queued: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+    // Concurrent retries after a lost acknowledgement return one persisted job even with a full queue.
+    let retries = (0..12).map(|_| async {
+        let response = client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .header("Idempotency-Key", "verify-catalog-1")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let replay: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(replay.id, queued.id);
+    });
+    futures_util::future::join_all(retries).await;
+    for headers in [vec![""], vec!["bad key"], vec!["same", "same"]] {
+        let mut request = client
+            .post(&endpoint)
+            .bearer_auth("service-only-token")
+            .body(body);
+        for header in headers {
+            request = request.header("Idempotency-Key", header);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = client
+        .post(&endpoint)
+        .header("Idempotency-Key", "verify-catalog-1")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
     assert_eq!(
         client
             .post(&endpoint)

@@ -2,6 +2,7 @@
 use crate::region::Region;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -49,7 +50,7 @@ pub enum Operation {
     Verify,
 }
 /// Requests select configured profiles; callers cannot supply filesystem paths or credentials.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub region: Region,
@@ -75,6 +76,9 @@ pub struct Job {
     /// Stable sanitized error code, never a raw upstream response or secret-bearing log.
     pub failure: Option<String>,
     pub retry_of: Option<String>,
+    /// Digest only: the raw caller key is never stored or returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_sha256: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 struct Ledger {
@@ -120,7 +124,18 @@ impl JobStore {
             return Err(JobError::Storage);
         }
         let mut ids = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
         for job in &mut ledger.jobs {
+            if let Some(key) = &job.idempotency_sha256 {
+                if key.len() != 64
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || !keys.insert(key.clone())
+                {
+                    return Err(JobError::Storage);
+                }
+            }
             if uuid::Uuid::parse_str(&job.id).is_err()
                 || !ids.insert(job.id.clone())
                 || !valid_request(&job.request)
@@ -149,9 +164,40 @@ impl JobStore {
         self.ledger.jobs.iter().find(|j| j.id == id)
     }
     pub fn submit(&mut self, request: Request) -> Result<Job, JobError> {
-        self.enqueue(request, None)
+        self.enqueue(request, None, None)
     }
-    fn enqueue(&mut self, request: Request, retry_of: Option<String>) -> Result<Job, JobError> {
+    /// Safe resubmission while the original job remains in the retained ledger.
+    pub fn submit_idempotent(&mut self, request: Request, key: &str) -> Result<Job, JobError> {
+        if !valid_request(&request)
+            || key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(JobError::Invalid);
+        }
+        let digest = hex::encode(Sha256::digest(key.as_bytes()));
+        if let Some(job) = self
+            .ledger
+            .jobs
+            .iter()
+            .find(|j| j.idempotency_sha256.as_ref() == Some(&digest))
+        {
+            return if job.request == request {
+                Ok(job.clone())
+            } else {
+                Err(JobError::Conflict)
+            };
+        }
+        self.enqueue(request, None, Some(digest))
+    }
+    fn enqueue(
+        &mut self,
+        request: Request,
+        retry_of: Option<String>,
+        idempotency_sha256: Option<String>,
+    ) -> Result<Job, JobError> {
         if !valid_request(&request) {
             return Err(JobError::Invalid);
         }
@@ -175,6 +221,7 @@ impl JobStore {
             progress: Progress::default(),
             failure: None,
             retry_of,
+            idempotency_sha256,
         };
         let mut ledger = self.ledger.clone();
         ledger.jobs.push(job.clone());
@@ -186,7 +233,7 @@ impl JobStore {
         if !matches!(job.status, Status::Failed | Status::Cancelled) {
             return Err(JobError::Conflict);
         }
-        self.enqueue(job.request.clone(), Some(id.into()))
+        self.enqueue(job.request.clone(), Some(id.into()), None)
     }
     /// FIFO among runnable regions. A busy region cannot block an idle region's queue.
     pub fn claim(&mut self) -> Result<Option<Job>, JobError> {
@@ -341,6 +388,123 @@ mod tests {
             profile: "full".into(),
             operation: Operation::Update,
         }
+    }
+    #[test]
+    fn idempotent_submission_survives_restart_and_queue_saturation() {
+        let d = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.max_queued = 1;
+        let mut store = JobStore::open(d.path(), limits).unwrap();
+        let original = store
+            .submit_idempotent(request(Region::Jp), "jp:catalog-1")
+            .unwrap();
+        assert_eq!(
+            store
+                .submit_idempotent(request(Region::Jp), "jp:catalog-1")
+                .unwrap()
+                .id,
+            original.id
+        );
+        assert!(matches!(
+            store.submit_idempotent(request(Region::En), "jp:catalog-1"),
+            Err(JobError::Conflict)
+        ));
+        let mut changed = request(Region::Jp);
+        changed.operation = Operation::Verify;
+        assert!(matches!(
+            store.submit_idempotent(changed, "jp:catalog-1"),
+            Err(JobError::Conflict)
+        ));
+        assert!(matches!(
+            store.submit_idempotent(request(Region::Jp), "another"),
+            Err(JobError::Full)
+        ));
+        assert!(!fs::read_to_string(d.path().join("jobs.json"))
+            .unwrap()
+            .contains("jp:catalog-1"));
+        store.claim().unwrap();
+        drop(store);
+        let mut store = JobStore::open(d.path(), limits).unwrap();
+        let replay = store
+            .submit_idempotent(request(Region::Jp), "jp:catalog-1")
+            .unwrap();
+        assert_eq!(replay.id, original.id);
+        assert_eq!(replay.failure.as_deref(), Some("service_interrupted"));
+        let retry = store.retry(&original.id).unwrap();
+        assert!(retry.idempotency_sha256.is_none());
+        assert_ne!(retry.id, original.id);
+        assert_eq!(
+            store
+                .submit_idempotent(request(Region::Jp), "jp:catalog-1")
+                .unwrap()
+                .id,
+            original.id
+        );
+    }
+    #[test]
+    fn idempotency_validation_retention_and_failed_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.retain_terminal = 1;
+        let mut store = JobStore::open(d.path(), limits).unwrap();
+        for key in [
+            "",
+            "contains space",
+            "comma,combined",
+            "bad/uri",
+            "非ASCII",
+            &"a".repeat(129),
+        ] {
+            assert!(matches!(
+                store.submit_idempotent(request(Region::Jp), key),
+                Err(JobError::Invalid)
+            ));
+        }
+        let first = store
+            .submit_idempotent(request(Region::Jp), "key-1")
+            .unwrap();
+        store.cancel(&first.id).unwrap();
+        let second = store
+            .submit_idempotent(request(Region::Jp), "key-2")
+            .unwrap();
+        store.cancel(&second.id).unwrap();
+        assert!(store.get(&first.id).is_none());
+        let replacement = store
+            .submit_idempotent(request(Region::Jp), "key-1")
+            .unwrap();
+        assert_ne!(replacement.id, first.id);
+        fs::remove_file(d.path().join("jobs.json")).unwrap();
+        fs::create_dir(d.path().join("jobs.json")).unwrap();
+        assert!(matches!(
+            store.submit_idempotent(request(Region::Jp), "not-committed"),
+            Err(JobError::Storage)
+        ));
+        assert_eq!(store.list().len(), 2);
+        fs::remove_dir(d.path().join("jobs.json")).unwrap();
+        let committed = store
+            .submit_idempotent(request(Region::Jp), "not-committed")
+            .unwrap();
+        drop(store);
+        let mut store = JobStore::open(d.path(), limits).unwrap();
+        assert_eq!(
+            store
+                .submit_idempotent(request(Region::Jp), "not-committed")
+                .unwrap()
+                .id,
+            committed.id
+        );
+        // Duplicate digests or malformed persisted identities must not be accepted.
+        store.ledger.jobs[0].idempotency_sha256 = committed.idempotency_sha256;
+        fs::write(
+            d.path().join("jobs.json"),
+            sonic_rs::to_vec(&store.ledger).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        assert!(matches!(
+            JobStore::open(d.path(), limits),
+            Err(JobError::Storage)
+        ));
     }
     #[test]
     fn cancellation_holds_region_and_slot_until_worker_exit() {
