@@ -1,16 +1,17 @@
 # Development rules
 
 This is a standalone Sirius project for BanG Dream! Our Notes. Do not reintroduce Sekai game protocols,
-CP/Nuverse providers, legacy account databases, Ent schemas or Master DB ingestion.
+CP/Nuverse providers, Sekai account databases or Ent schemas. Generic service persistence and Master publication/ingestion
+may be restored for Sirius; do not restore game-specific table models.
 Reuse Haruki concepts only where they fit the actual Sirius protocol.
 Keep Haruki MIT attribution and Sirius attribution in LICENSE; sources are in docs/SOURCES.md.
 
-- Rust implementation lives in `src/`; there are no legacy workspace members.
+- Rust implementation lives in `src/`; restore reusable service capabilities without importing Sekai adapters.
 - Never commit tokens, credentials, local config, game binaries or downloaded resources.
 - Test locally; no live game availability is required for tests.
 - Run `cargo fmt --all -- --check`, `cargo check --locked --all-targets`,
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, and `cargo test --locked`.
-- Repository Actions remain disabled until deployment is configured, except for explicitly scheduled release preflight runs. Restore the previous setting after preflight; do not create tags, public releases or registry pushes as part of preparation. CI/Release/Docker target this project's root binary.
+- The user authorized restoration, yhm01 full acceptance and release 1.2.0. Publish only after the restoration ledger and full acceptance gates pass. Preserve existing Actions settings; CI/Release/Docker target this project's binaries.
 - Commit subjects use `[Feat]`, `[Fix]`, `[Chore]` or `[Docs]` and an imperative description.
 - Include `Co-authored-by: Codex <noreply@openai.com>` in Codex commit bodies.
 
