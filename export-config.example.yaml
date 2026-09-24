@@ -1,0 +1,12 @@
+# Read a verified download; no game/CDN credentials are used by this command.
+input: ./downloads/catalog-example
+output: ./exports/run-example
+retain_outputs: true
+concurrency: 4
+cri_key_env: SIRIUS_CRI_KEY
+split_acb_xor_env: SIRIUS_SPLIT_ACB_XOR
+ffmpeg: /usr/bin/ffmpeg
+media_timeout_seconds: 120
+max_resource_output_bytes: 2147483648
+# Empty means every downloaded resource. Exact receipt paths can select a subset.
+paths: []

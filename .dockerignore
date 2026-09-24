@@ -1,0 +1,14 @@
+target/
+dist/
+.git/
+.github/
+.env
+.env.*
+*-config.yaml
+*-config.*.local.yaml
+downloads/
+exports/
+master-data/
+*.log
+.DS_Store
+.idea/

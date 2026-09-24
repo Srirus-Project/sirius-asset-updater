@@ -1,0 +1,41 @@
+[package]
+name = "sirius-asset-updater"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Resource downloader and exporter for BanG Dream! Our Notes"
+repository = "https://github.com/Srirus-Project/sirius-asset-updater"
+readme = "README.md"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "sirius-asset-updater"
+path = "src/main.rs"
+
+[dependencies]
+unity-rs-core = "=0.5.1"
+cridecoder = "=0.3.5"
+png = "0.18"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+aes = "0.8"
+ctr = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.5"
+sha2 = "0.11"
+hex = "0.4"
+tempfile = "3.27"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+yaml_serde = "0.10"
+
+[dev-dependencies]
+axum = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

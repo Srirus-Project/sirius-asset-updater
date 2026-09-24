@@ -1,0 +1,102 @@
+use sirius_asset_updater::{CatalogClient, Config, Error};
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::from(if matches!(error, Error::Cancelled) {
+                130
+            } else {
+                1
+            })
+        }
+    }
+}
+async fn run() -> Result<(), Error> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("sirius-asset-updater {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.len() == 2 && args[0] == "export" {
+        let config: sirius_asset_updater::export::ExportConfig =
+            yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
+                .map_err(|_| Error::Config)?;
+        let summary = config.run().await?;
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&summary).map_err(|_| Error::Verification)?
+        );
+        return if summary.complete {
+            Ok(())
+        } else {
+            Err(Error::Export(
+                "one or more resources failed; see resources.jsonl".into(),
+            ))
+        };
+    }
+    if args == ["--help"] {
+        println!("usage: sirius-asset-updater [check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        return Ok(());
+    }
+    if args.len() == 2 && args[0] == "verify" {
+        let report = sirius_asset_updater::verify::verify(std::path::Path::new(&args[1])).await?;
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&report).map_err(|_| Error::Verification)?
+        );
+        return Ok(());
+    }
+    if args.len() == 2 && args[0] == "inspect-catalog" {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::fs::File::open(&args[1])
+            .map_err(|_| Error::Io)?
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut input)
+            .map_err(|_| Error::Io)?;
+        let catalog = sirius_asset_updater::catalog::Catalog::parse(&input)?;
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&catalog).map_err(|_| Error::Catalog)?
+        );
+        return Ok(());
+    }
+    if !args.is_empty() && args != ["check"] && args != ["probe"] {
+        eprintln!(
+            "usage: sirius-asset-updater [check | probe | verify DIRECTORY | inspect-catalog FILE | export CONFIG]"
+        );
+        return Err(Error::Config);
+    }
+    let path = std::env::var("SIRIUS_ASSET_CONFIG_PATH")
+        .unwrap_or_else(|_| "sirius-asset-config.yaml".into());
+    let config: Config =
+        yaml_serde::from_str(&std::fs::read_to_string(path).map_err(|_| Error::Config)?)
+            .map_err(|_| Error::Config)?;
+    let check = config.check()?;
+    if args == ["check"] || !check.ready {
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&check).map_err(|_| Error::Config)?
+        );
+        if !check.ready {
+            return Err(Error::Preflight);
+        }
+        return Ok(());
+    }
+    let client = CatalogClient::new(config)?;
+    tokio::select! {
+        result = async {
+            if args == ["probe"] {
+                let snapshot=client.probe().await?;
+                println!("{}",sonic_rs::to_string_pretty(&snapshot).map_err(|_|Error::Snapshot)?);
+            } else { println!("{}",client.fetch().await?.display()); }
+            Ok(())
+        } => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|_|Error::Io)?;
+            Err(Error::Cancelled)
+        }
+    }
+}

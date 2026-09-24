@@ -1,0 +1,23 @@
+game_api_root: http://127.0.0.1:9999
+internal_token_env: SIRIUS_INTERNAL_TOKEN
+# Optional API-scope token: renew version observations before/throughout downloads.
+# Must differ from the internal token; never sent to the CDN.
+refresh_token_env: SIRIUS_API_TOKEN
+environment: release
+client_version: 1.0.3
+output: ./downloads/catalogs
+cdn_roots:
+  https://static.bang-dream-on.jp:
+    username_env: SIRIUS_CDN_USERNAME
+    credential_env: SIRIUS_CDN_CREDENTIAL
+# Optional: download catalog-referenced remote resources in the same atomic run.
+# Without this section, only the catalog is downloaded.
+# assets:
+#   concurrency: 4 # range: 1–16
+#   cache_directory: ./downloads/cache
+#   max_file_bytes: 536870912
+#   max_total_bytes: 17179869184
+#   # Omit decrypt to retain encrypted bundles as downloaded.
+#   decrypt:
+#     key_hex_env: SIRIUS_BUNDLE_KEY_HEX
+#     nonce_seed_hex_env: SIRIUS_BUNDLE_NONCE_SEED_HEX
