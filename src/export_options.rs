@@ -118,7 +118,7 @@ impl ImageExport {
         Ok(bytes)
     }
 }
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioExport {
     #[default]
@@ -136,4 +136,56 @@ pub enum VideoExport {
     Mkv,
     Mp4,
     MkvAndMp4,
+}
+
+/// Canonical nonempty format set, accepting the legacy scalar YAML spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioFormats(Vec<AudioExport>);
+impl Default for AudioFormats {
+    fn default() -> Self {
+        AudioExport::Wav.into()
+    }
+}
+impl From<AudioExport> for AudioFormats {
+    fn from(value: AudioExport) -> Self {
+        Self(vec![value])
+    }
+}
+impl AudioFormats {
+    pub fn contains(&self, value: AudioExport) -> bool {
+        self.0.contains(&value)
+    }
+}
+impl Serialize for AudioFormats {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.len() == 1 {
+            self.0[0].serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+impl<'de> Deserialize<'de> for AudioFormats {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            One(AudioExport),
+            Many(Vec<AudioExport>),
+        }
+        let mut values = match Input::deserialize(deserializer)? {
+            Input::One(value) => vec![value],
+            Input::Many(values) => values,
+        };
+        if values.is_empty() || values.len() > 3 {
+            return Err(serde::de::Error::custom(
+                "select one to three audio formats",
+            ));
+        }
+        values.sort();
+        if values.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(serde::de::Error::custom("duplicate audio format"));
+        }
+        Ok(Self(values))
+    }
 }

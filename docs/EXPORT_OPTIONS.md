@@ -67,8 +67,17 @@ match; sample-frame count may differ by at most 1,152 for codec framing/padding.
 structure/duration, not lossless PCM equivalence. Both WAV and MP3 count toward the resource
 output budget, journal, storage publication and independent hash verification.
 
-Audio mode participates in cache identity. Arbitrary simultaneous format lists and codec
-quality tuning remain outside the current scalar audio configuration.
+Audio accepts either a legacy scalar or a nonempty list, for example `audio: [wav, flac, mp3]`.
+All seven nonempty combinations are supported. Empty, duplicate and unknown formats are errors.
+Selections are canonicalized, so list order and scalar-versus-singleton syntax do not change
+cache identity or summary representation. Codec quality tuning remains fixed as described above.
+
+When MP3 is selected without FLAC, WAV remains as the lossless preservation output even if not
+explicitly listed. With `[flac, mp3]`, every conversion/verification completes before the temporary
+WAV is removed; FLAC is the preservation and video-muxing source. Explicit WAV always remains.
+Each retained output is recorded exactly once and counted toward the same resource byte budget.
+Old scalar configuration and schema-4 summaries remain readable; multi-format summaries serialize
+`audio` as a canonical array, which consumers must allow.
 
 ## Video output
 

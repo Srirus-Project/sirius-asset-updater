@@ -26,7 +26,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub image: crate::export_options::ImageExport,
     #[serde(default)]
-    pub audio: crate::export_options::AudioExport,
+    pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
     pub video: crate::export_options::VideoExport,
     pub output: PathBuf,
@@ -75,7 +75,7 @@ pub struct ExportSummary {
     #[serde(default)]
     pub image: crate::export_options::ImageExport,
     #[serde(default)]
-    pub audio: crate::export_options::AudioExport,
+    pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
     pub video: crate::export_options::VideoExport,
     #[serde(default)]
@@ -313,7 +313,7 @@ impl ExportConfig {
                 && self.selection.full(),
             selection: self.selection.clone(),
             image: self.image.clone(),
-            audio: self.audio,
+            audio: self.audio.clone(),
             video: self.video,
             full_catalog: complete_selection && assets.len() == catalog_files,
             schema_version: 4,
@@ -1254,12 +1254,23 @@ impl ExportConfig {
         codec: &str,
         report: &mut ResourceReport,
     ) -> Result<PathBuf, Error> {
-        if self.audio == crate::export_options::AudioExport::Wav {
+        use crate::export_options::AudioExport;
+        let flac = self.audio.contains(AudioExport::Flac);
+        // At least one lossless preservation representation always remains.
+        let keep_wav = self.audio.contains(AudioExport::Wav) || !flac;
+        let mp3 = if self.audio.contains(AudioExport::Mp3) {
+            Some(self.encode_mp3(root, wav)?)
+        } else {
+            None
+        };
+        if keep_wav {
             self.record(root, wav, &format!("{codec}_wav"), report)?;
-            return Ok(wav.into());
         }
-        if self.audio == crate::export_options::AudioExport::Mp3 {
-            return self.record_mp3(root, wav, codec, report);
+        if let Some(mp3) = mp3 {
+            self.record(root, &mp3, &format!("{codec}_mp3"), report)?;
+        }
+        if !flac {
+            return Ok(wav.into());
         }
         let target = wav.with_extension("flac");
         self.ffmpeg(&[
@@ -1295,16 +1306,12 @@ impl ExportConfig {
             return Err(err("FLAC PCM roundtrip mismatch"));
         }
         self.record(root, &target, &format!("{codec}_flac"), report)?;
-        fs::remove_file(wav).map_err(err)?;
+        if !keep_wav {
+            fs::remove_file(wav).map_err(err)?;
+        }
         Ok(target)
     }
-    fn record_mp3(
-        &self,
-        root: &Path,
-        wav: &Path,
-        codec: &str,
-        report: &mut ResourceReport,
-    ) -> Result<PathBuf, Error> {
+    fn encode_mp3(&self, root: &Path, wav: &Path) -> Result<PathBuf, Error> {
         let original = fs::read(wav).map_err(err)?;
         let (channels, rate, pcm) = pcm_identity(&original)?;
         if !matches!(channels, 1 | 2) || pcm.is_empty() {
@@ -1358,10 +1365,7 @@ impl ExportConfig {
         {
             return Err(err("MP3 channel/rate/duration verification failed"));
         }
-        self.record(root, wav, &format!("{codec}_wav"), report)?;
-        self.record(root, &target, &format!("{codec}_mp3"), report)?;
-        // Keep preservation PCM for subsequent video muxing, avoiding a lossy intermediate.
-        Ok(wav.into())
+        Ok(target)
     }
     fn record(
         &self,
@@ -1618,13 +1622,122 @@ pub(crate) mod tests {
         assert!(yaml_serde::from_str::<VideoExport>("avi").is_err());
     }
     #[test]
+    fn audio_format_lists_are_canonical_and_reject_invalid_selections() {
+        use crate::export_options::AudioFormats;
+        for format in ["wav", "flac", "mp3"] {
+            let single: AudioFormats = yaml_serde::from_str(format).unwrap();
+            let list: AudioFormats = yaml_serde::from_str(&format!("[{format}]")).unwrap();
+            assert_eq!(single, list);
+            assert_eq!(
+                sonic_rs::to_string(&single).unwrap(),
+                sonic_rs::to_string(&list).unwrap()
+            );
+        }
+        let a: AudioFormats = yaml_serde::from_str("[mp3, wav, flac]").unwrap();
+        let b: AudioFormats = yaml_serde::from_str("[flac, mp3, wav]").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            sonic_rs::to_string(&a).unwrap(),
+            "[\"wav\",\"flac\",\"mp3\"]"
+        );
+        for bad in [
+            "[]",
+            "[wav, wav]",
+            "[ogg]",
+            "[wav, flac, mp3, wav]",
+            "{formats: [wav]}",
+        ] {
+            assert!(yaml_serde::from_str::<AudioFormats>(bad).is_err());
+        }
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for simultaneous audio-format verification"]
+    fn simultaneous_audio_formats_preserve_requested_lossless_outputs() {
+        use crate::export_options::AudioExport;
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        let source = directory.path().join("source.wav");
+        cfg.ffmpeg(&[
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "sine=frequency=440:sample_rate=48000:duration=0.25".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            source.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let original = fs::read(&source).unwrap();
+        for (i, formats) in [
+            "[wav]",
+            "[flac]",
+            "[mp3]",
+            "[wav, flac]",
+            "[wav, mp3]",
+            "[flac, mp3]",
+            "[wav, flac, mp3]",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cfg.audio = yaml_serde::from_str(formats).unwrap();
+            let root = directory.path().join(i.to_string());
+            fs::create_dir(&root).unwrap();
+            let wav = root.join("audio.wav");
+            fs::copy(&source, &wav).unwrap();
+            let mut report = ResourceReport::default();
+            let mux = cfg
+                .record_audio(&root, &wav, "fixture", &mut report)
+                .unwrap();
+            let flac = cfg.audio.contains(AudioExport::Flac);
+            let mp3 = cfg.audio.contains(AudioExport::Mp3);
+            let keep_wav = cfg.audio.contains(AudioExport::Wav) || !flac;
+            assert_eq!(wav.exists(), keep_wav);
+            assert_eq!(wav.with_extension("flac").exists(), flac);
+            assert_eq!(wav.with_extension("mp3").exists(), mp3);
+            assert_eq!(
+                report.outputs.len(),
+                usize::from(keep_wav) + usize::from(flac) + usize::from(mp3)
+            );
+            assert_eq!(
+                report
+                    .outputs
+                    .iter()
+                    .map(|o| &o.path)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                report.outputs.len()
+            );
+            assert_eq!(mux.extension().unwrap(), if flac { "flac" } else { "wav" });
+            if keep_wav {
+                assert_eq!(fs::read(&wav).unwrap(), original);
+            }
+            if flac {
+                let decoded = root.join("decoded.wav");
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    wav.with_extension("flac").into_os_string(),
+                    "-c:a".into(),
+                    "pcm_s16le".into(),
+                    decoded.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                assert_eq!(
+                    pcm_identity(&fs::read(decoded).unwrap()).unwrap(),
+                    pcm_identity(&original).unwrap()
+                );
+            }
+        }
+    }
+    #[test]
     #[ignore = "requires SIRIUS_TEST_FFMPEG for MP3 encode/decode and PCM preservation checks"]
     fn mp3_output_preserves_pcm_and_verifies_supported_audio_shapes() {
         use crate::export_options::AudioExport;
         let directory = tempfile::tempdir().unwrap();
         let mut cfg = config(directory.path());
         cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
-        cfg.audio = AudioExport::Mp3;
+        cfg.audio = AudioExport::Mp3.into();
         for rate in [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000] {
             for channels in [1, 2] {
                 let wav = directory.path().join(format!("{rate}-{channels}.wav"));
@@ -1937,7 +2050,7 @@ pub(crate) mod tests {
                 assert!(actual.abs_diff(expected) <= 3);
             }
         }
-        cfg.audio = AudioExport::Flac;
+        cfg.audio = AudioExport::Flac.into();
         let audio_dir = root.path().join("audio");
         fs::create_dir(&audio_dir).unwrap();
         let mut report = ResourceReport::default();
@@ -2233,9 +2346,9 @@ pub(crate) mod tests {
         cfg.image = crate::export_options::ImageExport::Webp;
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
-        cfg.audio = crate::export_options::AudioExport::Flac;
+        cfg.audio = crate::export_options::AudioExport::Flac.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
-        cfg.audio = crate::export_options::AudioExport::Mp3;
+        cfg.audio = crate::export_options::AudioExport::Mp3.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.audio = Default::default();
         cfg.video = crate::export_options::VideoExport::Mp4;
