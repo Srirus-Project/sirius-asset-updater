@@ -9,6 +9,9 @@ use axum::{
 use std::sync::{Arc, Mutex};
 fn config() -> Config {
     Config {
+        region: region::Region::Jp,
+        platform: None,
+        protocol_version: None,
         game_api_root: "http://127.0.0.1:9999".into(),
         internal_token_env: "TOKEN".into(),
         refresh_token_env: None,
@@ -29,6 +32,7 @@ fn snapshot() -> SnapshotResponse {
     SnapshotResponse {
         stale: false,
         snapshot: Snapshot {
+            region: None,
             schema_version: 1,
             environment: "release".into(),
             platform: "iOS".into(),
@@ -907,7 +911,7 @@ async fn cache_survives_failed_runs_reuses_verified_bytes_and_repairs_corruption
     let snapshot: SnapshotResponse = sonic_rs::from_str(&f.snapshot.lock().unwrap()).unwrap();
     let url = snapshot.catalog_url(&client.config, Utc::now()).unwrap();
     let id = crate::cache::identity(
-        &url,
+        &format!("jp:release:iOS:{url}"),
         &hex::encode(Sha256::digest(&bytes)),
         "a",
         assets::Provider::Cri,
@@ -971,7 +975,7 @@ async fn encrypted_cache_preserves_ciphertext_and_can_be_redecrypted_on_rerun() 
     let snapshot: SnapshotResponse = sonic_rs::from_str(&f.snapshot.lock().unwrap()).unwrap();
     let url = snapshot.catalog_url(&client.config, Utc::now()).unwrap();
     let id = crate::cache::identity(
-        &url,
+        &format!("jp:release:iOS:{url}"),
         &hex::encode(Sha256::digest(&bytes)),
         "fixture.bundle",
         assets::Provider::EncryptedBundle,
@@ -1375,4 +1379,105 @@ async fn crypt_provider_preserves_plaintext_builtin_bundles_and_receipts() {
         assert_eq!(verify::verify(&output).await.unwrap().decrypted_bundles, 0);
     }
     server.abort();
+}
+
+#[test]
+fn regional_snapshots_require_explicit_identity_and_keep_cdn_prefixes() {
+    let mut cfg = config();
+    cfg.region = region::Region::En;
+    cfg.client_version = "1.0.1".into();
+    let base = "https://cdn.example/prod/en_fixture";
+    cfg.cdn_roots = BTreeMap::from([(
+        base.into(),
+        CdnAuth {
+            username_env: "U".into(),
+            credential_env: "P".into(),
+        },
+    )]);
+    assert!(cfg.validate().is_ok());
+    let mut s = snapshot();
+    s.snapshot.schema_version = 2;
+    s.snapshot.region = Some(region::Region::En);
+    s.snapshot.platform = "Android".into();
+    s.snapshot.client_version = "1.0.1".into();
+    s.snapshot.protocol_version = "1.0.1".into();
+    s.snapshot.effective_cdn_root = base.into();
+    s.snapshot.credential_ref = "P".into();
+    assert_eq!(
+        s.catalog_url(&cfg, Utc::now()).unwrap(),
+        "https://cdn.example/prod/en_fixture/asset/r1/Android/h1/catalog_main.bin"
+    );
+    for region in [
+        None,
+        Some(region::Region::Jp),
+        Some(region::Region::Tw),
+        Some(region::Region::Kr),
+        Some(region::Region::Cn),
+    ] {
+        let mut wrong = s.clone();
+        wrong.snapshot.region = region;
+        assert!(wrong.catalog_url(&cfg, Utc::now()).is_err());
+    }
+    s.snapshot.schema_version = 1;
+    s.snapshot.region = None;
+    assert!(s.catalog_url(&cfg, Utc::now()).is_err());
+    cfg.region = region::Region::Cn;
+    assert!(cfg.validate().is_err());
+    for bad in [
+        "https://cdn.example/prod/../en",
+        "https://cdn.example/%2f/prod",
+        "https://cdn.example/prod/en?x=1",
+        "https://cdn.example/prod/en/",
+    ] {
+        assert!(!cdn_root(bad), "{bad}");
+    }
+}
+#[tokio::test]
+async fn wrong_region_never_reaches_cdn_even_when_url_and_credentials_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = dir.path().into();
+    let (client, f, server) = serve(cfg, StatusCode::OK, vec![], Duration::ZERO).await;
+    let mut s: SnapshotResponse = sonic_rs::from_str(&f.snapshot.lock().unwrap()).unwrap();
+    s.snapshot.schema_version = 2;
+    s.snapshot.region = Some(region::Region::Kr);
+    *f.snapshot.lock().unwrap() = sonic_rs::to_string(&s).unwrap();
+    assert!(matches!(client.fetch().await, Err(Error::Snapshot)));
+    assert!(f.seen.lock().unwrap().iter().all(|(p, _)| p == "snapshot"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    server.abort();
+}
+#[test]
+fn cache_identity_separates_regions_even_with_shared_cdn_and_catalog() {
+    let id = cache::identity(
+        "en:release:Android:https://shared/catalog",
+        "same",
+        "a",
+        assets::Provider::Cri,
+    );
+    for scope in [
+        "kr:release:Android:https://shared/catalog",
+        "en:review:Android:https://shared/catalog",
+        "en:release:iOS:https://shared/catalog",
+    ] {
+        assert_ne!(
+            id,
+            cache::identity(scope, "same", "a", assets::Provider::Cri)
+        );
+    }
+}
+
+#[test]
+fn persisted_identity_accepts_legacy_jp_and_rejects_ambiguous_or_reserved_regions() {
+    let mut s = snapshot().snapshot;
+    assert_eq!(s.region_identity().unwrap(), region::Region::Jp);
+    s.schema_version = 2;
+    assert!(s.region_identity().is_err());
+    s.region = Some(region::Region::Cn);
+    assert!(s.region_identity().is_err());
+    s.region = Some(region::Region::Kr);
+    s.platform = "Android".into();
+    assert_eq!(s.region_identity().unwrap(), region::Region::Kr);
+    s.schema_version = 1;
+    assert!(s.region_identity().is_err());
 }

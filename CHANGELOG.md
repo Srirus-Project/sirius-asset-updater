@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0
+
+- Add explicit JP/TW/EN/KR identities and reserve CN without enabling unverified networking.
+- Separate region, platform and environment; reject mismatched known service endpoints.
+- Document capability boundaries and paired-service upgrade requirements in `docs/REGIONS.md`.
+- Validate snapshot region/platform/protocol identity before contacting a CDN; retain legacy JP receipt support.
+- Support safe CDN base paths and Android catalog paths without dropping region-specific prefixes.
+- Include region/platform in publication names and export summaries; scope cache identities by region/environment/platform.
+- Keep Global end-to-end asset acquisition gated on valid observed snapshots and separately configured secrets.
+
+
 ## 1.0.0
 
 - Initial public-release candidate for BanG Dream! Our Notes.

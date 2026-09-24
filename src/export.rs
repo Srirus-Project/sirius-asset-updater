@@ -45,6 +45,8 @@ fn max_output() -> u64 {
 #[derive(Default, Serialize)]
 pub struct ExportSummary {
     pub schema_version: u8,
+    pub region: crate::region::Region,
+    pub platform: String,
     pub complete: bool,
     pub input_files: usize,
     pub catalog_files: usize,
@@ -188,7 +190,9 @@ impl ExportConfig {
             }
         }
         let mut summary = ExportSummary {
-            schema_version: 1,
+            schema_version: 2,
+            region: receipt.snapshot.region.unwrap_or_default(),
+            platform: receipt.snapshot.platform.clone(),
             input_files: assets.len(),
             catalog_files,
             catalog_sha256: receipt.sha256.clone(),

@@ -87,4 +87,16 @@ with tempfile.TemporaryDirectory() as tmp:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+    if m["name"] == "sirius-asset-updater":
+        regional = json.loads((root / "docs/examples/en.yaml").read_text().split("\n", 1)[1])
+        regional.update(internal_token_env="SIRIUS_INTERNAL_TOKEN", refresh_token_env="SIRIUS_API_TOKEN")
+        for auth in regional["cdn_roots"].values():
+            auth.update(username_env="SIRIUS_CDN_USERNAME", credential_env="SIRIUS_CDN_CREDENTIAL")
+        (root / "sirius-asset-config.yaml").write_text(json.dumps(regional))
+        check = subprocess.run([str(exe), "check"], cwd=root, env=env, check=True, capture_output=True, timeout=15)
+        assert json.loads(check.stdout)["ready"]
+        regional["region"] = "cn"
+        (root / "sirius-asset-config.yaml").write_text(json.dumps(regional))
+        check = subprocess.run([str(exe), "check"], cwd=root, env=env, capture_output=True, timeout=15)
+        assert check.returncode != 0 and b"cn is reserved" in check.stderr
     print(f"Archive hashes, runtime files and offline startup passed: {m['name']} {m['version']} ({m['target']})")

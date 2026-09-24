@@ -95,8 +95,15 @@ impl CatalogClient {
                         .await
                         .map_err(|_| Error::Io)?;
                     let url = format!("{remote_dir}/{}", asset.relative_path);
+                    let scoped_catalog = format!(
+                        "{}:{}:{}:{}",
+                        self.config.region.name(),
+                        self.config.environment,
+                        self.config.platform().name(),
+                        catalog_url
+                    );
                     let cache_id = crate::cache::identity(
-                        catalog_url,
+                        &scoped_catalog,
                         catalog_sha256,
                         &asset.relative_path,
                         asset.provider,

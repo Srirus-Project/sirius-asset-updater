@@ -1,0 +1,18 @@
+# JSON is valid YAML. Replace the CDN placeholder with the selected server-list base URL.
+{
+  "region": "kr",
+  "platform": "Android",
+  "protocol_version": "1.0.1",
+  "game_api_root": "http://127.0.0.1:9999",
+  "internal_token_env": "SIRIUS_KR_INTERNAL_TOKEN",
+  "refresh_token_env": "SIRIUS_KR_API_TOKEN",
+  "environment": "release",
+  "client_version": "1.0.1",
+  "output": "./downloads/kr/catalogs",
+  "cdn_roots": {
+    "https://cdn.example.invalid/prod/kr_REPLACE_FROM_SERVER_LIST": {
+      "username_env": "SIRIUS_KR_CDN_USERNAME",
+      "credential_env": "SIRIUS_KR_CDN_CREDENTIAL"
+    }
+  }
+}

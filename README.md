@@ -14,8 +14,16 @@ is retained in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an un
 - Export Unity objects, sprites, Live2D MOC3, inline/SplitAcb audio and USM color/alpha video offline.
 - Validate decoded outputs, exact ADX sample counts and complete video frame counts.
 
-Application version **1.0.0** is independent of the JP iOS 1.0.3 game/protocol baseline.
+Application version **1.1.0** is independent of the JP iOS 1.0.3 game/protocol baseline.
 This is a one-shot CLI. Use an external scheduler for recurring downloads; it does not manage game accounts.
+
+## Regions
+
+Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejected before
+network activity. Use one instance per region. JP retains its existing functionality; Global
+currently supports verified server discovery/version queries and region-aware asset transport,
+not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
+instructions](docs/REGIONS.md) before deploying paired v1.1.0 services.
 
 ## Quick start
 
@@ -82,7 +90,7 @@ See [export formats and limits](docs/EXPORT.md).
 The current JP catalog passed full download and export validation: **13,367 remote resources,
 zero failures**, 896,263 Unity objects and 952,604 outputs (34.59 GB cumulatively).
 This includes 9,259 PNGs, 239 MOC3 models, 27,700 HCA WAVs, 39 ADX WAVs and 222 video tracks
-from 201 USM files. Validation used per-resource cleanup with representative outputs retained.
+from 201 USM files. A production full run also retained and independently SHA-256-verified all 952,604 outputs.
 This does not cover the 28 embedded locations, Unity runtime rendering, complete scene reconstruction
 or future game formats. Alpha and color tracks are exported separately, not composited.
 

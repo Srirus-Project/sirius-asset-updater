@@ -19,6 +19,8 @@ use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("cn is reserved; no verified endpoint or protocol is available")]
+    ReservedRegion,
     #[error("export failed: {0}")]
     Export(String),
     #[error("published output failed offline integrity verification")]
@@ -57,6 +59,12 @@ pub enum Error {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub region: region::Region,
+    #[serde(default)]
+    pub platform: Option<region::Platform>,
+    #[serde(default)]
+    pub protocol_version: Option<String>,
     pub game_api_root: String,
     pub internal_token_env: String,
     #[serde(default)]
@@ -77,6 +85,8 @@ pub struct CdnAuth {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<region::Region>,
     pub schema_version: u8,
     pub environment: String,
     pub platform: String,
@@ -90,7 +100,7 @@ pub struct Snapshot {
     pub observed_at: DateTime<Utc>,
     pub source: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotResponse {
     pub snapshot: Snapshot,
@@ -135,21 +145,78 @@ fn secret(name: &str) -> Result<String, Error> {
         .filter(|s| !s.is_empty())
         .ok_or(Error::Secret)
 }
+fn cdn_root(s: &str) -> bool {
+    Url::parse(s).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && !s.ends_with('/')
+            && !s.contains('%')
+            && !s.contains('\\')
+            && !s.split('/').any(|p| matches!(p, "." | ".."))
+            && u.path().split('/').all(|p| {
+                p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+    })
+}
 impl Config {
+    pub fn platform(&self) -> region::Platform {
+        self.platform.unwrap_or(self.region.default_platform())
+    }
+    pub fn protocol_version(&self) -> &str {
+        self.protocol_version
+            .as_deref()
+            .unwrap_or(self.region.protocol_version())
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
+        if self.region == region::Region::Cn {
+            return Err(Error::ReservedRegion);
+        }
+        for value in self.cdn_roots.keys() {
+            if let Ok(url) = Url::parse(value) {
+                if !self
+                    .region
+                    .matches_known_service(url.host_str().unwrap_or(""), url.path())
+                {
+                    return Err(Error::Config);
+                }
+            }
+        }
         if let Some(assets) = &self.assets {
             assets.validate()?;
         }
         if !root(&self.game_api_root, true)
             || !component(&self.environment)
-            || self.client_version != "1.0.3"
+            || !component(&self.client_version)
+            || !component(self.protocol_version())
             || self.output.as_os_str().is_empty()
             || self.cdn_roots.is_empty()
-            || self.cdn_roots.keys().any(|s| !root(s, false))
+            || self.cdn_roots.keys().any(|s| !cdn_root(s))
         {
             return Err(Error::Config);
         }
         Ok(())
+    }
+}
+impl Snapshot {
+    pub fn region_identity(&self) -> Result<region::Region, Error> {
+        match (self.schema_version, self.region) {
+            (1, None) if self.platform == "iOS" && self.protocol_version == "1.0.3" => {
+                Ok(region::Region::Jp)
+            }
+            (2, Some(region))
+                if region != region::Region::Cn
+                    && matches!(self.platform.as_str(), "iOS" | "Android") =>
+            {
+                Ok(region)
+            }
+            _ => Err(Error::Verification),
+        }
     }
 }
 impl SnapshotResponse {
@@ -158,11 +225,20 @@ impl SnapshotResponse {
         let age = now.signed_duration_since(s.observed_at).num_milliseconds();
         if self.stale
             || !(0..=300_000).contains(&age)
-            || s.schema_version != 1
+            || !match s.schema_version {
+                1 => {
+                    s.region.is_none()
+                        && config.region == region::Region::Jp
+                        && config.platform() == region::Platform::Ios
+                        && s.protocol_version == "1.0.3"
+                }
+                2 => s.region == Some(config.region),
+                _ => false,
+            }
             || s.environment != config.environment
-            || s.platform != "iOS"
+            || s.platform != config.platform().name()
             || s.client_version != config.client_version
-            || s.protocol_version != "1.0.3"
+            || s.protocol_version != config.protocol_version()
             || s.source != "remote"
             || !component(&s.resource_version)
             || !component(&s.platform_hash)
@@ -178,8 +254,11 @@ impl SnapshotResponse {
             return Err(Error::Snapshot);
         }
         Ok(format!(
-            "{}/asset/{}/iOS/{}/catalog_main.bin",
-            s.effective_cdn_root, s.resource_version, s.platform_hash
+            "{}/asset/{}/{}/{}/catalog_main.bin",
+            s.effective_cdn_root,
+            s.resource_version,
+            config.platform().name(),
+            s.platform_hash
         ))
     }
 }
@@ -369,10 +448,12 @@ impl CatalogClient {
         };
         let receipt_bytes = sonic_rs::to_vec_pretty(&receipt).map_err(|_| Error::Io)?;
         write_receipt(staging.path(), &receipt_bytes).await?;
-        let path = self
-            .config
-            .output
-            .join(format!("catalog-{}", uuid::Uuid::new_v4()));
+        let path = self.config.output.join(format!(
+            "catalog-{}-{}-{}",
+            self.config.region.name(),
+            self.config.platform().name(),
+            uuid::Uuid::new_v4()
+        ));
         eprintln!("stage=publish");
         tokio::fs::rename(staging.path(), &path)
             .await
@@ -397,3 +478,5 @@ async fn write_receipt(dir: &Path, bytes: &[u8]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests;
+
+pub mod region;

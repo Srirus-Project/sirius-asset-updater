@@ -10,6 +10,8 @@ use tokio::io::AsyncReadExt;
 #[derive(Serialize)]
 pub struct Verification {
     pub catalog_verified: bool,
+    pub region: crate::region::Region,
+    pub platform: String,
     pub asset_files_verified: usize,
     pub asset_bytes_verified: u64,
     pub planned_remote_files: usize,
@@ -96,6 +98,7 @@ pub async fn verify(directory: &Path) -> Result<Verification, Error> {
     let receipt: Receipt =
         sonic_rs::from_slice(&read(&file(&root, "receipt.json").await?, 64 * 1024 * 1024).await?)
             .map_err(|_| Error::Verification)?;
+    let region = receipt.snapshot.region_identity()?;
     let bytes = read(&file(&root, "catalog_main.bin").await?, 64 * 1024 * 1024).await?;
     if bytes.len() as u64 != receipt.bytes || hex::encode(Sha256::digest(&bytes)) != receipt.sha256
     {
@@ -109,6 +112,8 @@ pub async fn verify(directory: &Path) -> Result<Verification, Error> {
     let plan = catalog.plan(remote)?;
     let mut result = Verification {
         catalog_verified: true,
+        region,
+        platform: receipt.snapshot.platform.clone(),
         asset_files_verified: 0,
         asset_bytes_verified: 0,
         planned_remote_files: plan.assets.len(),

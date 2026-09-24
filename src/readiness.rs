@@ -138,7 +138,10 @@ impl CatalogClient {
         let current = self.observed_snapshot().await?;
         let old = &pinned.snapshot;
         let new = &current.snapshot;
-        if old.resource_version != new.resource_version
+        if old.region != new.region
+            || old.environment != new.environment
+            || old.client_version != new.client_version
+            || old.resource_version != new.resource_version
             || old.platform_hash != new.platform_hash
             || old.platform != new.platform
             || old.protocol_version != new.protocol_version
