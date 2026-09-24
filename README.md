@@ -123,3 +123,5 @@ are separate operations from release preparation.
 For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
 
 Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
+
+See [application logging](docs/APPLICATION_LOG.md) for process logs, separate from HTTP access logs.

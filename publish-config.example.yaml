@@ -13,3 +13,10 @@ storage:
   object_timeout_seconds: 300
   retry_delay_ms: 500
   remove_local_after_upload: false
+
+# Optional application events; default is info/text on stderr. See docs/APPLICATION_LOG.md.
+# logging:
+#   level: info
+#   format: json
+#   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
+#   queue_capacity: 4096

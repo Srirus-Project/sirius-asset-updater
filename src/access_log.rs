@@ -36,6 +36,7 @@ pub enum Rotation {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Output {
     Stdout {},
+    Stderr {},
     File {
         path: PathBuf,
         #[serde(default)]
@@ -191,36 +192,7 @@ pub struct AccessLog(Arc<Inner>);
 impl AccessLog {
     pub fn new(config: Config) -> io::Result<Self> {
         config.validate()?;
-        let writer: Box<dyn Write + Send> = match &config.output {
-            Output::Stdout {} => Box::new(io::stdout()),
-            Output::File {
-                path,
-                rotation,
-                max_files,
-            } => {
-                let directory = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(std::path::Path::new("."));
-                let name = path
-                    .file_name()
-                    .and_then(|p| p.to_str())
-                    .ok_or_else(invalid)?;
-                let rotation = match rotation {
-                    Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
-                    Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
-                    Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
-                };
-                Box::new(
-                    tracing_appender::rolling::Builder::new()
-                        .rotation(rotation)
-                        .filename_prefix(name)
-                        .max_log_files(*max_files)
-                        .build(directory)
-                        .map_err(|_| invalid())?,
-                )
-            }
-        };
+        let writer = config.output.writer()?;
         let (writer, guard) = NonBlockingBuilder::default()
             .buffered_lines_limit(config.queue_capacity)
             .lossy(true)
@@ -321,4 +293,40 @@ async fn access(State(log): State<AccessLog>, mut request: Request, next: Next) 
         .headers_mut()
         .insert("x-request-id", id.parse().expect("generated UUID header"));
     response
+}
+
+impl Output {
+    pub(crate) fn writer(&self) -> io::Result<Box<dyn Write + Send>> {
+        Ok(match self {
+            Output::Stdout {} => Box::new(io::stdout()) as Box<dyn Write + Send>,
+            Output::Stderr {} => Box::new(io::stderr()),
+            Output::File {
+                path,
+                rotation,
+                max_files,
+            } => {
+                let directory = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."));
+                let name = path
+                    .file_name()
+                    .and_then(|p| p.to_str())
+                    .ok_or_else(invalid)?;
+                let rotation = match rotation {
+                    Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
+                    Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
+                    Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
+                };
+                Box::new(
+                    tracing_appender::rolling::Builder::new()
+                        .rotation(rotation)
+                        .filename_prefix(name)
+                        .max_log_files(*max_files)
+                        .build(directory)
+                        .map_err(|_| invalid())?,
+                )
+            }
+        })
+    }
 }

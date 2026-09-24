@@ -47,3 +47,10 @@ regional_routes: false
 #   snapshot_retry: {attempts: 3, delay_ms: 500, max_delay_ms: 5000}
 #   catalog_retry: {attempts: 3, delay_ms: 250, max_delay_ms: 5000}
 #   asset_retry: {attempts: 3, delay_ms: 250, max_delay_ms: 5000}
+
+# Optional application events; default is info/text on stderr. See docs/APPLICATION_LOG.md.
+# logging:
+#   level: info
+#   format: json
+#   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
+#   queue_capacity: 4096

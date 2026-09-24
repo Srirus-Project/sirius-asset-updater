@@ -27,3 +27,10 @@ audio: wav # wav, flac
 # cache_directory: ./cache/decoded
 # Bump after external shared-library/runtime changes without executable changes.
 # cache_revision: ""
+
+# Optional application events; default is info/text on stderr. See docs/APPLICATION_LOG.md.
+# logging:
+#   level: info
+#   format: json
+#   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
+#   queue_capacity: 4096

@@ -2443,7 +2443,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "tracing",
  "tracing-appender",
+ "tracing-subscriber",
  "unity-rs-core",
  "uuid",
  "yaml_serde",
@@ -2852,6 +2854,7 @@ checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
 ]
 
@@ -2866,6 +2869,17 @@ dependencies = [
  "thiserror",
  "time",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

@@ -94,6 +94,8 @@ pub struct Target {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
+    #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
     pub input: PathBuf,
     pub region: Region,
     pub storage: Config,

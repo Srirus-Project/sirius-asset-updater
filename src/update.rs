@@ -121,7 +121,7 @@ impl CatalogClient {
                     };
                     let cache_hit = cached.is_some();
                     if cache_hit {
-                        eprintln!("stage=cache_hit resource={}", asset.relative_path);
+                        tracing::debug!(stage = "cache_hit", "Verified download cache hit");
                     }
                     let mut downloaded = cached;
                     for attempt in 0..self.config.network.asset_retry.attempts {
@@ -137,11 +137,12 @@ impl CatalogClient {
                                 break;
                             }
                             Err(error) => {
-                                eprintln!(
-                                    "stage=asset_attempt_failed attempt={} resource={} error={}",
-                                    attempt + 1,
-                                    asset.relative_path,
-                                    error
+                                tracing::warn!(
+                                    stage = "asset_attempt_failed",
+                                    attempt = attempt + 1,
+                                    error_code = error.code(),
+                                    status = error.http_status(),
+                                    "Asset request failed"
                                 );
                                 if !self.config.network.asset_retry.retry(&error, attempt) {
                                     return Err(error);
@@ -210,11 +211,12 @@ impl CatalogClient {
                 receipt.assets.push(asset);
             }
             next = end;
-            eprintln!(
-                "stage=asset completed={} total={} completed_bytes={}",
-                next,
-                plan.assets.len(),
-                receipt.total_bytes
+            tracing::info!(
+                stage = "asset",
+                completed = next,
+                total = plan.assets.len(),
+                bytes = receipt.total_bytes,
+                "Asset download progress"
             );
         }
         // Preserve the provider/dependency graph, not just a list of bundle names.
@@ -224,7 +226,7 @@ impl CatalogClient {
             .map_err(|_| Error::Io)?;
         file.write_all(&bytes).await.map_err(|_| Error::Io)?;
         file.sync_all().await.map_err(|_| Error::Io)?;
-        eprintln!("stage=version_recheck");
+        tracing::info!(stage = "version_recheck", "Rechecking download version");
         self.revalidate(snapshot).await?;
         Ok(receipt)
     }

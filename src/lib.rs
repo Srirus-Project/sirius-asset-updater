@@ -66,9 +66,45 @@ pub enum Error {
     #[error("local file operation failed")]
     Io,
 }
+impl Error {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Storage => "storage_failed",
+            Self::Selection => "invalid_selection",
+            Self::ReservedRegion => "reserved_region",
+            Self::Export(_) => "export_failed",
+            Self::Verification => "verification_failed",
+            Self::Busy => "cache_busy",
+            Self::Preflight => "preflight_failed",
+            Self::Unavailable => "upstream_unavailable",
+            Self::JobTimeout => "job_timeout",
+            Self::Cancelled => "cancelled",
+            Self::Provider => "unsupported_provider",
+            Self::AssetPath => "invalid_asset_path",
+            Self::Bundle => "invalid_bundle",
+            Self::Config => "invalid_config",
+            Self::Secret => "secret_unavailable",
+            Self::Snapshot => "invalid_snapshot",
+            Self::Transport => "transport_failed",
+            Self::Status(_) => "upstream_http_status",
+            Self::Size => "size_limit",
+            Self::Catalog => "invalid_catalog",
+            Self::Io => "io_failed",
+        }
+    }
+    pub fn http_status(&self) -> Option<u16> {
+        if let Self::Status(code) = self {
+            Some(*code)
+        } else {
+            None
+        }
+    }
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
     #[serde(default)]
     pub region: region::Region,
     #[serde(default)]
@@ -202,6 +238,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(log) = &self.logging {
+            log.validate().map_err(|_| Error::Config)?;
+        }
         self.network.validate()?;
         if self.region == region::Region::Cn {
             return Err(Error::ReservedRegion);
@@ -319,7 +358,11 @@ impl CatalogClient {
         if !self.config.check_secrets().ready {
             return Err(Error::Preflight);
         }
-        eprintln!("stage=output_preflight");
+        tracing::info!(
+            stage = "output_preflight",
+            region = self.config.region.name(),
+            "Download stage"
+        );
         tokio::fs::create_dir_all(&self.config.output)
             .await
             .map_err(|_| Error::Io)?;
@@ -336,7 +379,11 @@ impl CatalogClient {
             .and_then(|c| c.cache_directory.as_ref())
             .map(|root| cache::Guard::acquire(root))
             .transpose()?;
-        eprintln!("stage=snapshot");
+        tracing::info!(
+            stage = "snapshot",
+            region = self.config.region.name(),
+            "Download stage"
+        );
         self.download(self.observed_snapshot().await?).await
     }
     async fn read_snapshot(&self) -> Result<SnapshotResponse, Error> {
@@ -406,7 +453,11 @@ impl CatalogClient {
             .ok_or(Error::Snapshot)?;
         let username = secret(&auth.username_env)?;
         let password = secret(&auth.credential_env)?;
-        eprintln!("stage=catalog_download");
+        tracing::info!(
+            stage = "catalog_download",
+            region = self.config.region.name(),
+            "Download stage"
+        );
         tokio::fs::create_dir_all(&self.config.output)
             .await
             .map_err(|_| Error::Io)?;
@@ -432,10 +483,12 @@ impl CatalogClient {
                     break;
                 }
                 Err(error) => {
-                    eprintln!(
-                        "stage=catalog_attempt_failed attempt={} error={}",
-                        attempt + 1,
-                        error
+                    tracing::warn!(
+                        stage = "catalog_attempt_failed",
+                        attempt = attempt + 1,
+                        error_code = error.code(),
+                        status = error.http_status(),
+                        "Catalog request failed"
                     );
                     if !self.config.network.catalog_retry.retry(&error, attempt) {
                         return Err(error);
@@ -481,7 +534,11 @@ impl CatalogClient {
             self.config.platform().name(),
             uuid::Uuid::new_v4()
         ));
-        eprintln!("stage=publish");
+        tracing::info!(
+            stage = "publish",
+            region = self.config.region.name(),
+            "Download stage"
+        );
         tokio::fs::rename(staging.path(), &path)
             .await
             .map_err(|_| Error::Io)?;
@@ -517,3 +574,5 @@ pub mod export_options;
 pub mod server;
 
 pub mod access_log;
+
+pub mod application_log;

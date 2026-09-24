@@ -140,10 +140,12 @@ impl CatalogClient {
             .await;
             match result {
                 Err(error) if self.config.network.snapshot_retry.retry(&error, attempt) => {
-                    eprintln!(
-                        "stage=snapshot_retry attempt={} error={}",
-                        attempt + 1,
-                        error
+                    tracing::warn!(
+                        stage = "snapshot_retry",
+                        attempt = attempt + 1,
+                        error_code = error.code(),
+                        status = error.http_status(),
+                        "Snapshot request will retry"
                     );
                     tokio::time::sleep(self.config.network.snapshot_retry.delay(attempt)).await;
                 }

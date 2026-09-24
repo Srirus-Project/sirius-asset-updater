@@ -1,9 +1,30 @@
 use sirius_asset_updater::{CatalogClient, Config, Error};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let path = if args.len() == 2 && matches!(args[0].as_str(), "serve" | "export" | "publish") {
+        Some(std::path::PathBuf::from(&args[1]))
+    } else if args.is_empty() || args == ["check"] || args == ["probe"] {
+        Some(std::path::PathBuf::from(
+            std::env::var("SIRIUS_ASSET_CONFIG_PATH")
+                .unwrap_or_else(|_| "sirius-asset-config.yaml".into()),
+        ))
+    } else {
+        None
+    };
+    let _logging = match sirius_asset_updater::application_log::Config::from_file(path.as_deref())
+        .and_then(|c| c.init())
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            tracing::error!(error_code = error.code(), "Sirius asset command failed");
             eprintln!("{error}");
             std::process::ExitCode::from(if matches!(error, Error::Cancelled) {
                 130

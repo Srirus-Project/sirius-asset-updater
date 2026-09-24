@@ -29,6 +29,8 @@ use tokio::sync::{watch, Mutex, Notify};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: Option<crate::server::TlsConfig>,
@@ -92,6 +94,9 @@ struct Inner {
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
+        if let Some(log) = &config.logging {
+            log.validate().map_err(|_| Error::Config)?;
+        }
         if let Some(tls) = &config.tls {
             tls.validate().map_err(|_| Error::Config)?;
         }
@@ -115,7 +120,7 @@ impl Service {
             }
             if let Some(path) = &p.download_config {
                 let c: crate::Config = read_yaml(path)?;
-                if c.region != p.region {
+                if c.region != p.region || c.logging.is_some() {
                     return Err(Error::Config);
                 }
                 c.validate()?;
@@ -123,6 +128,9 @@ impl Service {
             if let Some(path) = &p.export_config {
                 let export: crate::export::ExportConfig = read_yaml(path)?;
                 export.validate()?;
+                if export.logging.is_some() {
+                    return Err(Error::Config);
+                }
                 if p.storage_config.is_some() && !export.retain_outputs {
                     return Err(Error::Config);
                 }
@@ -210,6 +218,7 @@ impl Service {
                 loop {
                     match store.claim() {
                         Ok(Some(job)) => {
+                            tracing::info!(job_id=%job.id, region=job.request.region.name(), stage="started", "Job started");
                             let (tx, rx) = watch::channel(false);
                             controls.insert(job.id.clone(), tx.clone());
                             let service = self.clone();
@@ -245,7 +254,13 @@ impl Service {
                 value=tasks.join_next(),if !tasks.is_empty()=>{
                     if let Some(Ok((id,code)))=value {
                         controls.remove(&id);
-                        if self.inner.store.lock().await.finish(&id,code).is_err(){storage_error=true;stopping=true;}
+                        match self.inner.store.lock().await.finish(&id,code) {
+                            Ok(job) => {
+                                if job.status == Status::Failed { tracing::warn!(job_id=%job.id, region=job.request.region.name(), status=?job.status, error_code=job.failure.as_deref(), "Job ended"); }
+                                else { tracing::info!(job_id=%job.id, region=job.request.region.name(), status=?job.status, "Job ended"); }
+                            }
+                            Err(_) => { tracing::error!(job_id=%id, error_code="job_ledger_failed", "Failed to persist job completion"); storage_error=true;stopping=true; }
+                        }
                     } else {storage_error=true;stopping=true;}
                 }
                 _=self.inner.wake.notified()=>{},
@@ -276,6 +291,7 @@ impl Service {
         }
     }
     async fn phase(&self, id: &str, phase: &str) -> Result<(), Error> {
+        tracing::info!(job_id = id, stage = phase, "Job stage");
         self.inner
             .store
             .lock()
@@ -321,7 +337,7 @@ impl Service {
             self.phase(&job.id, "download").await?;
             let mut config: crate::Config =
                 read_yaml(profile.download_config.as_ref().ok_or(Error::Config)?)?;
-            if config.region != profile.region {
+            if config.region != profile.region || config.logging.is_some() {
                 return Err(Error::Config);
             }
             config.output = root.join("downloads");
@@ -352,7 +368,9 @@ impl Service {
             if let Some(path) = &profile.export_config {
                 self.phase(&job.id, "export").await?;
                 let mut export: crate::export::ExportConfig = read_yaml(path)?;
-                if profile.storage_config.is_some() && !export.retain_outputs {
+                if export.logging.is_some()
+                    || (profile.storage_config.is_some() && !export.retain_outputs)
+                {
                     return Err(Error::Config);
                 }
                 export.input = input;
@@ -567,6 +585,7 @@ pub async fn run_file(path: &Path) -> Result<(), Error> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|_| Error::Io)?;
+    tracing::info!(%listen, "Sirius asset service listening");
     let (tx, rx) = watch::channel(false);
     let worker = service.clone();
     let mut workers = tokio::spawn(async move { worker.run_workers(rx).await });
@@ -647,6 +666,7 @@ mod lifecycle_tests {
         });
         std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
         let config = ServiceConfig {
+            logging: None,
             tls: None,
             access_log: None,
             listen: "127.0.0.1:0".parse().unwrap(),

@@ -16,6 +16,8 @@ use std::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
+    #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
     pub input: PathBuf,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -124,6 +126,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
 }
 impl ExportConfig {
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(log) = &self.logging {
+            log.validate().map_err(|_| Error::Config)?;
+        }
         self.selection.validate()?;
         self.image.validate()?;
         if self.cache_directory.is_some() && !self.retain_outputs
@@ -386,13 +391,13 @@ impl ExportConfig {
                 journal.flush().map_err(err)?;
                 let completed = summary.succeeded + summary.failed;
                 if completed.is_multiple_of(25) || !report.errors.is_empty() {
-                    eprintln!(
-                        "export {}/{} ok={} failed={} outputs={}",
+                    tracing::info!(
+                        stage = "export",
                         completed,
-                        assets.len(),
-                        summary.succeeded,
-                        summary.failed,
-                        summary.output_files
+                        total = assets.len(),
+                        failed = summary.failed,
+                        bytes = summary.output_bytes,
+                        "Resource export progress"
                     );
                 }
                 write_json(&root.join("summary.json"), &summary)?;
@@ -1365,6 +1370,7 @@ pub(crate) mod tests {
     use super::*;
     fn config(root: &Path) -> ExportConfig {
         ExportConfig {
+            logging: None,
             input: root.into(),
             paths: Vec::new(),
             selection: Default::default(),
