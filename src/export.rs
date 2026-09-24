@@ -1405,7 +1405,9 @@ fn adx_layout(bytes: &[u8]) -> Result<(u8, u32, u32, usize), Error> {
         .filter(|n| *n <= bytes.len())
         .ok_or_else(invalid)?;
     if bytes[header..end]
-        .chunks_exact(18)
+        .as_chunks::<18>()
+        .0
+        .iter()
         .any(|b| b[0] & 0x80 != 0)
     {
         return Err(invalid());

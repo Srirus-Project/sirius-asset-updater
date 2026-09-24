@@ -64,7 +64,9 @@ impl Reader<'_> {
                 return Err(Error::Catalog);
             }
             let units: Vec<_> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect();
             String::from_utf16(&units).map_err(|_| Error::Catalog)
@@ -102,8 +104,10 @@ impl Reader<'_> {
     fn ids(&self, id: u32) -> Result<Vec<u32>, Error> {
         Ok(self
             .array(id, 4)?
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect())
     }
 }
@@ -122,7 +126,7 @@ impl Catalog {
         let keys = r.array(r.u32(8)?, 8)?;
         let mut pending = Vec::new();
         let mut links = 0;
-        for key in keys.chunks_exact(8) {
+        for key in keys.as_chunks::<8>().0 {
             let ids = r.ids(u32::from_le_bytes(key[4..8].try_into().unwrap()))?;
             links += ids.len();
             if links > MAX_LINKS {
