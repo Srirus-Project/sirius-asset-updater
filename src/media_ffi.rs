@@ -33,15 +33,15 @@ mod video;
 use self::audio::{choose_sample_format, resample_audio_frame, AudioFifo};
 use self::error::{check, media_error, path_cstring, valid_rational};
 use self::raii::{CodecContext, Frame, InputContext, OutputContext, Packet};
-use self::video::{choose_pixel_format, scale_video_frame};
+use self::video::scale_video_frame;
 
 const AVERROR_EOF: i32 = -541_478_725;
 
 const AVERROR_EAGAIN: i32 = -(ffi::EAGAIN as i32);
 
-pub fn convert_video_to_mp4(usm_file: &Path, mp4_file: &Path) -> Result<(), MediaError> {
+pub fn convert_video_to_mp4(input_file: &Path, mp4_file: &Path) -> Result<(), MediaError> {
     ensure_ffmpeg_loaded()?;
-    unsafe { transcode_video_file_to_mp4(usm_file, mp4_file) }
+    unsafe { transcode_video_file_to_mp4(input_file, mp4_file) }
 }
 
 pub fn convert_m2v_to_mp4(
@@ -139,6 +139,13 @@ impl OutputCodec {
     }
 }
 
+unsafe fn find_encoder(codec: OutputCodec) -> *const ffi::AVCodec {
+    match codec {
+        OutputCodec::H264 => unsafe { ffi::avcodec_find_encoder_by_name(c"libx264".as_ptr()) },
+        OutputCodec::Mp3 => unsafe { ffi::avcodec_find_encoder_by_name(c"libmp3lame".as_ptr()) },
+        _ => unsafe { ffi::avcodec_find_encoder(codec.codec_id()) },
+    }
+}
 unsafe fn transcode_video_file_to_mp4(input: &Path, output: &Path) -> Result<(), MediaError> {
     let input_url = path_cstring(input)?;
     let input_ctx = InputContext::open_file(&input_url, None)?;
@@ -260,7 +267,7 @@ unsafe fn transcode_open_input_to_file(
 
     let output_url = path_cstring(output)?;
     let mut output_ctx = OutputContext::create(&output_url)?;
-    let encoder = unsafe { ffi::avcodec_find_encoder(output_codec.codec_id()) };
+    let encoder = unsafe { find_encoder(output_codec) };
     if encoder.is_null() {
         return Err(media_error(&format!(
             "could not find FFmpeg encoder for codec id {}",
@@ -403,7 +410,7 @@ impl TranscodeStream {
             "avcodec_open2 decoder usm",
         )?;
 
-        let encoder = unsafe { ffi::avcodec_find_encoder(output_codec.codec_id()) };
+        let encoder = unsafe { find_encoder(output_codec) };
         if encoder.is_null() {
             return Err(media_error(&format!(
                 "could not find FFmpeg encoder for codec id {}",
@@ -521,17 +528,50 @@ unsafe fn configure_encoder(
                 (*encoder_ctx).height = (*decoder_ctx).height;
                 (*encoder_ctx).width = (*decoder_ctx).width;
                 (*encoder_ctx).sample_aspect_ratio = (*decoder_ctx).sample_aspect_ratio;
-                (*encoder_ctx).pix_fmt = choose_pixel_format(encoder, (*decoder_ctx).pix_fmt)?;
-                (*encoder_ctx).bit_rate = 4_000_000;
-                (*encoder_ctx).gop_size = 12;
-                (*encoder_ctx).max_b_frames = 2;
+                if (*encoder_ctx).width <= 0
+                    || (*encoder_ctx).height <= 0
+                    || (*encoder_ctx).width % 2 != 0
+                    || (*encoder_ctx).height % 2 != 0
+                {
+                    return Err(media_error(
+                        "H.264 yuv420p requires positive even dimensions",
+                    ));
+                }
+                (*encoder_ctx).pix_fmt = ffi::AV_PIX_FMT_YUV420P;
+                (*encoder_ctx).thread_count = 2;
+                check(
+                    ffi::av_opt_set(
+                        (*encoder_ctx).priv_data,
+                        c"preset".as_ptr(),
+                        c"medium".as_ptr(),
+                        0,
+                    ),
+                    "set H.264 preset",
+                )?;
+                check(
+                    ffi::av_opt_set((*encoder_ctx).priv_data, c"crf".as_ptr(), c"18".as_ptr(), 0),
+                    "set H.264 quality",
+                )?;
+                check(
+                    ffi::av_opt_set(
+                        (*output_ctx).priv_data,
+                        c"movflags".as_ptr(),
+                        c"+faststart".as_ptr(),
+                        0,
+                    ),
+                    "set MP4 faststart",
+                )?;
+                if frame_rate.is_some_and(|rate| rate.numerator <= 0 || rate.denominator <= 0) {
+                    return Err(media_error("invalid explicit frame rate"));
+                }
                 let rate = frame_rate
                     .map(|rate| ffi::AVRational {
                         num: rate.numerator,
                         den: rate.denominator,
                     })
                     .or_else(|| valid_rational((*input_stream).avg_frame_rate))
-                    .unwrap_or(ffi::AVRational { num: 30, den: 1 });
+                    .or_else(|| valid_rational((*input_stream).r_frame_rate))
+                    .ok_or_else(|| media_error("missing video frame rate"))?;
                 (*encoder_ctx).framerate = rate;
                 (*encoder_ctx).time_base = ffi::AVRational {
                     num: rate.den,
@@ -542,10 +582,13 @@ unsafe fn configure_encoder(
                 (*encoder_ctx).sample_rate = (*decoder_ctx).sample_rate;
                 (*encoder_ctx).sample_fmt =
                     choose_sample_format(encoder, (*decoder_ctx).sample_fmt)?;
-                ffi::av_channel_layout_copy(
-                    &mut (*encoder_ctx).ch_layout,
-                    &(*decoder_ctx).ch_layout,
-                );
+                check(
+                    ffi::av_channel_layout_copy(
+                        &mut (*encoder_ctx).ch_layout,
+                        &(*decoder_ctx).ch_layout,
+                    ),
+                    "copy encoder channel layout",
+                )?;
                 if (*encoder_ctx).ch_layout.order == ffi::AV_CHANNEL_ORDER_UNSPEC {
                     let channels = (*encoder_ctx).ch_layout.nb_channels;
                     ffi::av_channel_layout_uninit(&mut (*encoder_ctx).ch_layout);
@@ -660,6 +703,11 @@ unsafe fn prepare_frame_for_encoder(
     unsafe {
         let codec_type = (*encoder_ctx).codec_type;
         if codec_type == ffi::AVMEDIA_TYPE_VIDEO {
+            if (*decoded).width != (*encoder_ctx).width
+                || (*decoded).height != (*encoder_ctx).height
+            {
+                return Err(media_error("video dimensions changed during decoding"));
+            }
             let needs_scale = (*decoded).format != (*encoder_ctx).pix_fmt
                 || (*decoded).width != (*encoder_ctx).width
                 || (*decoded).height != (*encoder_ctx).height;
@@ -669,6 +717,7 @@ unsafe fn prepare_frame_for_encoder(
                 decoded
             };
             (*frame).pts = *frame_index;
+            (*frame).duration = 1;
             *frame_index += 1;
             Ok(frame)
         } else if codec_type == ffi::AVMEDIA_TYPE_AUDIO {
@@ -701,6 +750,12 @@ unsafe fn drain_encoder(
         }
         check(ret, "avcodec_receive_packet")?;
         unsafe {
+            // libx264 in FFmpeg 7 can leave packet duration unset even with frame.duration.
+            // MP4 then ends at the last PTS and its edit list hides the final decoded frame.
+            if (*encoder_ctx).codec_type == ffi::AVMEDIA_TYPE_VIDEO && (*encoded.ptr).duration <= 0
+            {
+                (*encoded.ptr).duration = 1;
+            }
             ffi::av_packet_rescale_ts(
                 encoded.ptr,
                 (*encoder_ctx).time_base,
@@ -1015,5 +1070,215 @@ mod tests {
         );
         assert!(path_cstring(Path::new("https://example.invalid/media.wav")).is_err());
         assert!(path_cstring(Path::new("relative.wav")).is_err());
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG and adjacent ffprobe for independent video verification"]
+    fn ffi_video_preserves_m2v_ivf_frames_and_muxed_audio() {
+        use std::process::Command;
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            streams: Vec<Stream>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Stream {
+            codec_type: String,
+            codec_name: String,
+            width: Option<u32>,
+            height: Option<u32>,
+            pix_fmt: Option<String>,
+            r_frame_rate: Option<String>,
+            nb_read_frames: Option<String>,
+            sample_rate: Option<String>,
+            channels: Option<u32>,
+        }
+        let ffmpeg = std::path::PathBuf::from(std::env::var("SIRIUS_TEST_FFMPEG").unwrap());
+        let ffprobe = ffmpeg.with_file_name(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("audio.wav");
+        std::fs::write(&wav, sine_wav(0.48, 44100, 2)).unwrap();
+        for (extension, encoder) in [("m2v", "mpeg2video"), ("ivf", "libvpx-vp9")] {
+            let input = dir.path().join(format!("source.{extension}"));
+            let encoded = Command::new(&ffmpeg)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=16x16:rate=25",
+                    "-frames:v",
+                    "12",
+                    "-c:v",
+                    encoder,
+                ])
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(
+                encoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            let original = std::fs::read(&input).unwrap();
+            if extension == "m2v" {
+                let invalid = dir.path().join("invalid-rate.mp4");
+                assert!(convert_m2v_to_mp4(
+                    &input,
+                    &invalid,
+                    Some(FrameRate {
+                        numerator: 0,
+                        denominator: 1
+                    })
+                )
+                .is_err());
+                assert!(!invalid.exists());
+            }
+            for audio in [false, true] {
+                let movie = dir.path().join(format!("{extension}-{audio}.mkv"));
+                if audio {
+                    let mux = Command::new(&ffmpeg)
+                        .args([
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-y",
+                            "-fflags",
+                            "+genpts",
+                            "-r",
+                            "25",
+                            "-i",
+                        ])
+                        .arg(&input)
+                        .arg("-i")
+                        .arg(&wav)
+                        .args(["-c", "copy", "-t", "0.48"])
+                        .arg(&movie)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        mux.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&mux.stderr)
+                    );
+                }
+                let output = dir.path().join(format!("{extension}-{audio}.mp4"));
+                if extension == "m2v" && !audio {
+                    convert_m2v_to_mp4(
+                        &input,
+                        &output,
+                        Some(FrameRate {
+                            numerator: 25,
+                            denominator: 1,
+                        }),
+                    )
+                    .unwrap();
+                } else {
+                    convert_video_to_mp4(if audio { &movie } else { &input }, &output).unwrap();
+                }
+                let probe = Command::new(&ffprobe)
+                    .args([
+                        "-v",
+                        "error",
+                        "-count_frames",
+                        "-show_streams",
+                        "-of",
+                        "json",
+                    ])
+                    .arg(&output)
+                    .output()
+                    .unwrap();
+                assert!(probe.status.success());
+                let info: Probe = sonic_rs::from_slice(&probe.stdout).unwrap();
+                let video = info
+                    .streams
+                    .iter()
+                    .find(|s| s.codec_type == "video")
+                    .unwrap();
+                assert_eq!(video.codec_name, "h264");
+                assert_eq!((video.width, video.height), (Some(16), Some(16)));
+                assert_eq!(video.pix_fmt.as_deref(), Some("yuv420p"));
+                assert_eq!(video.r_frame_rate.as_deref(), Some("25/1"));
+                assert_eq!(
+                    video.nb_read_frames.as_deref(),
+                    Some("12"),
+                    "{extension}, audio={audio}: {}",
+                    String::from_utf8_lossy(&probe.stdout)
+                );
+                let decoded = Command::new(&ffmpeg)
+                    .args(["-v", "error", "-xerror", "-i"])
+                    .arg(&output)
+                    .args(["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                    .output()
+                    .unwrap();
+                assert!(decoded.status.success());
+                assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 3);
+                if audio {
+                    let sound = info
+                        .streams
+                        .iter()
+                        .find(|s| s.codec_type == "audio")
+                        .unwrap();
+                    assert_eq!(sound.codec_name, "aac");
+                    assert_eq!(sound.sample_rate.as_deref(), Some("44100"));
+                    assert_eq!(sound.channels, Some(2));
+                    let pcm = Command::new(&ffmpeg)
+                        .args(["-v", "error", "-xerror", "-i"])
+                        .arg(&output)
+                        .args(["-map", "0:a:0", "-f", "s16le", "-"])
+                        .output()
+                        .unwrap();
+                    assert!(pcm.status.success());
+                    assert!(
+                        pcm.stdout
+                            .len()
+                            .abs_diff(std::fs::metadata(&wav).unwrap().len() as usize - 44)
+                            <= 2048 * 4
+                    );
+                } else {
+                    assert_eq!(info.streams.len(), 1);
+                }
+                let mp4 = std::fs::read(&output).unwrap();
+                let mut pos = 0;
+                let mut atoms = Vec::new();
+                while pos + 8 <= mp4.len() {
+                    let size = u32::from_be_bytes(mp4[pos..pos + 4].try_into().unwrap()) as usize;
+                    assert!(size >= 8);
+                    atoms.push(&mp4[pos + 4..pos + 8]);
+                    pos += size;
+                }
+                assert!(
+                    atoms.iter().position(|s| *s == b"moov").unwrap()
+                        < atoms.iter().position(|s| *s == b"mdat").unwrap()
+                );
+            }
+            assert_eq!(std::fs::read(&input).unwrap(), original);
+        }
+        let odd = dir.path().join("odd.mkv");
+        let encoded = Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=17x17:rate=25",
+                "-frames:v",
+                "2",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&odd)
+            .output()
+            .unwrap();
+        assert!(encoded.status.success());
+        let output = dir.path().join("odd.mp4");
+        assert!(convert_video_to_mp4(&odd, &output).is_err());
+        assert!(!output.exists());
     }
 }

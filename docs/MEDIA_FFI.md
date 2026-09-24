@@ -68,3 +68,25 @@ application must account for this process-wide logging setting.
 The caller must still use private output staging and remove partial files on errors/cancellation.
 These codec helpers do not publish, delete or atomically replace export outputs themselves. The
 updater's existing CLI execution path remains in use until the complete adapter is integrated.
+
+## Video bridge verification
+
+The H.264 encoder is explicitly libx264 with medium/CRF 18, yuv420p and two codec threads;
+AAC remains 192 kbit/s. MP3 explicitly selects libmp3lame. Missing encoders are errors. MP4 uses
+faststart. Positive even dimensions are required; changing decoded dimensions is rejected,
+not resized. Explicit frame rates must be positive, and absent stream frame rates are errors
+rather than guessed 30 fps. The bridge currently uses constant-rate frame indexing; variable-rate
+and nonzero-start timestamp equivalence still require review before pipeline integration.
+
+An ignored integration test generates 12-frame M2V and IVF inputs, converts each directly and
+through an MKV with PCM audio, and independently checks H.264/yuv420p, dimensions, frame rate,
+12 decoded frames, AAC sample rate/channels/padding, preserved inputs and moov-before-mdat
+placement with CLI FFmpeg and adjacent ffprobe. Invalid explicit frame rates and odd dimensions
+are rejected before output creation. Run `ffi_video_preserves_m2v_ivf_frames_and_muxed_audio`
+with the same environment/feature flags as the audio integration test. CI runs both tests.
+
+This found and fixed a real tail-frame loss: FFmpeg 7 libx264 can leave packet duration zero
+although frame duration is set. MP4 then ends at the last PTS and its edit list hides the final
+frame. Video packets with unspecified duration now receive one encoder-timebase tick before
+muxer timebase rescaling. Real Sirius/alpha fixtures, production verification and adapter wiring
+remain separate acceptance gates; synthetic success does not complete them.

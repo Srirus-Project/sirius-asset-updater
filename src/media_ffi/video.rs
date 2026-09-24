@@ -37,7 +37,7 @@ pub(super) unsafe fn scale_video_frame(
         if sws.is_null() {
             return Err(media_error("sws_getContext failed"));
         }
-        ffi::sws_scale(
+        let rows = ffi::sws_scale(
             sws,
             (*decoded).data.as_ptr() as *const *const u8,
             (*decoded).linesize.as_ptr(),
@@ -47,25 +47,9 @@ pub(super) unsafe fn scale_video_frame(
             (*converted).linesize.as_mut_ptr(),
         );
         ffi::sws_freeContext(sws);
+        if rows != (*encoder_ctx).height {
+            return Err(media_error("incomplete video pixel conversion"));
+        }
         Ok(converted)
-    }
-}
-
-pub(super) unsafe fn choose_pixel_format(
-    codec: *const ffi::AVCodec,
-    decoder_format: ffi::AVPixelFormat,
-) -> Result<ffi::AVPixelFormat, MediaError> {
-    unsafe {
-        if (*codec).pix_fmts.is_null() {
-            return Ok(decoder_format);
-        }
-        let mut cursor = (*codec).pix_fmts;
-        while *cursor != ffi::AV_PIX_FMT_NONE {
-            if *cursor == decoder_format {
-                return Ok(decoder_format);
-            }
-            cursor = cursor.add(1);
-        }
-        Ok(*(*codec).pix_fmts)
     }
 }
