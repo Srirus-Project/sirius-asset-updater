@@ -131,7 +131,7 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
         if query.contains("uploadId=") {
             state.multipart_puts.fetch_add(1, Ordering::SeqCst);
         }
-        if mode == 4 {
+        if mode == 4 || mode == 8 && attempt > 0 {
             state.gate.notified().await;
         }
         if mode == 5 {
@@ -657,4 +657,63 @@ async fn storage_plan_and_publication_urls_share_region_scoped_targets_without_w
     assert!(!sonic_rs::to_string(&config.plan(Region::Jp).unwrap())
         .unwrap()
         .contains("public_url"));
+}
+
+#[tokio::test]
+async fn upload_progress_counts_only_verified_objects_and_all_destinations() {
+    let source = fixture();
+    let mut server = server().await;
+    server.config.concurrency = 1;
+    server.state.mode.store(8, Ordering::SeqCst);
+    let mut second = server.config.providers[0].clone();
+    second.name = "second".into();
+    second.prefix = "backup".into();
+    server.config.providers.push(second);
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    let (progress_tx, mut progress_rx) = watch::channel(UploadProgress::default());
+    let work =
+        server
+            .config
+            .publish_with_progress(source.path(), Region::Jp, stop_rx, Some(progress_tx));
+    tokio::pin!(work);
+    let partial = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut work => panic!("publication ended before partial progress: {}", result.is_ok()),
+                result = progress_rx.changed() => {
+                    result.unwrap();
+                    let snapshot = progress_rx.borrow().clone();
+                    if snapshot.completed == 1 { break snapshot; }
+                }
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(partial.phase, "publish_upload_1_of_2");
+    assert_eq!(partial.total, 6);
+    assert!(partial.bytes > 0);
+    server.state.mode.store(0, Ordering::SeqCst);
+    server.state.gate.notify_waiters();
+    let publication = tokio::time::timeout(Duration::from_secs(5), work)
+        .await
+        .unwrap()
+        .unwrap();
+    let final_progress = progress_rx.borrow().clone();
+    assert_eq!(final_progress.phase, "publish");
+    assert_eq!(final_progress.completed, 2 * publication.files as u64);
+    assert_eq!(final_progress.completed, final_progress.total);
+    assert_eq!(final_progress.bytes, 2 * publication.bytes);
+
+    let mut server = self::server().await;
+    server.config.concurrency = 1;
+    server.state.mode.store(2, Ordering::SeqCst); // Corrupt read-back must not count as success.
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    let (progress_tx, progress_rx) = watch::channel(UploadProgress::default());
+    assert!(server
+        .config
+        .publish_with_progress(source.path(), Region::Jp, stop_rx, Some(progress_tx))
+        .await
+        .is_err());
+    assert_eq!(progress_rx.borrow().completed, 0);
+    assert_eq!(progress_rx.borrow().bytes, 0);
+    assert!(source.path().exists());
 }

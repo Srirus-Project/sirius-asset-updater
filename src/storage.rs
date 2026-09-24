@@ -117,6 +117,20 @@ fn acl_rules(patterns: &[String]) -> Result<Vec<regex::Regex>, Error> {
         })
         .collect()
 }
+#[derive(Clone, Default)]
+pub struct UploadProgress {
+    pub phase: String,
+    pub completed: u64,
+    pub total: u64,
+    pub bytes: u64,
+}
+impl UploadProgress {
+    fn emit(&self, channel: &Option<watch::Sender<Self>>) {
+        if let Some(channel) = channel {
+            channel.send_replace(self.clone());
+        }
+    }
+}
 #[derive(Serialize)]
 pub struct Publication {
     pub schema_version: u8,
@@ -287,7 +301,16 @@ impl Config {
         &self,
         input: &Path,
         region: Region,
+        stop: watch::Receiver<bool>,
+    ) -> Result<Publication, Error> {
+        self.publish_with_progress(input, region, stop, None).await
+    }
+    pub async fn publish_with_progress(
+        &self,
+        input: &Path,
+        region: Region,
         mut stop: watch::Receiver<bool>,
+        progress_channel: Option<watch::Sender<UploadProgress>>,
     ) -> Result<Publication, Error> {
         if region == Region::Cn {
             return Err(Error::ReservedRegion);
@@ -315,7 +338,17 @@ impl Config {
         }
         let mut total_bytes = 0_u64;
         let mut total_files = 0_usize;
-        for (op, public_op, policy, target) in &operators {
+        let mut progress = UploadProgress {
+            phase: "publish".into(),
+            total: (verified.report.files_verified as u64)
+                .checked_add(2)
+                .and_then(|n| n.checked_mul(operators.len() as u64))
+                .ok_or(Error::Size)?,
+            ..UploadProgress::default()
+        };
+        for (index, (op, public_op, policy, target)) in operators.iter().enumerate() {
+            progress.phase = format!("publish_upload_{}_of_{}", index + 1, operators.len());
+            progress.emit(&progress_channel);
             let inventory = tokio::fs::File::open(verified.inventory.path())
                 .await
                 .map_err(|_| Error::Io)?;
@@ -372,6 +405,10 @@ impl Config {
                     Ok(size) => {
                         files += 1;
                         bytes = bytes.checked_add(size).ok_or(Error::Size)?;
+                        progress.completed =
+                            progress.completed.checked_add(1).ok_or(Error::Size)?;
+                        progress.bytes = progress.bytes.checked_add(size).ok_or(Error::Size)?;
+                        progress.emit(&progress_channel);
                     }
                     Err(e) => {
                         if error.is_none() {
@@ -386,6 +423,8 @@ impl Config {
             total_bytes = bytes;
             total_files = files;
         }
+        progress.phase = "publish_markers".into();
+        progress.emit(&progress_channel);
         // Consumers must ignore prefixes without this last, verified completion marker.
         let marker = sonic_rs::to_vec(&verified.report).map_err(|_| Error::Verification)?;
         for (op, public_op, policy, target) in &operators {
@@ -422,6 +461,8 @@ impl Config {
             return Err(Error::Cancelled);
         }
         if self.remove_local_after_upload {
+            progress.phase = "publish_cleanup".into();
+            progress.emit(&progress_channel);
             // Refuse to delete a changed tree or unlisted local additions.
             let checked = tokio::select! {
                 result = export_verify::verify(&input, region) => result?,
@@ -437,6 +478,8 @@ impl Config {
                 .await
                 .map_err(|_| Error::Io)?;
         }
+        progress.phase = "publish".into();
+        progress.emit(&progress_channel);
         Ok(Publication {
             schema_version: 1,
             id,

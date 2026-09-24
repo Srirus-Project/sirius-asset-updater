@@ -82,8 +82,15 @@ move original global file patterns into each selected S3 provider's include/excl
 The service writes `publication.json` beside its exports directory. CLI success prints the same
 receipt; save stdout outside the export directory if cleanup is enabled. File/byte counts include
 both export receipt files, exclude the completion marker, and are per destination, not multiplied
-by provider count. Service final progress uses these counts. Upload progress currently reports
-the phase followed by final totals, rather than per-object counters.
+by provider count. Service upload progress instead counts all destination copies: completed/total
+objects and verified bytes accumulate across providers. It includes both receipts, excludes markers,
+and advances only after authenticated read-back succeeds (not merely after sending bytes).
+The bounded in-memory watch snapshot is persisted by the service at most once per second and at
+successful completion. Phases identify `publish_upload_N_of_M`, `publish_markers`, optional
+`publish_cleanup`, and final `publish`. Object totals can reach 100% before marker/cleanup completion;
+only the completed job/outcome indicates a successful publication. Short phases may not appear in
+persisted snapshots. Failed/cancelled jobs retain their last persisted progress, not invented totals.
+A progress persistence failure cancels and drains active uploads before failing the job.
 
 Each invocation uses a new UUID; previous publications are never replaced. There is no mutable
 `latest` pointer. Different stores cannot commit atomically: if a later completion-marker write

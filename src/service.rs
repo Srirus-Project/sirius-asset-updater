@@ -449,9 +449,31 @@ impl Service {
                     if let Some(path) = &profile.storage_config {
                         self.phase(&job.id, "publish").await?;
                         let storage: crate::storage::Config = read_yaml(path)?;
-                        let publication = storage
-                            .publish(&output, profile.region, stop.clone())
-                            .await?;
+                        let (progress_tx, progress_rx) =
+                            watch::channel(crate::storage::UploadProgress::default());
+                        let task = storage.publish_with_progress(
+                            &output,
+                            profile.region,
+                            stop.clone(),
+                            Some(progress_tx),
+                        );
+                        tokio::pin!(task);
+                        let publication = loop {
+                            tokio::select! {
+                                result = &mut task => break result?,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                    let snapshot = progress_rx.borrow().clone();
+                                    if !snapshot.phase.is_empty() {
+                                        let progress = Progress { phase: snapshot.phase, completed: snapshot.completed, failed: 0, total: Some(snapshot.total), bytes: snapshot.bytes };
+                                        if self.inner.store.lock().await.progress(&job.id, progress).is_err() {
+                                            let _ = cancel.send(true);
+                                            let _ = task.await;
+                                            return Err(Error::Io);
+                                        }
+                                    }
+                                }
+                            }
+                        };
                         tokio::fs::write(
                             root.join("publication.json"),
                             sonic_rs::to_vec_pretty(&publication).map_err(|_| Error::Io)?,
@@ -466,10 +488,19 @@ impl Service {
                         }
                         final_progress = Progress {
                             phase: "publish".into(),
-                            completed: publication.files as u64,
+                            completed: (publication.files as u64)
+                                .checked_mul(publication.providers.len() as u64)
+                                .ok_or(Error::Size)?,
                             failed: 0,
-                            total: Some(publication.files as u64),
-                            bytes: publication.bytes,
+                            total: Some(
+                                (publication.files as u64)
+                                    .checked_mul(publication.providers.len() as u64)
+                                    .ok_or(Error::Size)?,
+                            ),
+                            bytes: publication
+                                .bytes
+                                .checked_mul(publication.providers.len() as u64)
+                                .ok_or(Error::Size)?,
                         };
                     }
                 }
