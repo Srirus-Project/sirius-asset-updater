@@ -97,3 +97,23 @@ requires `complete=true`, `full_catalog=true`, `full_export=true`, zero failures
 independent retained-file verification. A subset may complete successfully while
 `full_export=false`; selecting classes absent from all inputs cannot report success.
 Legacy summaries missing new fields deserialize conservatively with `full_export=false`.
+
+## Resource and media concurrency
+
+`concurrency` bounds concurrently processed resources (1..4). `media_concurrency` separately
+bounds FFmpeg processing children shared by those resource workers (1..4, default 2).
+Native parsing/image conversion can progress while other resources wait for a media slot.
+Audio conversion, video remux/encoding and independent decode validation share this limit;
+the one-off executable version probe precedes resource execution.
+
+`media_timeout_seconds` covers both admission wait and subprocess execution. Waiting observes
+cancellation at most every 20 ms and never launches a child after a cancelled/expired admission.
+A slot is released on normal completion, cancellation, deadline or spawn failure. Existing child
+cancellation/deadline handling kills and reaps the process before returning.
+
+Limits apply per export job, not host-wide: multiply the media limit by active service jobs when
+planning capacity. A lower media limit may require a longer media deadline for long videos.
+The default permits two processing children rather than tying child count to four resource workers.
+Set 4 explicitly for the previous potential parallelism. These options control scheduling, not
+output identity, and do not invalidate content caches by themselves. They are not hard RSS limits;
+output byte budgets, download concurrency and storage upload concurrency are separate controls.

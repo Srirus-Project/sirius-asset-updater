@@ -41,6 +41,10 @@ pub struct ExportConfig {
     pub split_acb_xor_env: Option<String>,
     #[serde(default = "default_workers")]
     pub concurrency: usize,
+    #[serde(default = "default_media_concurrency")]
+    pub media_concurrency: usize,
+    #[serde(skip)]
+    media_gate: std::sync::Arc<crate::media_gate::Gate>,
     #[serde(default = "media_timeout")]
     pub media_timeout_seconds: u64,
     #[serde(skip)]
@@ -48,6 +52,9 @@ pub struct ExportConfig {
     pub ffmpeg: PathBuf,
     #[serde(default = "max_output")]
     pub max_resource_output_bytes: u64,
+}
+fn default_media_concurrency() -> usize {
+    2
 }
 fn media_timeout() -> u64 {
     120
@@ -147,6 +154,7 @@ impl ExportConfig {
         }
         if !(1..=3600).contains(&self.media_timeout_seconds)
             || !(1..=4).contains(&self.concurrency)
+            || !(1..=4).contains(&self.media_concurrency)
             || self.max_resource_output_bytes == 0
             || self.max_resource_output_bytes > 16 * 1024 * 1024 * 1024
         {
@@ -1199,6 +1207,11 @@ impl ExportConfig {
         ])
     }
     fn ffmpeg(&self, args: &[std::ffi::OsString]) -> Result<(), Error> {
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(self.media_timeout_seconds);
+        let _permit =
+            self.media_gate
+                .acquire(self.media_concurrency, &self.cancel, started + timeout)?;
         let stderr = tempfile::tempfile().map_err(err)?;
         let mut child = Command::new(&self.ffmpeg)
             .env_remove(&self.cri_key_env)
@@ -1208,13 +1221,12 @@ impl ExportConfig {
             .stderr(stderr.try_clone().map_err(err)?)
             .spawn()
             .map_err(err)?;
-        let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().map_err(err)? {
                 break status;
             }
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-                || started.elapsed().as_secs() >= self.media_timeout_seconds
+                || started.elapsed() >= timeout
             {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1443,6 +1455,8 @@ pub(crate) mod tests {
             cri_key_env: "UNUSED_TEST_KEY".into(),
             split_acb_xor_env: None,
             concurrency: 1,
+            media_concurrency: 2,
+            media_gate: Default::default(),
             media_timeout_seconds: 120,
             cancel: Default::default(),
             ffmpeg: "unused".into(),
@@ -1534,6 +1548,103 @@ pub(crate) mod tests {
             assert_eq!(fs::read(&source).unwrap(), original);
         }
         assert!(yaml_serde::from_str::<VideoExport>("avi").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn media_process_gate_bounds_children_and_cancels_or_times_out_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("media-fixture");
+        let log = directory.path().join("events");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho start >> '{}'\nsleep 0.1\necho end >> '{}'\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        for limit in [1, 2] {
+            let mut cfg = config(directory.path());
+            cfg.ffmpeg = script.clone();
+            cfg.media_concurrency = limit;
+            let cfg = std::sync::Arc::new(cfg);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let cfg = cfg.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        cfg.ffmpeg(&[])
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+            let mut active = 0usize;
+            let mut starts = 0;
+            for event in fs::read_to_string(&log).unwrap().lines() {
+                if event == "start" {
+                    active += 1;
+                    starts += 1;
+                } else {
+                    active -= 1;
+                }
+                assert!(active <= limit);
+            }
+            assert_eq!(starts, 8);
+            assert_eq!(active, 0);
+            fs::remove_file(&log).unwrap();
+        }
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = script.clone();
+        cfg.media_concurrency = 1;
+        let cfg = std::sync::Arc::new(cfg);
+        let gate = cfg.media_gate.clone();
+        let hold = gate
+            .acquire(
+                1,
+                &cfg.cancel,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let child_cfg = cfg.clone();
+        let worker = std::thread::spawn(move || child_cfg.ffmpeg(&[]));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cfg.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+        assert!(!log.exists());
+        drop(hold);
+        let mut cfg = std::sync::Arc::try_unwrap(cfg).ok().unwrap();
+        cfg.cancel.store(false, Ordering::Relaxed);
+        cfg.media_timeout_seconds = 1;
+        let hold = gate
+            .acquire(
+                1,
+                &cfg.cancel,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(cfg.ffmpeg(&[]).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!log.exists());
+        drop(hold);
+        cfg.ffmpeg = directory.path().join("missing-executable");
+        assert!(cfg.ffmpeg(&[]).is_err());
+        cfg.ffmpeg = script;
+        cfg.ffmpeg(&[]).unwrap();
+        assert_eq!(fs::read_to_string(log).unwrap(), "start\nend\n");
+        cfg.media_concurrency = 0;
+        assert!(cfg.validate().is_err());
+        cfg.media_concurrency = 5;
+        assert!(cfg.validate().is_err());
     }
     #[test]
     fn export_selection_and_format_configuration_fail_closed() {
