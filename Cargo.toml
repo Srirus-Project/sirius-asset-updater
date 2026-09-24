@@ -13,7 +13,13 @@ publish = false
 name = "sirius-asset-updater"
 path = "src/main.rs"
 
+[features]
+default = []
+media-ffi = ["dep:rsmpeg", "dep:libc"]
+
 [dependencies]
+libc = { version = "0.2", optional = true }
+rsmpeg = { version = "=0.18.0", default-features = false, features = ["ffmpeg7_1", "link_system_ffmpeg"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 opendal = { version = "=0.58.2", default-features = false, features = ["services-fs", "services-s3", "executors-tokio"] }

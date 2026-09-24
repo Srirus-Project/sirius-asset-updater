@@ -4,6 +4,8 @@ mod cache;
 pub mod catalog;
 pub mod export;
 pub mod export_verify;
+#[cfg(feature = "media-ffi")]
+pub mod media_ffi;
 pub mod network;
 pub mod proxy;
 pub mod readiness;

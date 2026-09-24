@@ -18,3 +18,8 @@ package manager. It is not included in the standalone release archives.
 
 Storage uses [Apache OpenDAL](https://opendal.apache.org/) 0.58.2 under Apache-2.0.
 Its [license](../LICENSE-opendal) and [notice](../NOTICE-opendal) are included in archives and images.
+
+The optional FFmpeg FFI codec bridge in `src/media_ffi*` is adapted from Haruki's generic
+media layer at commit `3d33ed037f0ef5009e361e0535b3b19f8c239947` and retains its MIT attribution.
+It uses MIT-licensed [rsmpeg](https://github.com/larksuite/rsmpeg) and separately installed
+FFmpeg 7 libraries. See [development status and integration requirements](MEDIA_FFI.md).

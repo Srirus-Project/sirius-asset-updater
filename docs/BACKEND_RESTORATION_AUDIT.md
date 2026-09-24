@@ -47,7 +47,9 @@ Relevant original sources:
 
 Sirius currently uses native Rust Unity/CRI parsing and the configured FFmpeg executable for
 media conversion/validation. This restores media results but does not restore FFI/Auto backend
-selection. That remains required work. The reusable codec portions can be adapted independently
+selection. That remains required work. A feature-gated codec bridge now compiles against FFmpeg 7 and
+passes synthetic audio/ownership tests; see [MEDIA_FFI.md](MEDIA_FFI.md). It is not yet connected
+to export configuration, cancellation or the video acceptance pipeline. The codec portions are adapted independently
 of Sekai's encryption, model/chart conventions and game configuration; preserve Haruki attribution.
 Do not import the entire Sekai pipeline solely to obtain its codec layer.
 
