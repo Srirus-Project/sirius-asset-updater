@@ -6,6 +6,7 @@ pub mod export;
 pub mod export_verify;
 pub mod network;
 pub mod readiness;
+pub mod storage;
 mod update;
 pub mod verify;
 use chrono::{DateTime, Utc};
@@ -21,6 +22,8 @@ use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("storage publication failed")]
+    Storage,
     #[error("unknown or empty catalog selection key")]
     Selection,
     #[error("cn is reserved; no verified endpoint or protocol is available")]

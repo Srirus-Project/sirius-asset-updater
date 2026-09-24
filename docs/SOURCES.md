@@ -15,3 +15,6 @@ The legacy USM audio mask adapter is derived from cridecoder; its MIT notice is
 retained in [LICENSE-cridecoder](../LICENSE-cridecoder).
 [FFmpeg](https://ffmpeg.org/) is installed separately or through the Docker distribution's
 package manager. It is not included in the standalone release archives.
+
+Storage uses [Apache OpenDAL](https://opendal.apache.org/) 0.58.2 under Apache-2.0.
+Its [license](../LICENSE-opendal) and [notice](../NOTICE-opendal) are included in archives and images.

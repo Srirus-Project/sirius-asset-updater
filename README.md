@@ -91,6 +91,9 @@ Retained exports can be independently checked with `sirius-asset-updater verify-
 (use the expected region). Service jobs run this check after retained export and write
 `export-verification.json` beside the exports directory. See [export verification](docs/EXPORT_VERIFY.md).
 
+Optional [verified local/S3 publication](docs/STORAGE.md) is available through service profiles or
+`sirius-asset-updater publish publish-config.yaml`.
+
 See [export formats and limits](docs/EXPORT.md) and [incremental export](docs/EXPORT_CACHE.md).
 
 The current JP catalog passed full download and export validation: **13,367 remote resources,

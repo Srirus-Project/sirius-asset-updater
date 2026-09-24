@@ -65,6 +65,7 @@ pub struct Profile {
     pub region: Region,
     pub download_config: Option<PathBuf>,
     pub export_config: Option<PathBuf>,
+    pub storage_config: Option<PathBuf>,
     /// Configured source for standalone verify/export. Update uses its own publication.
     pub input: Option<PathBuf>,
 }
@@ -122,6 +123,16 @@ impl Service {
             if let Some(path) = &p.export_config {
                 let export: crate::export::ExportConfig = read_yaml(path)?;
                 export.validate()?;
+                if p.storage_config.is_some() && !export.retain_outputs {
+                    return Err(Error::Config);
+                }
+            }
+            if let Some(path) = &p.storage_config {
+                if p.export_config.is_none() {
+                    return Err(Error::Config);
+                }
+                let storage: crate::storage::Config = read_yaml(path)?;
+                storage.validate()?;
             }
         }
         let token = std::env::var(&config.token_env).map_err(|_| Error::Secret)?;
@@ -341,6 +352,9 @@ impl Service {
             if let Some(path) = &profile.export_config {
                 self.phase(&job.id, "export").await?;
                 let mut export: crate::export::ExportConfig = read_yaml(path)?;
+                if profile.storage_config.is_some() && !export.retain_outputs {
+                    return Err(Error::Config);
+                }
                 export.input = input;
                 export.output = root.join("exports");
                 let output = export.output.clone();
@@ -392,6 +406,26 @@ impl Service {
                         total: Some(report.files_verified as u64),
                         bytes: report.bytes_verified,
                     };
+                    if let Some(path) = &profile.storage_config {
+                        self.phase(&job.id, "publish").await?;
+                        let storage: crate::storage::Config = read_yaml(path)?;
+                        let publication = storage
+                            .publish(&output, profile.region, stop.clone())
+                            .await?;
+                        tokio::fs::write(
+                            root.join("publication.json"),
+                            sonic_rs::to_vec_pretty(&publication).map_err(|_| Error::Io)?,
+                        )
+                        .await
+                        .map_err(|_| Error::Io)?;
+                        final_progress = Progress {
+                            phase: "publish".into(),
+                            completed: publication.files as u64,
+                            failed: 0,
+                            total: Some(publication.files as u64),
+                            bytes: publication.bytes,
+                        };
+                    }
                 }
             }
         }
@@ -626,6 +660,7 @@ mod lifecycle_tests {
             profiles: BTreeMap::from([(
                 "download".into(),
                 Profile {
+                    storage_config: None,
                     region: Region::Jp,
                     download_config: Some(download),
                     export_config: None,

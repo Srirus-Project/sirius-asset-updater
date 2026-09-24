@@ -1,0 +1,22 @@
+# Profile storage_config points to this file. See docs/STORAGE.md.
+providers:
+  - name: local
+    prefix: assets
+    backend:
+      type: local
+      directory: ./published-assets
+  # - name: s3
+  #   prefix: assets
+  #   backend:
+  #     type: s3
+  #     endpoint: https://s3.example.com
+  #     bucket: sirius-assets
+  #     region: auto
+  #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID
+  #     secret_access_key_env: SIRIUS_STORAGE_SECRET_ACCESS_KEY
+  #     session_token_env: SIRIUS_STORAGE_SESSION_TOKEN # optional temporary credentials
+concurrency: 4
+attempts: 3
+object_timeout_seconds: 300
+retry_delay_ms: 500
+remove_local_after_upload: false

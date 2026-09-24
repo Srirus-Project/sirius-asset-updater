@@ -22,6 +22,17 @@ async fn run() -> Result<(), Error> {
     if args.len() == 2 && args[0] == "serve" {
         return sirius_asset_updater::service::run_file(std::path::Path::new(&args[1])).await;
     }
+    if args.len() == 2 && args[0] == "publish" {
+        let config: sirius_asset_updater::storage::Command =
+            yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
+                .map_err(|_| Error::Config)?;
+        let publication = config.storage.run(&config.input, config.region).await?;
+        println!(
+            "{}",
+            sonic_rs::to_string_pretty(&publication).map_err(|_| Error::Verification)?
+        );
+        return Ok(());
+    }
     if args.len() == 2 && args[0] == "export" {
         let config: sirius_asset_updater::export::ExportConfig =
             yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
@@ -40,7 +51,7 @@ async fn run() -> Result<(), Error> {
         };
     }
     if args == ["--help"] {
-        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
+        println!("usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG]\ncheck: offline config/secrets validation\nprobe: refresh/read Game API snapshot without CDN requests\nno arguments: execute configured downloads");
         return Ok(());
     }
     if args.len() == 3 && args[0] == "verify-export" {
@@ -88,7 +99,7 @@ async fn run() -> Result<(), Error> {
     }
     if !args.is_empty() && args != ["check"] && args != ["probe"] {
         eprintln!(
-            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG]"
+            "usage: sirius-asset-updater [serve CONFIG | check | probe | verify DIRECTORY | verify-export DIRECTORY REGION | inspect-catalog FILE | inspect-keys FILE | export CONFIG | publish CONFIG]"
         );
         return Err(Error::Config);
     }

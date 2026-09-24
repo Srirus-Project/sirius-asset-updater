@@ -30,12 +30,14 @@ with tempfile.TemporaryDirectory() as tmp:
     shutil.copy2(source, stage / exe)
     for filename in ["README.md", "CHANGELOG.md", config]:
         shutil.copy2(root / filename, stage / filename)
-    for license_file in root.glob("LICENSE*"):
+    for license_file in list(root.glob("LICENSE*")) + list(root.glob("NOTICE*")):
         shutil.copy2(license_file, stage / license_file.name)
     shutil.copytree(root / "docs", stage / "docs")
     if name == "sirius-api-proxy":
         shutil.copytree(root / "protocol", stage / "protocol")
     else:
+        shutil.copy2(root / "storage-config.example.yaml", stage / "storage-config.example.yaml")
+        shutil.copy2(root / "publish-config.example.yaml", stage / "publish-config.example.yaml")
         shutil.copy2(root / "export-config.example.yaml", stage / "export-config.example.yaml")
         shutil.copy2(root / "sirius-service-config.example.yaml", stage / "sirius-service-config.example.yaml")
     manifest = {"name": name, "version": version, "target": a.target, "files": {}}

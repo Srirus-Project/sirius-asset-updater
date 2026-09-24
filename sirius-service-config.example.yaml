@@ -13,6 +13,7 @@ profiles:
     region: jp
     download_config: ./sirius-asset-config.yaml
     export_config: ./export-config.yaml
+    # storage_config: ./storage-config.yaml # requires retained exports
     # Optional verified publication for standalone export/verify operations:
     # input: ./downloads/catalogs/PUBLISHED_DIRECTORY
 

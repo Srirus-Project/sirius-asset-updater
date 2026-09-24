@@ -1,0 +1,398 @@
+use super::*;
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::header,
+    response::Response,
+    routing::any,
+    Router,
+};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{atomic::AtomicUsize, Mutex},
+};
+fn local(directory: PathBuf) -> Provider {
+    Provider {
+        name: "local".into(),
+        prefix: "assets".into(),
+        backend: Backend::Local { directory },
+    }
+}
+fn config(provider: Provider) -> Config {
+    Config {
+        providers: vec![provider],
+        concurrency: 2,
+        attempts: 2,
+        object_timeout_seconds: 5,
+        retry_delay_ms: 1,
+        remove_local_after_upload: false,
+    }
+}
+fn fixture() -> tempfile::TempDir {
+    crate::export_verify::tests::fixture()
+}
+#[tokio::test]
+async fn local_publication_readback_region_scope_and_explicit_cleanup() {
+    let source = fixture();
+    let destination = tempfile::tempdir().unwrap();
+    let mut config = config(local(destination.path().into()));
+    let (_tx, rx) = watch::channel(false);
+    let result = config
+        .publish(source.path(), Region::Jp, rx.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.files, 3);
+    assert!(!result.local_removed && source.path().exists());
+    let prefix = &result.providers[0].prefix;
+    assert!(prefix.starts_with("assets/jp/publications/"));
+    assert_eq!(
+        std::fs::read(destination.path().join(prefix).join("00000/payload.bin")).unwrap(),
+        b"synthetic export"
+    );
+    assert!(destination
+        .path()
+        .join(prefix)
+        .join("complete.json")
+        .is_file());
+    config.remove_local_after_upload = true;
+    let result2 = config.publish(source.path(), Region::Jp, rx).await.unwrap();
+    assert_ne!(result.id, result2.id);
+    assert!(result2.local_removed && !source.path().exists());
+    assert!(destination
+        .path()
+        .join(prefix)
+        .join("complete.json")
+        .is_file());
+}
+#[derive(Default)]
+struct Fake {
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+    parts: Mutex<BTreeMap<usize, Vec<u8>>>,
+    mode: AtomicUsize,
+    puts: AtomicUsize,
+    multipart_puts: AtomicUsize,
+    aborts: AtomicUsize,
+    unsigned: AtomicBool,
+    gate: tokio::sync::Notify,
+}
+async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
+    let method = request.method().clone();
+    let key = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("").to_string();
+    if !request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 Credential=synthetic-access/"))
+    {
+        state.unsigned.store(true, Ordering::SeqCst);
+    }
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 6 && method == "GET" {
+        return Response::builder()
+            .status(403)
+            .body(Body::from("<Error><Code>AccessDenied</Code></Error>"))
+            .unwrap();
+    }
+    if method == "DELETE" {
+        state.aborts.fetch_add(1, Ordering::SeqCst);
+        return Response::builder().status(204).body(Body::empty()).unwrap();
+    }
+    if method == "POST" && query.contains("uploads") {
+        return Response::builder().body(Body::from("<InitiateMultipartUploadResult><UploadId>synthetic-upload</UploadId></InitiateMultipartUploadResult>")).unwrap();
+    }
+    if method == "PUT" {
+        let attempt = state.puts.fetch_add(1, Ordering::SeqCst);
+        if mode == 1 && attempt == 0 {
+            return Response::builder()
+                .status(503)
+                .body(Body::from("<Error><Code>ServiceUnavailable</Code></Error>"))
+                .unwrap();
+        }
+        if mode == 3 || mode == 7 && key.ends_with("complete.json") {
+            return Response::builder()
+                .status(403)
+                .body(Body::from("<Error><Code>AccessDenied</Code></Error>"))
+                .unwrap();
+        }
+        if query.contains("uploadId=") {
+            state.multipart_puts.fetch_add(1, Ordering::SeqCst);
+        }
+        if mode == 4 {
+            state.gate.notified().await;
+        }
+        if mode == 5 {
+            return Response::builder()
+                .status(307)
+                .header(header::LOCATION, "/redirected")
+                .body(Body::empty())
+                .unwrap();
+        }
+        let data = axum::body::to_bytes(request.into_body(), 32 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec();
+        if query.contains("uploadId=") {
+            let part = query
+                .split('&')
+                .find_map(|s| s.strip_prefix("partNumber="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            state.parts.lock().unwrap().insert(part, data);
+        } else {
+            state.objects.lock().unwrap().insert(key, data);
+        }
+        return Response::builder()
+            .header(header::ETAG, "\"synthetic-etag\"")
+            .body(Body::empty())
+            .unwrap();
+    }
+    if method == "POST" && query.contains("uploadId=") {
+        let data = state
+            .parts
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        state.objects.lock().unwrap().insert(key, data);
+        return Response::builder().body(Body::from("<CompleteMultipartUploadResult><ETag>synthetic-etag</ETag></CompleteMultipartUploadResult>")).unwrap();
+    }
+    let objects = state.objects.lock().unwrap();
+    let Some(data) = objects.get(&key) else {
+        return Response::builder().status(404).body(Body::empty()).unwrap();
+    };
+    if method == "HEAD" {
+        return Response::builder()
+            .header(header::CONTENT_LENGTH, data.len())
+            .body(Body::empty())
+            .unwrap();
+    }
+    let mut data = data.clone();
+    if mode == 2 && !data.is_empty() {
+        data[0] ^= 1;
+    }
+    if let Some(range) = request.headers().get(header::RANGE) {
+        let range = range.to_str().unwrap().strip_prefix("bytes=").unwrap();
+        let (a, b) = range.split_once('-').unwrap();
+        let a: usize = a.parse().unwrap();
+        let b: usize = if b.is_empty() {
+            data.len() - 1
+        } else {
+            b.parse().unwrap()
+        };
+        return Response::builder()
+            .status(206)
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {a}-{b}/{}", data.len()),
+            )
+            .body(Body::from(data[a..=b].to_vec()))
+            .unwrap();
+    }
+    Response::builder().body(Body::from(data)).unwrap()
+}
+struct Server {
+    state: Arc<Fake>,
+    config: Config,
+    task: tokio::task::JoinHandle<()>,
+    env: [String; 2],
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+        for name in &self.env {
+            std::env::remove_var(name);
+        }
+    }
+}
+async fn server() -> Server {
+    let state = Arc::new(Fake::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .fallback(any(handle))
+        .with_state(state.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let env = [
+        format!("SIRIUS_STORAGE_ACCESS_{}", uuid::Uuid::new_v4().simple()),
+        format!("SIRIUS_STORAGE_SECRET_{}", uuid::Uuid::new_v4().simple()),
+    ];
+    std::env::set_var(&env[0], "synthetic-access");
+    std::env::set_var(&env[1], "synthetic-secret");
+    let config = config(Provider {
+        name: "s3".into(),
+        prefix: "assets".into(),
+        backend: Backend::S3 {
+            endpoint,
+            bucket: "synthetic-bucket".into(),
+            region: "test-region".into(),
+            access_key_id_env: env[0].clone(),
+            secret_access_key_env: env[1].clone(),
+            session_token_env: None,
+        },
+    });
+    Server {
+        state,
+        config,
+        task,
+        env,
+    }
+}
+#[tokio::test]
+async fn s3_signed_upload_retry_readback_and_failure_preserves_source() {
+    for mode in [0, 1, 2, 3, 5, 6, 7] {
+        let source = fixture();
+        let mut server = server().await;
+        server.state.mode.store(mode, Ordering::SeqCst);
+        server.config.concurrency = 1;
+        server.config.remove_local_after_upload = true;
+        let (_tx, rx) = watch::channel(false);
+        let result = server.config.publish(source.path(), Region::Jp, rx).await;
+        if mode <= 1 {
+            assert!(
+                result.is_ok(),
+                "mode {mode}: {}",
+                result.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            assert!(!source.path().exists());
+            assert_eq!(
+                server.state.puts.load(Ordering::SeqCst),
+                4 + usize::from(mode == 1)
+            );
+        } else {
+            assert!(result.is_err());
+            assert!(source.path().exists());
+            assert!(!server
+                .state
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.ends_with("complete.json")));
+            if mode == 3 || mode == 5 {
+                assert_eq!(server.state.puts.load(Ordering::SeqCst), 1);
+            }
+        }
+        assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    }
+}
+#[tokio::test]
+async fn multiple_destinations_must_pass_before_markers_or_cleanup() {
+    let source = fixture();
+    let local_root = tempfile::tempdir().unwrap();
+    let mut server = server().await;
+    server
+        .config
+        .providers
+        .insert(0, local(local_root.path().into()));
+    server.config.remove_local_after_upload = true;
+    server.state.mode.store(3, Ordering::SeqCst);
+    let (_tx, rx) = watch::channel(false);
+    assert!(server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .is_err());
+    assert!(source.path().join("00000/payload.bin").is_file());
+    let publications = local_root.path().join("assets/jp/publications");
+    let publication = std::fs::read_dir(publications)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(publication.join("00000/payload.bin").is_file());
+    assert!(!publication.join("complete.json").exists());
+}
+fn large_source() -> tempfile::TempDir {
+    let root = fixture();
+    let data = vec![0x5a; 9 * 1024 * 1024];
+    std::fs::write(root.path().join("00000/payload.bin"), &data).unwrap();
+    let path = root.path().join("resources.jsonl");
+    let mut report: crate::export::ResourceReport =
+        sonic_rs::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    report.outputs[0].bytes = data.len() as u64;
+    report.outputs[0].sha256 = hex::encode(Sha256::digest(&data));
+    let mut bytes = sonic_rs::to_vec(&report).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).unwrap();
+    let path = root.path().join("summary.json");
+    let mut summary: crate::export::ExportSummary =
+        sonic_rs::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    summary.output_bytes = data.len() as u64;
+    std::fs::write(path, sonic_rs::to_vec(&summary).unwrap()).unwrap();
+    root
+}
+#[tokio::test]
+async fn multipart_success_and_cancellation_abort_without_cleanup() {
+    let source = large_source();
+    let server = server().await;
+    let (tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Jp, rx.clone())
+        .await
+        .unwrap();
+    assert_eq!(server.state.parts.lock().unwrap().len(), 2);
+    server.state.mode.store(4, Ordering::SeqCst);
+    server.state.puts.store(0, Ordering::SeqCst);
+    server.state.multipart_puts.store(0, Ordering::SeqCst);
+    let work = server.config.publish(source.path(), Region::Jp, rx);
+    tokio::pin!(work);
+    let cancel = async {
+        while server.state.multipart_puts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tx.send(true).unwrap();
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(work, cancel) })
+            .await
+            .unwrap();
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(source.path().exists());
+    assert!(server.state.aborts.load(Ordering::SeqCst) > 0);
+}
+#[test]
+fn invalid_config_fails_closed_and_source_overlap_is_rejected() {
+    let source = fixture();
+    let config = config(local(source.path().into()));
+    assert!(config.providers[0].operator(source.path()).is_err());
+    let mut config = config;
+    config.concurrency = 0;
+    assert!(config.validate().is_err());
+    config.concurrency = 1;
+    config.providers[0].prefix = "../outside".into();
+    assert!(config.validate().is_err());
+    assert!(
+        yaml_serde::from_str::<Backend>("type: local\ndirectory: /tmp\nsecret: ignored").is_err()
+    );
+}
+
+#[tokio::test]
+async fn storage_timeouts_are_bounded_and_zero_byte_objects_roundtrip() {
+    let source = fixture();
+    let mut server = server().await;
+    server.state.mode.store(4, Ordering::SeqCst);
+    server.config.attempts = 1;
+    server.config.object_timeout_seconds = 1;
+    server.config.remove_local_after_upload = true;
+    let (_tx, rx) = watch::channel(false);
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        server.config.publish(source.path(), Region::Jp, rx),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(Error::Transport)));
+    assert!(source.path().join("00000/payload.bin").exists());
+    server.state.mode.store(0, Ordering::SeqCst);
+    let op = server.config.providers[0].operator(source.path()).unwrap();
+    op.write("empty", Vec::<u8>::new()).await.unwrap();
+    check_remote(&op, "empty", 0, &hex::encode(Sha256::digest([])))
+        .await
+        .unwrap();
+}

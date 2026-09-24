@@ -1521,6 +1521,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
         profiles: BTreeMap::from([(
             "verify".into(),
             Profile {
+                storage_config: None,
                 region: region::Region::Jp,
                 download_config: None,
                 export_config: None,
@@ -2075,6 +2076,8 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
     let cache = directory.path().join("export-cache");
     let yaml = format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {key}\nffmpeg: {:?}\ncache_directory: {:?}\n", std::env::var("SIRIUS_TEST_FFMPEG").unwrap(), cache);
     std::fs::write(&export, yaml).unwrap();
+    let storage = directory.path().join("storage.yaml");
+    let destination = directory.path().join("published");
     let config = || ServiceConfig {
         tls: None,
         access_log: None,
@@ -2089,6 +2092,7 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         profiles: BTreeMap::from([(
             "export".into(),
             Profile {
+                storage_config: Some(storage.clone()),
                 region: region::Region::Jp,
                 download_config: None,
                 export_config: Some(export.clone()),
@@ -2097,7 +2101,23 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         )]),
     };
     let mut previous = None;
-    for expected_hits in [0, 1] {
+    for (round, expected_hits) in [0, 1, 1].into_iter().enumerate() {
+        let failed = round == 2;
+        let target = if failed {
+            let path = directory.path().join("not-a-directory");
+            std::fs::write(&path, "synthetic failure").unwrap();
+            path
+        } else {
+            destination.clone()
+        };
+        std::fs::write(
+            &storage,
+            format!(
+                "providers:\n  - name: local\n    backend: {{type: local, directory: {:?}}}\n",
+                target
+            ),
+        )
+        .unwrap();
         let service = Service::open(config()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/api/v1/jobs", listener.local_addr().unwrap());
@@ -2135,9 +2155,18 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         })
         .await
         .unwrap();
-        assert_eq!(finished.status, Status::Completed);
-        assert_eq!(finished.progress.phase, "verify_export");
-        assert_eq!(finished.progress.completed, 2);
+        assert_eq!(
+            finished.status,
+            if failed {
+                Status::Failed
+            } else {
+                Status::Completed
+            }
+        );
+        if !failed {
+            assert_eq!(finished.progress.phase, "publish");
+            assert_eq!(finished.progress.completed, 4);
+        }
         let output = directory
             .path()
             .join("jobs/jp")
@@ -2158,6 +2187,20 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
             Some(summary.output_bytes)
         );
         let wav = std::fs::read(output.join("00000/00000.wav")).unwrap();
+        let receipt = output.parent().unwrap().join("publication.json");
+        if failed {
+            assert!(!receipt.exists());
+        } else {
+            let value: sonic_rs::Value =
+                sonic_rs::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+            let prefix = value["providers"][0]["prefix"].as_str().unwrap();
+            assert_eq!(
+                std::fs::read(destination.join(prefix).join("00000/00000.wav")).unwrap(),
+                wav
+            );
+            assert!(destination.join(prefix).join("complete.json").is_file());
+        }
+
         if let Some(previous) = previous {
             assert_eq!(wav, previous);
         }

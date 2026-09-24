@@ -48,6 +48,34 @@ with tempfile.TemporaryDirectory() as tmp:
         subprocess.run([str(exe), "--help"], cwd=root, env=env, check=True, capture_output=True, timeout=15)
         check = subprocess.run([str(exe), "check"], cwd=root, env=env, check=True, capture_output=True, timeout=15)
         assert json.loads(check.stdout)["ready"]
+        assert {"storage-config.example.yaml", "publish-config.example.yaml", "LICENSE-opendal", "NOTICE-opendal"} <= actual
+        export = root / "synthetic-export"
+        (export / "00000").mkdir(parents=True)
+        payload = b"synthetic publication smoke"
+        (export / "00000" / "payload.bin").write_bytes(payload)
+        resource = {"source": "synthetic.bundle", "source_sha256": "a" * 64,
+                    "output_directory": "00000", "objects": 0, "selected_objects": 0,
+                    "skipped_objects": 0, "errors": [], "outputs": [{"path": "payload.bin",
+                    "kind": "binary", "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}]}
+        (export / "resources.jsonl").write_text(json.dumps(resource) + "\n")
+        summary = {"schema_version": 4, "region": "jp", "platform": "iOS", "complete": True,
+                   "retained": True, "full_catalog": True, "full_export": True, "input_files": 1,
+                   "catalog_files": 1, "unity_objects": 0, "catalog_sha256": "b" * 64,
+                   "succeeded": 1, "failed": 0, "output_files": 1, "output_bytes": len(payload),
+                   "payloads": {"binary": 1}}
+        (export / "summary.json").write_text(json.dumps(summary))
+        destination = root / "synthetic-published"
+        publish = {"input": str(export), "region": "jp", "storage": {"providers": [
+            {"name": "local", "backend": {"type": "local", "directory": str(destination)}}]}}
+        config_file = root / "publish-config.yaml"
+        config_file.write_text(json.dumps(publish))
+        result = subprocess.run([str(exe), "publish", str(config_file)], cwd=root, env=env,
+                                check=True, capture_output=True, timeout=30)
+        receipt = json.loads(result.stdout)
+        published = destination / receipt["providers"][0]["prefix"]
+        assert receipt["files"] == 3 and not receipt["local_removed"]
+        assert (published / "00000" / "payload.bin").read_bytes() == payload
+        assert (published / "complete.json").is_file() and export.exists()
     else:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))

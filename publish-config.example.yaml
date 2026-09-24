@@ -1,0 +1,15 @@
+# Run: sirius-asset-updater publish publish-config.yaml
+input: ./exports/retained-export
+region: jp
+storage:
+  providers:
+    - name: local
+      prefix: assets
+      backend:
+        type: local
+        directory: ./published-assets
+  concurrency: 4
+  attempts: 3
+  object_timeout_seconds: 300
+  retry_delay_ms: 500
+  remove_local_after_upload: false

@@ -14,6 +14,8 @@ name = "sirius-asset-updater"
 path = "src/main.rs"
 
 [dependencies]
+opendal = { version = "=0.58.2", default-features = false, features = ["services-fs", "services-s3", "executors-tokio"] }
+opendal-http-transport-reqwest = { version = "=0.58.2", default-features = false, features = ["rustls"] }
 tracing-appender = "0.2"
 ipnet = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -23,7 +23,7 @@ and at most one million resource records. It holds one resource's output-path se
 and writes a temporary JSON-lines allowlist containing each output plus both receipt files.
 The temporary allowlist is removed on failure, cancellation or after the caller releases it.
 No payload is uploaded or removed by this command. The allowlist is the input boundary for
-storage publication; upload/read-back/cleanup support is still pending.
+[storage publication](STORAGE.md), which separately rechecks upload and read-back bytes before cleanup.
 
 Keep the source directory immutable and owned by the updater throughout verification and
 publication. The verifier rejects observed links and detects receipt changes, but is not a

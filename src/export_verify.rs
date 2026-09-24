@@ -4,7 +4,7 @@ use crate::{
     region::Region,
     Error,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -37,7 +37,7 @@ pub struct VerifiedExport {
     pub report: Report,
     pub inventory: tempfile::NamedTempFile,
 }
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Object {
     pub path: String,
     pub bytes: u64,
@@ -355,9 +355,9 @@ pub async fn prepare(directory: &Path, region: Region) -> Result<VerifiedExport,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn fixture() -> tempfile::TempDir {
+    pub(crate) fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("00000")).unwrap();
         std::fs::write(root.path().join("00000/payload.bin"), b"synthetic export").unwrap();

@@ -9,7 +9,7 @@ RUN cargo build --release --locked
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata ffmpeg && addgroup -S sirius && adduser -S -G sirius sirius
 WORKDIR /app
-COPY --from=builder /app/LICENSE* /usr/share/licenses/sirius-asset-updater/
+COPY --from=builder /app/LICENSE* /app/NOTICE* /usr/share/licenses/sirius-asset-updater/
 COPY --from=builder /app/target/release/sirius-asset-updater /usr/local/bin/sirius-asset-updater
 ENV SIRIUS_ASSET_CONFIG_PATH=/app/sirius-asset-config.yaml
 ARG VERSION=dev
