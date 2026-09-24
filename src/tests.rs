@@ -13,6 +13,7 @@ fn config() -> Config {
         platform: None,
         protocol_version: None,
         game_api_root: "http://127.0.0.1:9999".into(),
+        regional_routes: false,
         internal_token_env: "TOKEN".into(),
         refresh_token_env: None,
         environment: "release".into(),
@@ -148,7 +149,11 @@ async fn serve(
     };
     let app = Router::new()
         .route(
-            "/api/v1/system",
+            if cfg.regional_routes {
+                "/api/v1/jp/system"
+            } else {
+                "/api/v1/system"
+            },
             get(|State(f): State<Fixture>, headers: HeaderMap| async move {
                 f.seen.lock().unwrap().push((
                     "system".into(),
@@ -173,7 +178,11 @@ async fn serve(
             }),
         )
         .route(
-            "/internal/v1/resources/snapshot",
+            if cfg.regional_routes {
+                "/internal/v1/jp/resources/snapshot"
+            } else {
+                "/internal/v1/resources/snapshot"
+            },
             get(|State(f): State<Fixture>, headers: HeaderMap| async move {
                 f.seen.lock().unwrap().push((
                     "snapshot".into(),
@@ -1830,4 +1839,30 @@ fn root_filters_keep_required_dependencies_and_prioritize_selected_assets() {
         ..Default::default()
     };
     assert!(invalid.validate().is_err());
+}
+
+#[tokio::test]
+async fn regional_proxy_refresh_and_snapshot_keep_token_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = dir.path().into();
+    cfg.regional_routes = true;
+    let token = format!("SIRIUS_REGIONAL_REFRESH_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "regional-public-token");
+    cfg.refresh_token_env = Some(token);
+    let (client, fixture, server) = serve(cfg, StatusCode::OK, catalog(), Duration::ZERO).await;
+    let output = client.fetch().await.unwrap();
+    assert!(output.join("receipt.json").is_file());
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(
+        seen[0],
+        ("system".into(), "Bearer regional-public-token".into())
+    );
+    assert_eq!(
+        seen[1],
+        ("snapshot".into(), "Bearer internal-fixture".into())
+    );
+    assert_eq!(seen[2].0, "catalog");
+    assert!(seen[2].1.starts_with("Basic "));
+    server.abort();
 }

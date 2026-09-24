@@ -37,6 +37,7 @@ with tempfile.TemporaryDirectory() as tmp:
         shutil.copytree(root / "protocol", stage / "protocol")
     else:
         shutil.copy2(root / "export-config.example.yaml", stage / "export-config.example.yaml")
+        shutil.copy2(root / "sirius-service-config.example.yaml", stage / "sirius-service-config.example.yaml")
     manifest = {"name": name, "version": version, "target": a.target, "files": {}}
     for item in sorted(stage.rglob("*")):
         if item.is_symlink():

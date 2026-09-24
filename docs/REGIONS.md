@@ -70,3 +70,11 @@ must not be parsed as the previous `catalog-UUID` naming convention.
 
 `cn` has no default API/CDN, invented area ID, copied Global protocol or fallback to JP.
 Enabling it later requires verified endpoints, login/protobuf contracts and resource behavior.
+
+## Multi-region API deployment
+
+Set `regional_routes: true` to use `/api/v1/{region}/system` and
+`/internal/v1/{region}/resources/snapshot` on a multi-region proxy. Both requests
+use the configured region and their separate public/internal bearer references.
+The default is false for existing single-region proxies. `game_api_root` remains
+an origin, without a path. Snapshot identity and credential checks are unchanged.

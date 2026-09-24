@@ -68,6 +68,9 @@ pub struct Config {
     #[serde(default)]
     pub protocol_version: Option<String>,
     pub game_api_root: String,
+    /// Use /api/v1/{region} and /internal/v1/{region} on a multi-region proxy.
+    #[serde(default)]
+    pub regional_routes: bool,
     pub internal_token_env: String,
     #[serde(default)]
     pub refresh_token_env: Option<String>,
@@ -166,6 +169,19 @@ fn cdn_root(s: &str) -> bool {
     })
 }
 impl Config {
+    pub(crate) fn api_url(&self, internal: bool, suffix: &str) -> String {
+        let scope = if internal { "internal" } else { "api" };
+        if self.regional_routes {
+            format!(
+                "{}/{scope}/v1/{}/{suffix}",
+                self.game_api_root,
+                self.region.name()
+            )
+        } else {
+            format!("{}/{scope}/v1/{suffix}", self.game_api_root)
+        }
+    }
+
     pub fn platform(&self) -> region::Platform {
         self.platform.unwrap_or(self.region.default_platform())
     }
@@ -313,10 +329,7 @@ impl CatalogClient {
     }
     async fn read_snapshot(&self) -> Result<SnapshotResponse, Error> {
         let token = secret(&self.config.internal_token_env)?;
-        let url = format!(
-            "{}/internal/v1/resources/snapshot",
-            self.config.game_api_root
-        );
+        let url = self.config.api_url(true, "resources/snapshot");
         let response = self
             .http
             .get(url)

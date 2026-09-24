@@ -30,3 +30,6 @@ cdn_roots:
 #   decrypt:
 #     key_hex_env: SIRIUS_BUNDLE_KEY_HEX
 #     nonce_seed_hex_env: SIRIUS_BUNDLE_NONCE_SEED_HEX
+
+# Set true when using a multi-region API deployment. The region selects both routes.
+regional_routes: false

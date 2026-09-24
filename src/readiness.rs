@@ -87,7 +87,7 @@ impl CatalogClient {
         let Some(name) = &self.config.refresh_token_env else {
             return Ok(());
         };
-        let url = format!("{}/api/v1/system", self.config.game_api_root);
+        let url = self.config.api_url(false, "system");
         let response = self
             .http
             .get(url)
