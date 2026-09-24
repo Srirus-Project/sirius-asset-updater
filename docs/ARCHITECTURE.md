@@ -29,15 +29,15 @@ Only the first min(16384, size) bytes change. Plain Unity bundles and decrypted
 bundles must start with UnityFS; this is a header check, not full Unity parsing.
 CRI files remain byte-for-byte as downloaded.
 
-Transport failures, HTTP 429 and 5xx get at most three attempts with exponential
-backoff. Each retry restarts its unpublished file; there is no HTTP Range append.
-401/403, redirects, malformed catalogs, size siriustions and decrypt failures are
+Transport failures, HTTP 429 and 5xx get three attempts by default with exponential
+backoff. Request deadlines and retry policies are [configurable](NETWORK.md). Each retry restarts its unpublished file; there is no HTTP Range append.
+401/403, redirects, malformed catalogs, size violations and decrypt failures are
 terminal. Credentials are origin-scoped and never included in receipts.
 
 After all files are ready, the updater re-reads the snapshot. It must be fresh and
 match the original resource version, platform hash, CDN and credential reference.
 An optional refresh_token_env uses a separate API-scope bearer token to invoke
-Game API /system at startup, between files after 120 seconds, and before publishing.
+Game API /system at startup, between batches after the configured interval (120 seconds by default), and before publishing.
 Without it another caller must keep Game API observations fresh. Maintenance,
 refresh failure or identity changes stop the run. Account registration is never performed.
 

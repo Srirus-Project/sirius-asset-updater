@@ -33,3 +33,14 @@ cdn_roots:
 
 # Set true when using a multi-region API deployment. The region selects both routes.
 regional_routes: false
+
+# Optional request policy; these are the defaults. See docs/NETWORK.md.
+# network:
+#   connect_timeout_ms: 10000
+#   download_timeout_ms: 60000
+#   snapshot_timeout_ms: 10000
+#   refresh_timeout_ms: 30000
+#   revalidate_interval_ms: 120000
+#   snapshot_retry: {attempts: 3, delay_ms: 500, max_delay_ms: 5000}
+#   catalog_retry: {attempts: 3, delay_ms: 250, max_delay_ms: 5000}
+#   asset_retry: {attempts: 3, delay_ms: 250, max_delay_ms: 5000}

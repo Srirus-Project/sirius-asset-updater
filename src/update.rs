@@ -69,7 +69,9 @@ impl CatalogClient {
         let mut last_check = tokio::time::Instant::now();
         let mut next = 0;
         while next < plan.assets.len() {
-            if last_check.elapsed() >= Duration::from_secs(120) {
+            if last_check.elapsed()
+                >= Duration::from_millis(self.config.network.revalidate_interval_ms)
+            {
                 self.revalidate(snapshot).await?;
                 last_check = tokio::time::Instant::now();
             }
@@ -122,7 +124,7 @@ impl CatalogClient {
                         eprintln!("stage=cache_hit resource={}", asset.relative_path);
                     }
                     let mut downloaded = cached;
-                    for attempt in 0..3 {
+                    for attempt in 0..self.config.network.asset_retry.attempts {
                         if downloaded.is_some() {
                             break;
                         }
@@ -141,14 +143,11 @@ impl CatalogClient {
                                     asset.relative_path,
                                     error
                                 );
-                                let retry = matches!(
-                                    error,
-                                    Error::Transport | Error::Status(429 | 500..=599)
-                                );
-                                if !retry || attempt == 2 {
+                                if !self.config.network.asset_retry.retry(&error, attempt) {
                                     return Err(error);
                                 }
-                                tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+                                tokio::time::sleep(self.config.network.asset_retry.delay(attempt))
+                                    .await;
                             }
                         }
                     }

@@ -3,6 +3,7 @@ pub mod assets;
 mod cache;
 pub mod catalog;
 pub mod export;
+pub mod network;
 pub mod readiness;
 mod update;
 pub mod verify;
@@ -70,6 +71,8 @@ pub struct Config {
     #[serde(default)]
     pub protocol_version: Option<String>,
     pub game_api_root: String,
+    #[serde(default)]
+    pub network: network::Network,
     /// Use /api/v1/{region} and /internal/v1/{region} on a multi-region proxy.
     #[serde(default)]
     pub regional_routes: bool,
@@ -194,6 +197,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        self.network.validate()?;
         if self.region == region::Region::Cn {
             return Err(Error::ReservedRegion);
         }
@@ -299,8 +303,8 @@ impl CatalogClient {
                 env!("CARGO_PKG_VERSION")
             ))
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_millis(config.network.download_timeout_ms))
+            .connect_timeout(Duration::from_millis(config.network.connect_timeout_ms))
             .build()
             .map_err(|_| Error::Transport)?;
         Ok(Self { config, http })
@@ -336,7 +340,9 @@ impl CatalogClient {
             .http
             .get(url)
             .bearer_auth(token)
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_millis(
+                self.config.network.snapshot_timeout_ms,
+            ))
             .send()
             .await
             .map_err(|_| Error::Transport)?;
@@ -405,7 +411,7 @@ impl CatalogClient {
             .tempdir_in(&self.config.output)
             .map_err(|_| Error::Io)?;
         let mut downloaded = None;
-        for attempt in 0..3 {
+        for attempt in 0..self.config.network.catalog_retry.attempts {
             match self
                 .download_catalog_once(
                     &url,
@@ -425,12 +431,10 @@ impl CatalogClient {
                         attempt + 1,
                         error
                     );
-                    if !matches!(error, Error::Transport | Error::Status(429 | 500..=599))
-                        || attempt == 2
-                    {
+                    if !self.config.network.catalog_retry.retry(&error, attempt) {
                         return Err(error);
                     }
-                    tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+                    tokio::time::sleep(self.config.network.catalog_retry.delay(attempt)).await;
                 }
             }
         }

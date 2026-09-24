@@ -13,6 +13,7 @@ fn config() -> Config {
         platform: None,
         protocol_version: None,
         game_api_root: "http://127.0.0.1:9999".into(),
+        network: Default::default(),
         regional_routes: false,
         internal_token_env: "TOKEN".into(),
         refresh_token_env: None,
@@ -1879,4 +1880,161 @@ async fn regional_proxy_refresh_and_snapshot_keep_token_scopes() {
     assert_eq!(seen[2].0, "catalog");
     assert!(seen[2].1.starts_with("Basic "));
     server.abort();
+}
+
+#[tokio::test]
+async fn configured_download_retry_counts_apply_to_catalog_assets_and_snapshot() {
+    for (status, attempts) in [
+        (StatusCode::SERVICE_UNAVAILABLE, 2),
+        (StatusCode::FORBIDDEN, 1),
+    ] {
+        for asset_stage in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            cfg.output = root.path().into();
+            cfg.network.catalog_retry.attempts = 2;
+            cfg.network.catalog_retry.delay_ms = 1;
+            cfg.network.asset_retry.attempts = 2;
+            cfg.network.asset_retry.delay_ms = 1;
+            let bytes = if asset_stage {
+                enable_assets(&mut cfg, false);
+                catalog_fixture(
+                    &[("{Fwk.Resource.RemoteAssetDir}/sound", CRI_PROVIDER)],
+                    false,
+                )
+            } else {
+                catalog()
+            };
+            let (client, f, server) = serve(
+                cfg,
+                if asset_stage { StatusCode::OK } else { status },
+                bytes,
+                Duration::ZERO,
+            )
+            .await;
+            if asset_stage {
+                f.assets
+                    .lock()
+                    .unwrap()
+                    .insert("sound".into(), (status, vec![]));
+            }
+            assert!(matches!(client.fetch().await, Err(Error::Status(_))));
+            let path = if asset_stage { "sound" } else { "catalog" };
+            assert_eq!(
+                f.seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(p, _)| p == path)
+                    .count(),
+                attempts
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            server.abort();
+        }
+    }
+    let mut cfg = config();
+    cfg.network.snapshot_retry.attempts = 2;
+    cfg.network.snapshot_retry.delay_ms = 1;
+    let env = format!("SIRIUS_RETRY_REFRESH_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, "refresh-fixture");
+    cfg.refresh_token_env = Some(env);
+    let (client, f, server) = serve(cfg, StatusCode::OK, vec![], Duration::ZERO).await;
+    *f.system_failures.lock().unwrap() = 10;
+    assert!(matches!(client.probe().await, Err(Error::Status(502))));
+    assert_eq!(
+        f.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == "system")
+            .count(),
+        2
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn configured_download_timeout_and_cancelled_backoff_leave_no_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = root.path().into();
+    cfg.network.download_timeout_ms = 100;
+    cfg.network.catalog_retry.attempts = 1;
+    let (client, f, server) = serve(cfg, StatusCode::OK, catalog(), Duration::from_secs(2)).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), client.fetch())
+            .await
+            .unwrap(),
+        Err(Error::Transport)
+    ));
+    assert_eq!(
+        f.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == "catalog")
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    server.abort();
+    let mut cfg = config();
+    cfg.output = root.path().into();
+    cfg.network.catalog_retry.delay_ms = 5000;
+    let (client, f, server) = serve(
+        cfg,
+        StatusCode::SERVICE_UNAVAILABLE,
+        catalog(),
+        Duration::ZERO,
+    )
+    .await;
+    let job = tokio::spawn(async move { client.fetch().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.seen.lock().unwrap().iter().all(|(p, _)| p != "catalog") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    server.abort();
+}
+
+#[test]
+fn download_network_policy_defaults_caps_backoff_and_rejects_invalid_values() {
+    let defaults = network::Network::default();
+    defaults.validate().unwrap();
+    assert_eq!(defaults.snapshot_retry.delay_ms, 500);
+    assert_eq!(defaults.catalog_retry.attempts, 3);
+    assert_eq!(defaults.asset_retry.delay(7), Duration::from_millis(5000));
+    for yaml in [
+        "connect_timeout_ms: 0",
+        "download_timeout_ms: 300001",
+        "snapshot_timeout_ms: 0",
+        "refresh_timeout_ms: 0",
+        "revalidate_interval_ms: 120001",
+        "asset_retry: {attempts: 0}",
+        "catalog_retry: {attempts: 9}",
+        "snapshot_retry: {delay_ms: 1000, max_delay_ms: 500}",
+    ] {
+        assert!(
+            yaml_serde::from_str::<network::Network>(yaml)
+                .unwrap()
+                .validate()
+                .is_err(),
+            "{yaml}"
+        );
+    }
+    for error in [
+        Error::Status(403),
+        Error::Catalog,
+        Error::Verification,
+        Error::Bundle,
+        Error::Secret,
+    ] {
+        assert!(!defaults.asset_retry.retry(&error, 0));
+    }
 }

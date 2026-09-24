@@ -15,12 +15,13 @@ is retained in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an un
 - Validate decoded outputs, exact ADX sample counts and complete video frame counts.
 
 Application version **1.1.0** is independent of the JP iOS 1.0.3 game/protocol baseline.
-This is a one-shot CLI. Use an external scheduler for recurring downloads; it does not manage game accounts.
+The restoration branch also provides an [authenticated job service](docs/JOB_SERVICE.md).
+Use an external scheduler for recurring downloads; the updater does not manage game accounts.
 
 ## Regions
 
 Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejected before
-network activity. Use one instance per region. JP retains its existing functionality; Global
+network activity. CLI configurations select one region; the job service accepts regional profiles. JP retains its existing functionality; Global
 currently supports verified server discovery/version queries and region-aware asset transport,
 not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.1.0 services.
@@ -48,6 +49,7 @@ The default example downloads only the catalog. Enable `assets` to download all 
 Set `assets.decrypt` to decrypt bundle prefixes using a 16-byte key and 8-byte nonce seed,
 provided as hexadecimal environment variables. No real game keys are distributed.
 Concurrency defaults to 4 (range 1–16); per-file and total byte limits bound downloads.
+See [request policy](docs/NETWORK.md) for configurable deadlines and retries.
 Cache and published resources occupy separate space, and old cache versions are not removed automatically.
 
 Each published directory contains `catalog_main.bin`, `receipt.json`, a resource plan and,

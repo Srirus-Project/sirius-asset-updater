@@ -92,7 +92,9 @@ impl CatalogClient {
             .http
             .get(url)
             .bearer_auth(secret(name)?)
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_millis(
+                self.config.network.refresh_timeout_ms,
+            ))
             .send()
             .await
             .map_err(|_| Error::Transport)?;
@@ -109,7 +111,7 @@ impl CatalogClient {
     }
     /// Refresh and read are separate scoped requests: neither token reaches a CDN.
     pub(crate) async fn observed_snapshot(&self) -> Result<SnapshotResponse, Error> {
-        for attempt in 0..3 {
+        for attempt in 0..self.config.network.snapshot_retry.attempts {
             let result = async {
                 self.refresh_version().await?;
                 let snapshot = self.read_snapshot().await?;
@@ -118,16 +120,13 @@ impl CatalogClient {
             }
             .await;
             match result {
-                Err(error)
-                    if attempt < 2
-                        && matches!(error, Error::Transport | Error::Status(429 | 500..=599)) =>
-                {
+                Err(error) if self.config.network.snapshot_retry.retry(&error, attempt) => {
                     eprintln!(
                         "stage=snapshot_retry attempt={} error={}",
                         attempt + 1,
                         error
                     );
-                    tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+                    tokio::time::sleep(self.config.network.snapshot_retry.delay(attempt)).await;
                 }
                 value => return value,
             }
