@@ -10,3 +10,14 @@ media_timeout_seconds: 120
 max_resource_output_bytes: 2147483648
 # Empty means every downloaded resource. Exact receipt paths can select a subset.
 paths: []
+# Empty provider/class lists retain all types. Class IDs are exact Unity IDs.
+selection:
+  providers: [] # unity, cri
+  unity_class_ids: [] # e.g. [28, 213] for Texture2D and Sprite
+  embedded_audio: true
+# Native lossless image formats: png, webp, bmp, tga.
+# JPEG requires both quality (1..100) and an explicit RGB background.
+# image: {format: jpeg, quality: 90, background: [255, 255, 255]}
+image: {format: png}
+# FLAC is validated by an exact PCM roundtrip. USM keeps Matroska video.
+audio: wav # wav, flac

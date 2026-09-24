@@ -112,7 +112,8 @@ impl Service {
                 c.validate()?;
             }
             if let Some(path) = &p.export_config {
-                let _: crate::export::ExportConfig = read_yaml(path)?;
+                let export: crate::export::ExportConfig = read_yaml(path)?;
+                export.validate()?;
             }
         }
         let token = std::env::var(&config.token_env).map_err(|_| Error::Secret)?;

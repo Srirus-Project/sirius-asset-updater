@@ -43,3 +43,6 @@ Embedded RuntimePath entries are recorded, not downloaded from the CDN.
 The tutorial has a separate address-list asset and runtime required-address logic. No tutorial
 preset is provided until that composition is verified. MasterDownload's presentation/tips
 priority is unrelated to bundle download priority.
+
+For decoded Unity class selection and image/audio settings, see [export options](EXPORT_OPTIONS.md).
+Full export acceptance also requires `summary.full_export=true`.

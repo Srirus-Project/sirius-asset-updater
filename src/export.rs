@@ -17,6 +17,12 @@ pub struct ExportConfig {
     pub input: PathBuf,
     #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub selection: crate::export_options::Selection,
+    #[serde(default)]
+    pub image: crate::export_options::ImageExport,
+    #[serde(default)]
+    pub audio: crate::export_options::AudioExport,
     pub output: PathBuf,
     #[serde(default)]
     pub retain_outputs: bool,
@@ -45,6 +51,18 @@ fn max_output() -> u64 {
 #[derive(Default, Deserialize, Serialize)]
 pub struct ExportSummary {
     pub full_catalog: bool,
+    #[serde(default)]
+    pub full_export: bool,
+    #[serde(default)]
+    pub selection: crate::export_options::Selection,
+    #[serde(default)]
+    pub image: crate::export_options::ImageExport,
+    #[serde(default)]
+    pub audio: crate::export_options::AudioExport,
+    #[serde(default)]
+    pub selected_unity_objects: usize,
+    #[serde(default)]
+    pub skipped_unity_objects: usize,
     pub schema_version: u8,
     pub region: crate::region::Region,
     pub platform: String,
@@ -83,6 +101,8 @@ struct ResourceReport {
     output_directory: String,
     source_sha256: String,
     objects: usize,
+    selected_objects: usize,
+    skipped_objects: usize,
     outputs: Vec<OutputRecord>,
     errors: Vec<String>,
 }
@@ -93,6 +113,18 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
 impl ExportConfig {
+    pub fn validate(&self) -> Result<(), Error> {
+        self.selection.validate()?;
+        self.image.validate()?;
+        if !(1..=3600).contains(&self.media_timeout_seconds)
+            || !(1..=4).contains(&self.concurrency)
+            || self.max_resource_output_bytes == 0
+            || self.max_resource_output_bytes > 16 * 1024 * 1024 * 1024
+        {
+            return Err(Error::Config);
+        }
+        Ok(())
+    }
     pub async fn run(self) -> Result<ExportSummary, Error> {
         let (stop, receiver) = tokio::sync::watch::channel(false);
         let work = self.run_controlled(receiver);
@@ -112,15 +144,9 @@ impl ExportConfig {
         self,
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) -> Result<ExportSummary, Error> {
+        self.validate()?;
         if *stop.borrow() {
             return Err(Error::Cancelled);
-        }
-        if !(1..=3600).contains(&self.media_timeout_seconds)
-            || !(1..=4).contains(&self.concurrency)
-            || self.max_resource_output_bytes == 0
-            || self.max_resource_output_bytes > 16 * 1024 * 1024 * 1024
-        {
-            return Err(Error::Config);
         }
         let key = std::env::var(&self.cri_key_env)
             .map_err(|_| Error::Secret)?
@@ -209,6 +235,7 @@ impl ExportConfig {
             catalog.select(&update.selection)?.locations.len() == catalog.locations.len();
         let mut assets = update.assets;
         let catalog_files = plan.assets.len();
+        assets.retain(|a| self.selection.provider(a.provider));
         if !self.paths.is_empty() {
             let selected: std::collections::BTreeSet<_> = self.paths.iter().collect();
             assets.retain(|a| selected.contains(&a.relative_path));
@@ -216,9 +243,18 @@ impl ExportConfig {
                 return Err(Error::AssetPath);
             }
         }
+        if assets.is_empty() {
+            return Err(Error::Selection);
+        }
         let mut summary = ExportSummary {
+            full_export: complete_selection
+                && assets.len() == catalog_files
+                && self.selection.full(),
+            selection: self.selection.clone(),
+            image: self.image.clone(),
+            audio: self.audio,
             full_catalog: complete_selection && assets.len() == catalog_files,
-            schema_version: 2,
+            schema_version: 3,
             region: receipt.snapshot.region.unwrap_or_default(),
             platform: receipt.snapshot.platform.clone(),
             input_files: assets.len(),
@@ -282,6 +318,8 @@ impl ExportConfig {
                     summary.failed += 1;
                 }
                 summary.unity_objects += report.objects;
+                summary.selected_unity_objects += report.selected_objects;
+                summary.skipped_unity_objects += report.skipped_objects;
                 for output in &report.outputs {
                     summary.output_files += 1;
                     summary.output_bytes += output.bytes;
@@ -307,7 +345,9 @@ impl ExportConfig {
             }
             Ok(())
         })?;
-        summary.complete = summary.failed == 0 && summary.succeeded == summary.input_files;
+        summary.complete = summary.failed == 0
+            && summary.succeeded == summary.input_files
+            && summary.output_files > 0;
         write_json(&root.join("summary.json"), &summary)?;
         Ok(summary)
     }
@@ -360,19 +400,14 @@ impl ExportConfig {
         asset_root: &Path,
     ) -> Result<(), Error> {
         use unity_rs_core::{
-            image_export::{
-                write_rgba_image_with_options, ImageEncodeOptions, ImageFormat, ImageRowOrder,
-                PngCompression,
-            },
-            sprite::SpriteReadLimits,
-            studio::Studio,
+            image_export::ImageRowOrder, sprite::SpriteReadLimits, studio::Studio,
             texture::TextureReadLimits,
         };
         let mut studio = Studio::open(path).map_err(err)?;
         let own_files: std::collections::BTreeSet<_> =
             studio.files().map(|f| f.path().to_string()).collect();
         // Atlas references are on logical catalog locations, not bundle nodes.
-        if studio.objects().any(|o| o.class_id() == 213) {
+        if self.selection.class(213) && studio.objects().any(|o| o.class_id() == 213) {
             if let Some(dependencies) = dependencies.filter(|d| !d.is_empty()) {
                 let mut regions = vec![(
                     path.to_string_lossy().into_owned(),
@@ -414,6 +449,11 @@ impl ExportConfig {
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
+            if !self.selection.class(object.class_id()) {
+                report.skipped_objects += 1;
+                continue;
+            }
+            report.selected_objects += 1;
             let stem = format!("{}_{}", object.file_index(), object.path_id());
             let output_start = report.outputs.len();
             let result = (|| -> Result<(), Error> {
@@ -432,24 +472,20 @@ impl ExportConfig {
                                 )
                                 .map_err(err)?
                         };
-                        let mut png = Vec::new();
-                        write_rgba_image_with_options(
+                        let data = self.image.encode(
                             &image,
-                            ImageFormat::Png,
                             if object.class_id() == 28 {
                                 ImageRowOrder::UnityDecoded
                             } else {
                                 ImageRowOrder::Display
                             },
-                            &ImageEncodeOptions {
-                                png_compression: PngCompression::Fast,
-                                maximum_output_bytes: limit,
-                                ..ImageEncodeOptions::default()
-                            },
-                            &mut png,
+                            limit,
+                        )?;
+                        (
+                            data,
+                            self.image.native().extension().trim_start_matches('.'),
+                            self.image.native().payload_kind(),
                         )
-                        .map_err(err)?;
-                        (png, "png", "image_png")
                     }
                     114 if is_moc_object(&studio, object)? => {
                         let file =
@@ -557,7 +593,10 @@ impl ExportConfig {
                         self.record(output, &target, "typetree_binary_source", report)?;
                     }
                 }
-                if object.class_id() == 114 && kind == "typetree_json" {
+                if self.selection.embedded_audio
+                    && object.class_id() == 114
+                    && kind == "typetree_json"
+                {
                     let value: sonic_rs::Value = sonic_rs::from_slice(&data).map_err(err)?;
                     if let Some(chunks) = value.get("_chunks").and_then(|v| v.as_array()) {
                         if chunks.is_empty() {
@@ -721,7 +760,7 @@ impl ExportConfig {
                 .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                 .map_err(err)?;
             self.media_check(&target)?;
-            self.record(root, &target, "hca_wav", report)?;
+            self.record_audio(root, &target, "hca", report)?;
             let cues: Vec<_> = tracks
                 .tracks
                 .iter()
@@ -880,8 +919,7 @@ impl ExportConfig {
                         &stream.data
                     };
                     self.adx(data, &target)?;
-                    self.record(report_root, &target, "adx_wav", report)?;
-                    audio = Some(target);
+                    audio = Some(self.record_audio(report_root, &target, "adx", report)?);
                 }
                 "hca" => {
                     if audio.is_some() {
@@ -895,8 +933,7 @@ impl ExportConfig {
                         .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                         .map_err(err)?;
                     self.media_check(&target)?;
-                    self.record(report_root, &target, "hca_wav", report)?;
-                    audio = Some(target);
+                    audio = Some(self.record_audio(report_root, &target, "hca", report)?);
                 }
                 _ => return Err(err("unsupported USM stream codec")),
             }
@@ -1080,6 +1117,54 @@ impl ExportConfig {
         }
         Ok(())
     }
+    fn record_audio(
+        &self,
+        root: &Path,
+        wav: &Path,
+        codec: &str,
+        report: &mut ResourceReport,
+    ) -> Result<PathBuf, Error> {
+        if self.audio == crate::export_options::AudioExport::Wav {
+            self.record(root, wav, &format!("{codec}_wav"), report)?;
+            return Ok(wav.into());
+        }
+        let target = wav.with_extension("flac");
+        self.ffmpeg(&[
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-i".into(),
+            wav.as_os_str().to_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-c:a".into(),
+            "flac".into(),
+            target.as_os_str().to_owned(),
+        ])?;
+        let decoded = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile_in(root)
+            .map_err(err)?;
+        self.ffmpeg(&[
+            "-y".into(),
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-i".into(),
+            target.as_os_str().to_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            decoded.path().as_os_str().to_owned(),
+        ])?;
+        let original = fs::read(wav).map_err(err)?;
+        let roundtrip = fs::read(decoded.path()).map_err(err)?;
+        if pcm_identity(&original)? != pcm_identity(&roundtrip)? {
+            return Err(err("FLAC PCM roundtrip mismatch"));
+        }
+        self.record(root, &target, &format!("{codec}_flac"), report)?;
+        fs::remove_file(wav).map_err(err)?;
+        Ok(target)
+    }
     fn record(
         &self,
         root: &Path,
@@ -1101,6 +1186,9 @@ impl ExportConfig {
             let mut buffer = vec![0; reader.output_buffer_size().ok_or(Error::Size)?];
             reader.next_frame(&mut buffer).map_err(err)?;
         }
+        if kind.starts_with("image_") && kind != "image_png" {
+            self.media_check(path)?;
+        }
         report.outputs.push(OutputRecord {
             path: path
                 .strip_prefix(root)
@@ -1114,6 +1202,26 @@ impl ExportConfig {
         });
         Ok(())
     }
+}
+
+fn pcm_identity(bytes: &[u8]) -> Result<(u16, u32, &[u8]), Error> {
+    validate_wav(bytes)?;
+    let mut pos = 12;
+    let mut channels = 0;
+    let mut rate = 0;
+    let mut pcm = None;
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if &bytes[pos..pos + 4] == b"fmt " {
+            channels = u16::from_le_bytes(bytes[pos + 10..pos + 12].try_into().unwrap());
+            rate = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap());
+        }
+        if &bytes[pos..pos + 4] == b"data" {
+            pcm = Some(&bytes[pos + 8..pos + 8 + len]);
+        }
+        pos += 8 + len + len % 2;
+    }
+    Ok((channels, rate, pcm.ok_or(Error::Verification)?))
 }
 
 // PCM WAV validation is independent of the HCA decoder; require complete frames,
@@ -1205,6 +1313,9 @@ mod tests {
         ExportConfig {
             input: root.into(),
             paths: Vec::new(),
+            selection: Default::default(),
+            image: Default::default(),
+            audio: Default::default(),
             output: root.join("out"),
             retain_outputs: false,
             cri_key_env: "UNUSED_TEST_KEY".into(),
@@ -1215,6 +1326,188 @@ mod tests {
             ffmpeg: "unused".into(),
             max_resource_output_bytes: 16 * 1024 * 1024,
         }
+    }
+    #[test]
+    fn export_selection_and_format_configuration_fail_closed() {
+        use crate::export_options::{ImageExport, Selection};
+        let default = Selection::default();
+        assert!(default.full());
+        let selected: Selection = yaml_serde::from_str(
+            "providers: [unity]\nunity_class_ids: [28, 213]\nembedded_audio: false",
+        )
+        .unwrap();
+        selected.validate().unwrap();
+        assert!(!selected.full());
+        assert!(selected.provider(Provider::EncryptedBundle));
+        assert!(!selected.provider(Provider::Cri));
+        assert!(selected.class(28));
+        assert!(!selected.class(114));
+        for text in [
+            "providers: [cri]\nunity_class_ids: [28]",
+            "providers: [unity, unity]",
+            "unity_class_ids: [0]",
+            "unity_class_ids: [28, 28]",
+        ] {
+            assert!(yaml_serde::from_str::<Selection>(text)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        assert!(yaml_serde::from_str::<Selection>("providers: [sekai]").is_err());
+        assert!(yaml_serde::from_str::<ImageExport>("format: jpeg\nquality: 90").is_err());
+        assert!(yaml_serde::from_str::<ImageExport>(
+            "format: jpeg\nquality: 0\nbackground: [255,255,255]"
+        )
+        .unwrap()
+        .validate()
+        .is_err());
+        let cfg: ExportConfig =
+            yaml_serde::from_str(include_str!("../export-config.example.yaml")).unwrap();
+        assert!(cfg.selection.full());
+        cfg.image.validate().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for independent image/audio roundtrip verification"]
+    fn configurable_images_preserve_rgba_orientation_and_flac_preserves_pcm() {
+        use crate::export_options::{AudioExport, ImageExport};
+        use unity_rs_core::{image_export::ImageRowOrder, texture::RgbaImage};
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        let pixels = vec![255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 0, 50, 60, 70, 90];
+        let image = RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: pixels.clone(),
+        };
+        for (i, format) in [
+            ImageExport::Png,
+            ImageExport::Webp,
+            ImageExport::Bmp,
+            ImageExport::Tga,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (j, order) in [ImageRowOrder::Display, ImageRowOrder::UnityDecoded]
+                .into_iter()
+                .enumerate()
+            {
+                let bytes = format.encode(&image, order, 1024 * 1024).unwrap();
+                let path = root
+                    .path()
+                    .join(format!("image-{i}-{j}{}", format.native().extension()));
+                fs::write(&path, bytes).unwrap();
+                let mut report = ResourceReport::default();
+                cfg.record(
+                    root.path(),
+                    &path,
+                    format.native().payload_kind(),
+                    &mut report,
+                )
+                .unwrap();
+                let raw = root.path().join(format!("rgba-{i}-{j}.raw"));
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    path.into_os_string(),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    "-pix_fmt".into(),
+                    "rgba".into(),
+                    raw.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                let expected = if j == 0 {
+                    pixels.clone()
+                } else {
+                    [pixels[8..].to_vec(), pixels[..8].to_vec()].concat()
+                };
+                assert_eq!(fs::read(raw).unwrap(), expected, "format {i} order {j}");
+            }
+            assert!(format.encode(&image, ImageRowOrder::Display, 1).is_err());
+        }
+        let format = ImageExport::Jpeg {
+            quality: 100,
+            background: [255, 255, 255],
+        };
+        let image = RgbaImage {
+            width: 16,
+            height: 16,
+            pixels: [255, 0, 0, 128].repeat(256),
+        };
+        let jpeg = root.path().join("background.jpg");
+        fs::write(
+            &jpeg,
+            format
+                .encode(&image, ImageRowOrder::Display, 1024 * 1024)
+                .unwrap(),
+        )
+        .unwrap();
+        let raw = root.path().join("jpeg.raw");
+        cfg.ffmpeg(&[
+            "-i".into(),
+            jpeg.into_os_string(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "rgba".into(),
+            raw.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        for pixel in fs::read(raw).unwrap().chunks_exact(4) {
+            for (actual, expected) in pixel.iter().zip([255u8, 127, 127, 255]) {
+                assert!(actual.abs_diff(expected) <= 3);
+            }
+        }
+        cfg.audio = AudioExport::Flac;
+        let audio_dir = root.path().join("audio");
+        fs::create_dir(&audio_dir).unwrap();
+        let mut report = ResourceReport::default();
+        cfg.acb(
+            &synthetic_acb(0x12345678),
+            &audio_dir,
+            0x12345678,
+            &mut report,
+            &audio_dir,
+        )
+        .unwrap();
+        assert!(audio_dir.join("00000.flac").is_file());
+        assert!(!audio_dir.join("00000.wav").exists());
+        assert_eq!(report.outputs[0].kind, "hca_flac");
+        assert_eq!(report.outputs.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires SIRIUS_UNITY_SAMPLE pointing to a decrypted bundle with AssetBundle and other objects"]
+    fn selected_unity_class_exports_only_selected_objects() {
+        let sample = PathBuf::from(std::env::var("SIRIUS_UNITY_SAMPLE").unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.selection.unity_class_ids = vec![142];
+        cfg.selection.embedded_audio = false;
+        let mut report = ResourceReport::default();
+        cfg.unity(
+            &sample,
+            root.path(),
+            0,
+            &mut report,
+            None,
+            sample.parent().unwrap(),
+        )
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.selected_objects > 0);
+        assert!(report.skipped_objects > 0);
+        assert_eq!(
+            report.objects,
+            report.selected_objects + report.skipped_objects
+        );
+        assert_eq!(report.outputs.len(), report.selected_objects);
+        assert!(report
+            .outputs
+            .iter()
+            .all(|o| o.object.as_ref().unwrap().class_id == 142));
     }
     // Synthesized 440 Hz PCM, encoded by cridecoder. No game bytes or real keys.
     fn synthetic_acb(key: u64) -> Vec<u8> {

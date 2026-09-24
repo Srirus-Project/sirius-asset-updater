@@ -35,7 +35,7 @@ async fn run() -> Result<(), Error> {
             Ok(())
         } else {
             Err(Error::Export(
-                "one or more resources failed; see resources.jsonl".into(),
+                "export incomplete or empty; see summary.json and resources.jsonl".into(),
             ))
         };
     }
