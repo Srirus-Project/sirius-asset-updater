@@ -49,6 +49,8 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
 
       - name: Check tag version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -59,7 +61,7 @@ jobs:
         run: cargo build --release --locked -p sirius-asset-updater
 
       - name: Run regression tests
-        run: cargo test --locked
+        run: cargo test --release --locked
 
       - name: Package complete runtime
         run: python3 scripts/package-release.py --target ${{ matrix.name }}

@@ -131,7 +131,11 @@ impl Pending {
         tokio::fs::copy(source, directory.path().join("data"))
             .await
             .map_err(|_| Error::Io)?;
-        tokio::fs::File::open(directory.path().join("data"))
+        // Windows FlushFileBuffers requires a writable handle, even for a
+        // file just copied successfully. Opening with write does not truncate it.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("data"))
             .await
             .map_err(|_| Error::Io)?
             .sync_all()
