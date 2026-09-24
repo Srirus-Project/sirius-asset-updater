@@ -2038,3 +2038,120 @@ fn download_network_policy_defaults_caps_backoff_and_rejects_invalid_values() {
         assert!(!defaults.asset_retry.retry(&error, 0));
     }
 }
+
+#[tokio::test]
+#[ignore = "requires SIRIUS_TEST_FFMPEG for the real service export pipeline"]
+async fn job_service_exports_and_reuses_content_cache_after_restart() {
+    use crate::{
+        jobs::{Job, Status},
+        service::{Profile, Service, ServiceConfig},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = directory.path().join("input");
+    enable_assets(&mut cfg, false);
+    let catalog = catalog_fixture(
+        &[("{Fwk.Resource.RemoteAssetDir}/audio.acb", CRI_PROVIDER)],
+        false,
+    );
+    let (client, fixture, upstream) = serve(cfg, StatusCode::OK, catalog, Duration::ZERO).await;
+    fixture.assets.lock().unwrap().insert(
+        "audio.acb".into(),
+        (
+            StatusCode::OK,
+            crate::export::tests::synthetic_acb(0x12345678),
+        ),
+    );
+    let publication = client.fetch().await.unwrap();
+    upstream.abort();
+    let token = format!("SERVICE_CACHE_{}", uuid::Uuid::new_v4().simple());
+    let key = format!("SERVICE_CACHE_KEY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "service-cache-only");
+    std::env::set_var(&key, "305419896");
+    let export = directory.path().join("export.yaml");
+    let cache = directory.path().join("export-cache");
+    let yaml = format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {key}\nffmpeg: {:?}\ncache_directory: {:?}\n", std::env::var("SIRIUS_TEST_FFMPEG").unwrap(), cache);
+    std::fs::write(&export, yaml).unwrap();
+    let config = || ServiceConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        token_env: token.clone(),
+        state_directory: directory.path().join("state"),
+        output_directory: directory.path().join("jobs"),
+        max_concurrent_jobs: 1,
+        max_queued_jobs: 4,
+        retain_terminal_jobs: 10,
+        timeout_seconds: 30,
+        profiles: BTreeMap::from([(
+            "export".into(),
+            Profile {
+                region: region::Region::Jp,
+                download_config: None,
+                export_config: Some(export.clone()),
+                input: Some(publication.clone()),
+            },
+        )]),
+    };
+    let mut previous = None;
+    for expected_hits in [0, 1] {
+        let service = Service::open(config()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/api/v1/jobs", listener.local_addr().unwrap());
+        let router = service.router();
+        let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let workers = tokio::spawn(async move { service.run_workers(receiver).await });
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&endpoint)
+            .bearer_auth("service-cache-only")
+            .body(r#"{"region":"jp","profile":"export","operation":"export"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let text = client
+                    .get(format!("{endpoint}/{}", job.id))
+                    .bearer_auth("service-cache-only")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let job: Job = sonic_rs::from_str(&text).unwrap();
+                if job.status.terminal() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(finished.status, Status::Completed);
+        assert_eq!(finished.progress.completed, 1);
+        let output = directory
+            .path()
+            .join("jobs/jp")
+            .join(&job.id)
+            .join("exports");
+        let summary: crate::export::ExportSummary =
+            sonic_rs::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
+        assert!(summary.complete && summary.full_catalog && summary.full_export);
+        assert_eq!(summary.cache_hits, expected_hits);
+        assert_eq!(summary.output_files, 2);
+        let wav = std::fs::read(output.join("00000/00000.wav")).unwrap();
+        if let Some(previous) = previous {
+            assert_eq!(wav, previous);
+        }
+        previous = Some(wav);
+        stop.send(true).unwrap();
+        workers.await.unwrap().unwrap();
+        http.abort();
+        let _ = http.await;
+    }
+    std::env::remove_var(token);
+    std::env::remove_var(key);
+}

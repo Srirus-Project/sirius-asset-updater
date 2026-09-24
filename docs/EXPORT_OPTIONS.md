@@ -58,7 +58,7 @@ Video container/backend selection remains a separate pending restoration item.
 
 ## Receipts and completeness
 
-Export summary schema 3 records selection, image/audio formats, selected/skipped Unity
+Export summary schema 4 records selection, image/audio formats, selected/skipped Unity
 object counts and `full_export`. Resource journals report the same object counts and
 identities for outputs. `unity_objects` counts all source objects; selected and skipped
 counts explain a successful subset without concealing omitted objects.

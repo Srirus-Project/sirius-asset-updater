@@ -29,6 +29,9 @@ atomically retained; failures remove partial products and record errors while ot
 continue. Any failure gives exit 1 and complete=false. Cancellation stops new work, terminates
 and reaps FFmpeg children, cleans active temporary directories and exits 130.
 
+See [incremental export](EXPORT_CACHE.md) for optional verified decoded-resource reuse
+and recovery across retries/restarts.
+
 ## Outputs
 
 - `summary.json`: success/failure counts, object/output counts, byte totals, kinds and catalog hash.

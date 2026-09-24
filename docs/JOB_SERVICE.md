@@ -45,6 +45,9 @@ interrupted running jobs become failed and can be retried explicitly. Completed 
 are retained. The ledger directory has exclusive process ownership, so two services cannot
 schedule from one ledger concurrently. Terminal retention prunes records only, not outputs.
 
+Profiles can opt into [incremental export](EXPORT_CACHE.md); successful resource caches
+survive job retries and service restarts while each job retains independent outputs.
+
 This is an implementation milestone, not the complete 1.2.0 platform restoration. Storage uploads,
-incremental export, stage tuning, scheduling, TLS/logging and remaining acceptance requirements
+stage tuning, scheduling, TLS/logging and remaining acceptance requirements
 are tracked separately in RESTORATION_1_2.md. Do not publish 1.2.0 from this milestone alone.

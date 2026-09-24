@@ -87,7 +87,7 @@ cp export-config.example.yaml export-config.yaml
 every output but deletes each resource's temporary products after recording its hashes.
 The summary is complete only when every selected resource succeeds. Unknown paths fail;
 a selected subset does not constitute a full-catalog acceptance test.
-See [export formats and limits](docs/EXPORT.md).
+See [export formats and limits](docs/EXPORT.md) and [incremental export](docs/EXPORT_CACHE.md).
 
 The current JP catalog passed full download and export validation: **13,367 remote resources,
 zero failures**, 896,263 Unity objects and 952,604 outputs (34.59 GB cumulatively).

@@ -1,4 +1,6 @@
 //! Offline, per-resource export. A successful download is not an export receipt.
+#[path = "export_cache.rs"]
+mod cache;
 use crate::{assets::Provider, Error, Receipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +28,10 @@ pub struct ExportConfig {
     pub output: PathBuf,
     #[serde(default)]
     pub retain_outputs: bool,
+    #[serde(default)]
+    pub cache_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub cache_revision: String,
     pub cri_key_env: String,
     #[serde(default)]
     pub split_acb_xor_env: Option<String>,
@@ -71,6 +77,8 @@ pub struct ExportSummary {
     pub catalog_files: usize,
     pub unity_objects: usize,
     pub catalog_sha256: String,
+    #[serde(default)]
+    pub cache_hits: usize,
     pub succeeded: usize,
     pub failed: usize,
     pub output_files: usize,
@@ -78,7 +86,7 @@ pub struct ExportSummary {
     pub payloads: BTreeMap<String, usize>,
     pub retained: bool,
 }
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct OutputRecord {
     path: String,
     kind: String,
@@ -87,7 +95,7 @@ struct OutputRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     object: Option<ObjectIdentity>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ObjectIdentity {
     source_file: String,
     path_id: i64,
@@ -95,8 +103,10 @@ struct ObjectIdentity {
     name: Option<String>,
     container: Option<String>,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct ResourceReport {
+    #[serde(default)]
+    cache_hit: bool,
     source: String,
     output_directory: String,
     source_sha256: String,
@@ -116,6 +126,16 @@ impl ExportConfig {
     pub fn validate(&self) -> Result<(), Error> {
         self.selection.validate()?;
         self.image.validate()?;
+        if self.cache_directory.is_some() && !self.retain_outputs
+            || self
+                .cache_directory
+                .as_ref()
+                .is_some_and(|p| p.as_os_str().is_empty())
+            || self.cache_revision.len() > 256
+            || (self.cache_directory.is_none() && !self.cache_revision.is_empty())
+        {
+            return Err(Error::Config);
+        }
         if !(1..=3600).contains(&self.media_timeout_seconds)
             || !(1..=4).contains(&self.concurrency)
             || self.max_resource_output_bytes == 0
@@ -230,7 +250,31 @@ impl ExportConfig {
                 }
             }
         }
+        let cache = cache::Cache::open(self, &input, &root, &receipt.snapshot, key)?;
         let update = receipt.update.ok_or(Error::Verification)?;
+        let hashes: BTreeMap<_, _> = update
+            .assets
+            .iter()
+            .map(|a| (a.relative_path.clone(), a.stored_sha256.clone()))
+            .collect();
+        let mut cache_ids = BTreeMap::new();
+        if let Some(cache) = &cache {
+            for asset in &update.assets {
+                let mut dep_hashes = BTreeMap::new();
+                if let Some(paths) = dependencies.get(&asset.relative_path) {
+                    for path in paths {
+                        dep_hashes.insert(
+                            path.clone(),
+                            hashes.get(path).ok_or(Error::Verification)?.clone(),
+                        );
+                    }
+                }
+                cache_ids.insert(
+                    asset.relative_path.clone(),
+                    cache.identity(asset, &dep_hashes)?,
+                );
+            }
+        }
         let complete_selection =
             catalog.select(&update.selection)?.locations.len() == catalog.locations.len();
         let mut assets = update.assets;
@@ -254,7 +298,7 @@ impl ExportConfig {
             image: self.image.clone(),
             audio: self.audio,
             full_catalog: complete_selection && assets.len() == catalog_files,
-            schema_version: 3,
+            schema_version: 4,
             region: receipt.snapshot.region.unwrap_or_default(),
             platform: receipt.snapshot.platform.clone(),
             input_files: assets.len(),
@@ -274,6 +318,8 @@ impl ExportConfig {
                 let input = &input;
                 let dependencies = &dependencies;
                 let root = &root;
+                let cache = &cache;
+                let cache_ids = &cache_ids;
                 scope.spawn(move || loop {
                     if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -284,14 +330,21 @@ impl ExportConfig {
                     };
                     let report =
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            self.process_resource(
-                                input,
-                                root,
-                                asset,
-                                i,
-                                key,
-                                dependencies.get(&asset.relative_path),
-                            )
+                            let decode = || {
+                                self.process_resource(
+                                    input,
+                                    root,
+                                    asset,
+                                    i,
+                                    key,
+                                    dependencies.get(&asset.relative_path),
+                                )
+                            };
+                            if let Some(cache) = cache {
+                                cache.process(&cache_ids[&asset.relative_path], root, i, decode)
+                            } else {
+                                decode()
+                            }
                         })) {
                             Ok(Ok(report)) => report,
                             result => ResourceReport {
@@ -314,6 +367,7 @@ impl ExportConfig {
             for report in recv {
                 if report.errors.is_empty() {
                     summary.succeeded += 1;
+                    summary.cache_hits += usize::from(report.cache_hit);
                 } else {
                     summary.failed += 1;
                 }
@@ -1194,7 +1248,7 @@ impl ExportConfig {
                 .strip_prefix(root)
                 .map_err(err)?
                 .to_string_lossy()
-                .into_owned(),
+                .replace('\\', "/"),
             kind: kind.into(),
             bytes: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(&bytes)),
@@ -1307,7 +1361,7 @@ fn is_moc_object(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     fn config(root: &Path) -> ExportConfig {
         ExportConfig {
@@ -1318,6 +1372,8 @@ mod tests {
             audio: Default::default(),
             output: root.join("out"),
             retain_outputs: false,
+            cache_directory: None,
+            cache_revision: String::new(),
             cri_key_env: "UNUSED_TEST_KEY".into(),
             split_acb_xor_env: None,
             concurrency: 1,
@@ -1556,7 +1612,7 @@ mod tests {
         }
     }
     // Synthesized 440 Hz PCM, encoded by cridecoder. No game bytes or real keys.
-    fn synthetic_acb(key: u64) -> Vec<u8> {
+    pub(crate) fn synthetic_acb(key: u64) -> Vec<u8> {
         let samples: Vec<f32> = (0..4096)
             .map(|i| ((i as f32) * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.25)
             .collect();
@@ -1576,6 +1632,201 @@ mod tests {
         builder.build(&mut acb, None).unwrap();
         acb.into_inner()
     }
+    fn cache_snapshot() -> crate::Snapshot {
+        crate::Snapshot {
+            region: Some(crate::region::Region::Jp),
+            schema_version: 2,
+            environment: "test".into(),
+            platform: "iOS".into(),
+            client_version: "1".into(),
+            protocol_version: "1".into(),
+            master_version: None,
+            resource_version: "one".into(),
+            platform_hash: "a".into(),
+            effective_cdn_root: "https://example.invalid".into(),
+            credential_ref: "unused".into(),
+            observed_at: chrono::Utc::now(),
+            source: "test".into(),
+        }
+    }
+    #[test]
+    fn incremental_export_reuses_verified_audio_repairs_corruption_and_keeps_old_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut cfg = config(root);
+        cfg.input = root.join("input");
+        cfg.cache_directory = Some(root.join("cache"));
+        cfg.retain_outputs = true;
+        cfg.ffmpeg = std::env::current_exe().unwrap();
+        fs::create_dir_all(cfg.input.join("assets")).unwrap();
+        fs::create_dir(&cfg.output).unwrap();
+        let bytes = synthetic_acb(0x12345678);
+        fs::write(cfg.input.join("assets/test.acb"), &bytes).unwrap();
+        let asset = crate::update::AssetReceipt {
+            relative_path: "test.acb".into(),
+            provider: Provider::Cri,
+            bytes: bytes.len() as u64,
+            downloaded_sha256: hex::encode(Sha256::digest(&bytes)),
+            stored_sha256: hex::encode(Sha256::digest(&bytes)),
+            decrypted: false,
+        };
+        let snapshot = cache_snapshot();
+        let cache = cache::Cache::open(&cfg, &cfg.input, &cfg.output, &snapshot, 0x12345678)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cache::Cache::open(&cfg, &cfg.input, &cfg.output, &snapshot, 0x12345678),
+            Err(Error::Busy)
+        ));
+        let id = cache.identity(&asset, &BTreeMap::new()).unwrap();
+        let run =
+            |index| cfg.process_resource(&cfg.input, &cfg.output, &asset, index, 0x12345678, None);
+        let first = cache.process(&id, &cfg.output, 0, || run(0)).unwrap();
+        assert!(first.errors.is_empty() && !first.cache_hit);
+        assert_eq!(first.outputs.len(), 2);
+        let original = fs::read(cfg.output.join("00000/00000.wav")).unwrap();
+        validate_wav(&original).unwrap();
+        let second = cache
+            .process(&id, &cfg.output, 1, || {
+                panic!("cache hit must bypass decoding")
+            })
+            .unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(second.output_directory, "00001");
+        assert_eq!(
+            fs::read(cfg.output.join("00001/00000.wav")).unwrap(),
+            original
+        );
+        let entry = cfg.cache_directory.as_ref().unwrap().join(&id);
+        fs::write(entry.join("data/00000.wav"), b"broken").unwrap();
+        let repaired = cache.process(&id, &cfg.output, 2, || run(2)).unwrap();
+        assert!(!repaired.cache_hit && repaired.errors.is_empty());
+        assert_eq!(fs::read(entry.join("data/00000.wav")).unwrap(), original);
+        // Publications are independent copies, not links into mutable cache storage.
+        assert_eq!(
+            fs::read(cfg.output.join("00000/00000.wav")).unwrap(),
+            original
+        );
+        cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            cache.process(&id, &cfg.output, 3, || panic!()),
+            Err(Error::Cancelled)
+        ));
+        assert!(!cfg.output.join("00003").exists());
+        cfg.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(cache);
+        let cache = cache::Cache::open(&cfg, &cfg.input, &cfg.output, &snapshot, 0x12345678)
+            .unwrap()
+            .unwrap();
+        assert!(
+            cache
+                .process(&id, &cfg.output, 4, || panic!())
+                .unwrap()
+                .cache_hit
+        );
+        let failed_id = cache
+            .identity(
+                &asset,
+                &BTreeMap::from([("dependency".into(), "changed".into())]),
+            )
+            .unwrap();
+        let failed = cache
+            .process(&failed_id, &cfg.output, 5, || {
+                Ok(ResourceReport {
+                    errors: vec!["failed".into()],
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+        assert!(!failed.errors.is_empty());
+        assert!(!cfg
+            .cache_directory
+            .as_ref()
+            .unwrap()
+            .join(failed_id)
+            .exists());
+        assert!(fs::read_dir(cfg.cache_directory.as_ref().unwrap())
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pending")));
+    }
+
+    #[test]
+    fn incremental_identity_tracks_content_dependencies_formats_regions_tools_and_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut cfg = config(root);
+        cfg.input = root.join("input");
+        cfg.cache_directory = Some(root.join("cache"));
+        cfg.retain_outputs = true;
+        cfg.ffmpeg = root.join("media-tool");
+        fs::write(&cfg.ffmpeg, b"tool-one").unwrap();
+        fs::create_dir(&cfg.input).unwrap();
+        fs::create_dir(&cfg.output).unwrap();
+        let mut snapshot = cache_snapshot();
+        let mut asset = crate::update::AssetReceipt {
+            relative_path: "test".into(),
+            provider: Provider::UnityBundle,
+            bytes: 1,
+            downloaded_sha256: "download".into(),
+            stored_sha256: "stored".into(),
+            decrypted: false,
+        };
+        let id = |cfg: &ExportConfig,
+                  snapshot: &crate::Snapshot,
+                  asset: &crate::update::AssetReceipt,
+                  deps: &BTreeMap<String, String>,
+                  key| {
+            cache::Cache::open(cfg, &cfg.input, &cfg.output, snapshot, key)
+                .unwrap()
+                .unwrap()
+                .identity(asset, deps)
+                .unwrap()
+        };
+        let deps = BTreeMap::new();
+        let base = id(&cfg, &snapshot, &asset, &deps, 1);
+        // A new catalog/resource version with identical source content remains reusable.
+        snapshot.resource_version = "two".into();
+        assert_eq!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 2));
+        assert_ne!(
+            base,
+            id(
+                &cfg,
+                &snapshot,
+                &asset,
+                &BTreeMap::from([("atlas".into(), "hash".into())]),
+                1
+            )
+        );
+        asset.stored_sha256 = "changed".into();
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        asset.stored_sha256 = "stored".into();
+        snapshot.region = Some(crate::region::Region::En);
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        snapshot.region = Some(crate::region::Region::Jp);
+        cfg.image = crate::export_options::ImageExport::Webp;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.image = Default::default();
+        cfg.audio = crate::export_options::AudioExport::Flac;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.audio = Default::default();
+        cfg.selection.embedded_audio = false;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.selection.embedded_audio = true;
+        cfg.cache_revision = "new-shared-libraries".into();
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.cache_revision.clear();
+        fs::write(&cfg.ffmpeg, b"tool-two").unwrap();
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.retain_outputs = false;
+        assert!(cfg.validate().is_err());
+    }
+
     #[test]
     fn encrypted_acb_exports_pcm_and_keeps_cue_names_out_of_paths() {
         let root = tempfile::tempdir().unwrap();

@@ -21,3 +21,9 @@ selection:
 image: {format: png}
 # FLAC is validated by an exact PCM roundtrip. USM keeps Matroska video.
 audio: wav # wav, flac
+
+# Optional decoded-resource cache; requires retain_outputs: true.
+# Keep separate from inputs, outputs and the ciphertext cache. See docs/EXPORT_CACHE.md.
+# cache_directory: ./cache/decoded
+# Bump after external shared-library/runtime changes without executable changes.
+# cache_revision: ""
