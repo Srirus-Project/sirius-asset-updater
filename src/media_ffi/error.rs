@@ -16,9 +16,20 @@ pub(super) fn valid_rational(value: ffi::AVRational) -> Option<ffi::AVRational> 
 }
 
 pub(super) fn path_cstring(path: &Path) -> Result<CString, MediaError> {
-    CString::new(path.to_string_lossy().as_bytes()).map_err(|err| MediaError::Media {
-        message: format!("path contains NUL byte: {err}"),
-    })
+    if !path.is_absolute() {
+        return Err(media_error("FFmpeg paths must be absolute local paths"));
+    }
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| media_error("path is not valid Unicode"))?
+        .as_bytes();
+    CString::new(bytes).map_err(|_| media_error("path contains NUL byte"))
 }
 
 pub(super) fn cstring(value: &str) -> Result<CString, MediaError> {
@@ -28,6 +39,7 @@ pub(super) fn cstring(value: &str) -> Result<CString, MediaError> {
 }
 
 pub(super) fn check(ret: i32, operation: &str) -> Result<(), MediaError> {
+    super::control::check()?;
     if ret >= 0 {
         Ok(())
     } else {
@@ -90,7 +102,7 @@ mod tests {
         assert_eq!(cstring("libmp3lame").unwrap().to_bytes(), b"libmp3lame");
         assert!(cstring("bad\0name").is_err());
 
-        assert!(path_cstring(Path::new("/tmp/out.mp3")).is_ok());
+        assert!(path_cstring(&std::env::temp_dir().join("out.mp3")).is_ok());
         assert!(path_cstring(Path::new("/tmp/ba\0d.mp3")).is_err());
     }
 

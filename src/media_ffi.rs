@@ -1,5 +1,5 @@
 //! FFmpeg 7.1 codec bridge adapted from Haruki's MIT-licensed generic media layer.
-//! Development backend: not yet connected to export configuration or job cancellation.
+//! Development backend: not yet connected to export configuration.
 //! See docs/MEDIA_FFI.md for integration gates and build requirements.
 use std::path::Path;
 use std::ptr;
@@ -14,11 +14,17 @@ pub struct FrameRate {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
+    #[error("media conversion cancelled")]
+    Cancelled,
+    #[error("media conversion deadline exceeded")]
+    Timeout,
     #[error("{message}")]
     Media { message: String },
 }
 
 mod audio;
+mod control;
+pub use control::controlled;
 mod avio;
 mod error;
 mod raii;
@@ -93,6 +99,7 @@ pub fn convert_wav_bytes_to_flac(wav_bytes: &[u8], flac_file: &Path) -> Result<(
 }
 
 fn ensure_ffmpeg_loaded() -> Result<(), MediaError> {
+    control::check()?;
     let avformat_version = unsafe { ffi::avformat_version() };
     let avcodec_version = unsafe { ffi::avcodec_version() };
     let avutil_version = unsafe { ffi::avutil_version() };
@@ -101,9 +108,8 @@ fn ensure_ffmpeg_loaded() -> Result<(), MediaError> {
             message: "FFmpeg 7.x libraries are required".to_string(),
         });
     }
-    unsafe {
-        ffi::av_log_set_level(ffi::AV_LOG_ERROR as i32);
-    }
+    static LOGGING: std::sync::Once = std::sync::Once::new();
+    LOGGING.call_once(|| unsafe { ffi::av_log_set_level(ffi::AV_LOG_QUIET) });
     Ok(())
 }
 
@@ -920,5 +926,94 @@ mod tests {
             &dir.path().join("surround.mp3")
         )
         .is_err());
+    }
+    #[test]
+    fn controlled_conversion_cancels_active_work_and_recovers() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("interrupted.flac");
+        let wav = sine_wav(120.0, 48000, 2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let watch_path = output.clone();
+        let watch_cancel = cancel.clone();
+        let watch_observed = observed.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let watcher = std::thread::spawn(move || {
+            while Instant::now() < deadline {
+                if watch_path.exists() {
+                    watch_observed.store(true, Ordering::Release);
+                    watch_cancel.store(true, Ordering::Release);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let result = controlled(cancel.clone(), deadline, || {
+            convert_wav_bytes_to_flac(&wav, &output)
+        });
+        watcher.join().unwrap();
+        assert!(
+            observed.load(Ordering::Acquire),
+            "conversion created its output before cancellation"
+        );
+        assert!(matches!(result, Err(MediaError::Cancelled)));
+        assert!(control::current().is_none());
+        assert!(matches!(
+            controlled(
+                cancel,
+                Instant::now() + Duration::from_secs(1),
+                || -> Result<(), MediaError> { panic!("pre-cancelled work ran") }
+            ),
+            Err(MediaError::Cancelled)
+        ));
+        assert!(matches!(
+            controlled(
+                Arc::new(AtomicBool::new(false)),
+                Instant::now(),
+                || -> Result<(), MediaError> { panic!("expired work ran") }
+            ),
+            Err(MediaError::Timeout)
+        ));
+        assert!(matches!(
+            controlled(
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_millis(2),
+                || convert_wav_bytes_to_flac(&wav, &dir.path().join("deadline.flac"))
+            ),
+            Err(MediaError::Timeout)
+        ));
+        let clean = dir.path().join("clean.flac");
+        controlled(
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(5),
+            || convert_wav_bytes_to_flac(&sine_wav(0.1, 44100, 2), &clean),
+        )
+        .unwrap();
+        assert!(std::fs::metadata(clean).unwrap().len() > 0);
+    }
+    #[test]
+    fn local_input_cannot_open_playlist_network_urls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("playlist.m3u8");
+        std::fs::write(&input, format!("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttp://{}/media.ts\n#EXT-X-ENDLIST\n", listener.local_addr().unwrap())).unwrap();
+        let result = controlled(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            || convert_video_to_mp4(&input, &dir.path().join("out.mp4")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(path_cstring(Path::new("https://example.invalid/media.wav")).is_err());
+        assert!(path_cstring(Path::new("relative.wav")).is_err());
     }
 }

@@ -36,10 +36,9 @@ the current buffer, including a buffer replaced by libavformat.
 - Preserve Sirius stream-copy MKV, M2V/IVF timing, separate alpha, H.264/AAC parameters, source
   preservation and independent frame-count verification. Generic video entry points are ported
   but not yet accepted as equivalent to the Sirius CLI pipeline.
-- Integrate cancellation, deadline checks, media admission and worker drain. Direct bridge calls
-  currently have no cancellation contract and must not be exposed as cancellable service work.
-- Restrict inputs to the exporter's local paths, preserve path encoding, and keep raw FFmpeg logs
-  out of application logs. Review all remaining unsafe/error paths before pipeline activation.
+- Wire the existing controlled wrapper to job cancellation/deadlines, media admission and worker
+  drain; the export pipeline does not call the bridge yet.
+- Review remaining unsafe/error paths and output staging/cleanup before pipeline activation.
 - Include library versions/backend policy in decoded-cache identity; validate feature-disabled
   selections explicitly before job admission. Audit library licensing/runtime dependencies for
   all release targets, and test both enabled and disabled packages.
@@ -48,3 +47,24 @@ the current buffer, including a buffer replaced by libavformat.
 This feature does not remove the separately installed FFmpeg executable requirement and does not
 change existing release archives or deployment defaults. Do not enable it in production merely
 because the bridge's unit tests pass.
+
+## Controlled calls and local IO
+
+`controlled(cancel, absolute_deadline, work)` installs per-thread operation context, checks before
+and after work and between checked codec operations, and returns distinct Cancelled/Timeout
+errors. Nested control scopes are rejected and scope state is cleared on errors or unwinding.
+Input contexts retain an Arc to the same control until FFmpeg closes them; interrupt callbacks
+can read cancellation/deadlines even when invoked from a different thread. Tests cancel a real
+120-second synthetic input after its output is created, expire a running conversion, and verify
+subsequent conversions recover. This is cooperative: a single codec call or OS-blocked file IO
+cannot be forcibly preempted, so workers must be joined rather than abandoned.
+
+File paths must be absolute; Unix path bytes are preserved without lossy conversion. Inputs set
+FFmpeg's protocol whitelist to file only, including for nested playlist resources. A local HTTP
+listener test verifies that a playlist cannot open a network segment. Raw FFmpeg logging is set
+to quiet once for the process; callers receive typed operation errors instead. The embedding
+application must account for this process-wide logging setting.
+
+The caller must still use private output staging and remove partial files on errors/cancellation.
+These codec helpers do not publish, delete or atomically replace export outputs themselves. The
+updater's existing CLI execution path remains in use until the complete adapter is integrated.

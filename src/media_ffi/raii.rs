@@ -18,49 +18,76 @@ use super::error::{check, cstring, media_error};
 pub(super) struct InputContext<'a> {
     pub(super) ptr: *mut ffi::AVFormatContext,
     pub(super) avio: Option<CustomAvio<'a>>,
+    _control: Option<std::sync::Arc<super::control::Control>>,
 }
 
 impl<'a> InputContext<'a> {
+    fn allocated() -> Result<Self, MediaError> {
+        super::control::check()?;
+        let ptr = unsafe { ffi::avformat_alloc_context() };
+        if ptr.is_null() {
+            return Err(media_error("avformat_alloc_context failed"));
+        }
+        let ctx = Self {
+            ptr,
+            avio: None,
+            _control: super::control::current(),
+        };
+        if let Some(control) = &ctx._control {
+            unsafe {
+                (*ptr).interrupt_callback = ffi::AVIOInterruptCB {
+                    callback: Some(super::control::interrupt),
+                    opaque: std::sync::Arc::as_ptr(control).cast_mut().cast(),
+                };
+            }
+        }
+        check(
+            unsafe {
+                ffi::av_opt_set(
+                    ptr.cast(),
+                    c"protocol_whitelist".as_ptr(),
+                    c"file".as_ptr(),
+                    0,
+                )
+            },
+            "set local input protocol whitelist",
+        )?;
+        Ok(ctx)
+    }
     pub(super) unsafe fn open_file(
         url: &CStr,
         input_format: Option<&str>,
     ) -> Result<Self, MediaError> {
-        let mut ptr = ptr::null_mut();
         let format = input_format_ptr(input_format)?;
+        let mut ctx = Self::allocated()?;
         check(
-            unsafe { ffi::avformat_open_input(&mut ptr, url.as_ptr(), format, ptr::null_mut()) },
+            unsafe {
+                ffi::avformat_open_input(&mut ctx.ptr, url.as_ptr(), format, ptr::null_mut())
+            },
             "avformat_open_input",
         )?;
-        Ok(Self { ptr, avio: None })
+        Ok(ctx)
     }
-
     pub(super) unsafe fn open_memory(
         data: &'a [u8],
         input_format: Option<&str>,
     ) -> Result<Self, MediaError> {
         let format = input_format_ptr(input_format)?;
         let url = cstring("memory:input")?;
+        let mut ctx = Self::allocated()?;
         let avio = CustomAvio::new(data)?;
-        let mut ctx = unsafe { ffi::avformat_alloc_context() };
-        if ctx.is_null() {
-            return Err(media_error("avformat_alloc_context failed"));
-        }
         unsafe {
-            (*ctx).pb = avio.ctx;
-            (*ctx).flags |= ffi::AVFMT_FLAG_CUSTOM_IO as i32;
+            (*ctx.ptr).pb = avio.ctx;
+            (*ctx.ptr).flags |= ffi::AVFMT_FLAG_CUSTOM_IO as i32;
         }
-        let mut ctx_for_open = ctx;
+        ctx.avio = Some(avio);
         check(
             unsafe {
-                ffi::avformat_open_input(&mut ctx_for_open, url.as_ptr(), format, ptr::null_mut())
+                ffi::avformat_open_input(&mut ctx.ptr, url.as_ptr(), format, ptr::null_mut())
             },
             "avformat_open_input memory",
         )?;
-        ctx = ctx_for_open;
-        Ok(Self {
-            ptr: ctx,
-            avio: Some(avio),
-        })
+        Ok(ctx)
     }
 }
 
