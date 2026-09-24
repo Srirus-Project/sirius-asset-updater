@@ -125,3 +125,14 @@ pub enum AudioExport {
     Wav,
     Flac,
 }
+
+/// Native elementary streams are always preserved with their actual codec extension.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoExport {
+    Source,
+    #[default]
+    Mkv,
+    Mp4,
+    MkvAndMp4,
+}

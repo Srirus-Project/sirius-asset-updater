@@ -54,11 +54,36 @@ count, sample rate and every sample with the source WAV. Only after this check s
 is FLAC recorded and the intermediate WAV removed. Cue metadata remains unchanged.
 This applies to embedded ACB, standalone ACB and USM audio. Matroska video muxing keeps
 the selected WAV/FLAC audio and original video stream; alpha video handling is unchanged.
-Video container/backend selection remains a separate pending restoration item.
+
+## Video output
+
+`video` accepts `source`, `mkv` (default), `mp4`, or `mkv_and_mp4`.
+All modes retain native demuxed video streams with their actual M2V/IVF extensions and the
+selected decoded WAV/FLAC audio. Sirius can carry either video codec; `source` does not rename
+IVF as M2V. It uses a temporary MKV for full decode/frame-count verification, then removes that
+container. MKV remuxes the original video and selected audio without re-encoding.
+
+MP4 is an additional compatibility rendition: H.264/libx264, medium preset, CRF 18,
+YUV420P, AAC 192 kbit/s and fast-start metadata. This rendition is lossy; original video and
+WAV/FLAC audio remain the preservation outputs. `mp4` removes the intermediate MKV after
+validation, while `mkv_and_mp4` retains both. Encoder options are fixed in this version;
+FFmpeg must provide libx264/AAC. Unsupported dimensions or encoder failures fail the resource
+rather than silently resizing/padding or changing the requested format.
+
+Every output container is fully decoded and its video frame count checked against the USM
+metadata. The existing media deadline, cancellation and output-byte budget apply. USM color
+and alpha streams remain in separate directories: MP4 is not a combined transparency export,
+and its alpha rendition is also lossy. Native alpha streams remain intact.
+
+Video mode is recorded in schema-4 summaries and participates in decoded-cache identity.
+Existing configurations keep MKV behavior; existing summaries without `video` read as MKV.
+The active backend remains the configured FFmpeg executable for media and native Rust for
+Unity/CRI parsing. FFI/backend-choice restoration remains a separate audit item; no ignored
+backend setting is exposed.
 
 ## Receipts and completeness
 
-Export summary schema 4 records selection, image/audio formats, selected/skipped Unity
+Export summary schema 4 records selection, image/audio/video formats, selected/skipped Unity
 object counts and `full_export`. Resource journals report the same object counts and
 identities for outputs. `unity_objects` counts all source objects; selected and skipped
 counts explain a successful subset without concealing omitted objects.

@@ -69,7 +69,7 @@ impl Cache {
             &snapshot.protocol_version,
             &config.selection,
             &config.image,
-            config.audio,
+            (config.audio, config.video),
             key,
             split,
             &config.cache_revision,

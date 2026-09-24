@@ -34,3 +34,7 @@ audio: wav # wav, flac
 #   format: json
 #   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
 #   queue_capacity: 4096
+
+# Video containers: source, mkv (default), mp4, mkv_and_mp4.
+# MP4 is lossy; native video and WAV/FLAC audio remain preserved. See docs/EXPORT_OPTIONS.md.
+video: mkv

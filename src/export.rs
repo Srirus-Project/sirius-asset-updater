@@ -27,6 +27,8 @@ pub struct ExportConfig {
     pub image: crate::export_options::ImageExport,
     #[serde(default)]
     pub audio: crate::export_options::AudioExport,
+    #[serde(default)]
+    pub video: crate::export_options::VideoExport,
     pub output: PathBuf,
     #[serde(default)]
     pub retain_outputs: bool,
@@ -67,6 +69,8 @@ pub struct ExportSummary {
     pub image: crate::export_options::ImageExport,
     #[serde(default)]
     pub audio: crate::export_options::AudioExport,
+    #[serde(default)]
+    pub video: crate::export_options::VideoExport,
     #[serde(default)]
     pub selected_unity_objects: usize,
     #[serde(default)]
@@ -302,6 +306,7 @@ impl ExportConfig {
             selection: self.selection.clone(),
             image: self.image.clone(),
             audio: self.audio,
+            video: self.video,
             full_catalog: complete_selection && assets.len() == catalog_files,
             schema_version: 4,
             region: receipt.snapshot.region.unwrap_or_default(),
@@ -1023,33 +1028,8 @@ impl ExportConfig {
         }
         args.extend(["-c".into(), "copy".into(), movie.as_os_str().to_owned()]);
         self.ffmpeg(&args)?;
-        let progress = tempfile::NamedTempFile::new_in(output).map_err(err)?;
-        self.ffmpeg(&[
-            "-xerror".into(),
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-threads".into(),
-            "2".into(),
-            "-i".into(),
-            movie.as_os_str().to_owned(),
-            "-map".into(),
-            "0".into(),
-            "-progress".into(),
-            progress.path().as_os_str().to_owned(),
-            "-f".into(),
-            "null".into(),
-            "-".into(),
-        ])?;
-        let progress = fs::read_to_string(progress.path()).map_err(err)?;
-        let decoded_frames = progress
-            .lines()
-            .filter_map(|s| s.strip_prefix("frame="))
-            .filter_map(|s| s.trim().parse::<u64>().ok())
-            .next_back();
-        if expected_frames.is_none() || decoded_frames != expected_frames {
-            return Err(err(format!("video frame count mismatch: declared {expected_frames:?}, decoded {decoded_frames:?}")));
-        }
-        self.record(report_root, &movie, "usm_mkv", report)?;
+        self.check_video_frames(&movie, expected_frames)?;
+        self.video_formats(&movie, expected_frames, report_root, report)?;
         let target = output.join("usm.json");
         fs::write(&target, metadata_json).map_err(err)?;
         self.record(report_root, &target, "usm_metadata_json", report)?;
@@ -1116,6 +1096,85 @@ impl ExportConfig {
         }
         if actual != wav_bytes || format != Some((channels as u16, rate)) {
             return Err(err("ADX decoded PCM length or format mismatch"));
+        }
+        Ok(())
+    }
+    fn check_video_frames(&self, movie: &Path, expected_frames: Option<u64>) -> Result<(), Error> {
+        let progress = tempfile::NamedTempFile::new_in(movie.parent().ok_or(Error::Verification)?)
+            .map_err(err)?;
+        self.ffmpeg(&[
+            "-xerror".into(),
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-threads".into(),
+            "2".into(),
+            "-i".into(),
+            movie.as_os_str().to_owned(),
+            "-map".into(),
+            "0".into(),
+            "-progress".into(),
+            progress.path().as_os_str().to_owned(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ])?;
+        let progress = fs::read_to_string(progress.path()).map_err(err)?;
+        let decoded_frames = progress
+            .lines()
+            .filter_map(|s| s.strip_prefix("frame="))
+            .filter_map(|s| s.trim().parse::<u64>().ok())
+            .next_back();
+        if expected_frames.is_none() || decoded_frames != expected_frames {
+            return Err(err(format!("video frame count mismatch: declared {expected_frames:?}, decoded {decoded_frames:?}")));
+        }
+        Ok(())
+    }
+    fn video_formats(
+        &self,
+        movie: &Path,
+        expected_frames: Option<u64>,
+        root: &Path,
+        report: &mut ResourceReport,
+    ) -> Result<(), Error> {
+        use crate::export_options::VideoExport;
+        if matches!(self.video, VideoExport::Mp4 | VideoExport::MkvAndMp4) {
+            let mp4 = movie.with_extension("mp4");
+            self.ffmpeg(&[
+                "-protocol_whitelist".into(),
+                "file,pipe".into(),
+                "-i".into(),
+                movie.as_os_str().to_owned(),
+                "-map".into(),
+                "0:v:0".into(),
+                "-map".into(),
+                "0:a:0?".into(),
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "medium".into(),
+                "-crf".into(),
+                "18".into(),
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+                "-threads".into(),
+                "2".into(),
+                "-fps_mode".into(),
+                "passthrough".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-movflags".into(),
+                "+faststart".into(),
+                mp4.as_os_str().to_owned(),
+            ])?;
+            self.check_video_frames(&mp4, expected_frames)?;
+            self.record(root, &mp4, "usm_mp4", report)?;
+        }
+        if matches!(self.video, VideoExport::Mkv | VideoExport::MkvAndMp4) {
+            self.record(root, movie, "usm_mkv", report)?;
+        } else {
+            fs::remove_file(movie).map_err(err)?;
         }
         Ok(())
     }
@@ -1376,6 +1435,7 @@ pub(crate) mod tests {
             selection: Default::default(),
             image: Default::default(),
             audio: Default::default(),
+            video: Default::default(),
             output: root.join("out"),
             retain_outputs: false,
             cache_directory: None,
@@ -1388,6 +1448,92 @@ pub(crate) mod tests {
             ffmpeg: "unused".into(),
             max_resource_output_bytes: 16 * 1024 * 1024,
         }
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for video format and independent decode checks"]
+    fn video_formats_preserve_source_and_validate_mp4_frames_and_audio() {
+        use crate::export_options::VideoExport;
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        let source = directory.path().join("source.mkv");
+        cfg.ffmpeg(&[
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "testsrc2=size=16x16:rate=25:duration=0.32".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "sine=frequency=440:sample_rate=48000:duration=0.32".into(),
+            "-c:v".into(),
+            "ffv1".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            source.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let original = fs::read(&source).unwrap();
+        for (index, mode) in [
+            VideoExport::Source,
+            VideoExport::Mkv,
+            VideoExport::Mp4,
+            VideoExport::MkvAndMp4,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cfg.video = mode;
+            let root = directory.path().join(index.to_string());
+            fs::create_dir(&root).unwrap();
+            let movie = root.join("movie.mkv");
+            fs::copy(&source, &movie).unwrap();
+            let mut report = ResourceReport::default();
+            cfg.check_video_frames(&movie, Some(8)).unwrap();
+            cfg.video_formats(&movie, Some(8), &root, &mut report)
+                .unwrap();
+            let mkv = matches!(mode, VideoExport::Mkv | VideoExport::MkvAndMp4);
+            let mp4 = matches!(mode, VideoExport::Mp4 | VideoExport::MkvAndMp4);
+            assert_eq!(movie.exists(), mkv);
+            assert_eq!(root.join("movie.mp4").exists(), mp4);
+            assert_eq!(report.outputs.len(), usize::from(mkv) + usize::from(mp4));
+            if mkv {
+                assert_eq!(fs::read(&movie).unwrap(), original);
+            }
+            if mp4 {
+                let video = root.join("frames.yuv");
+                let audio = root.join("audio.pcm");
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    root.join("movie.mp4").into_os_string(),
+                    "-map".into(),
+                    "0:v:0".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    video.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                assert_eq!(fs::metadata(video).unwrap().len(), 8 * 16 * 16 * 3 / 2);
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    root.join("movie.mp4").into_os_string(),
+                    "-map".into(),
+                    "0:a:0".into(),
+                    "-f".into(),
+                    "s16le".into(),
+                    audio.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                assert!(fs::metadata(audio).unwrap().len() >= 15_000 * 2);
+                assert!(cfg
+                    .check_video_frames(&root.join("movie.mp4"), Some(9))
+                    .is_err());
+            }
+            assert_eq!(fs::read(&source).unwrap(), original);
+        }
+        assert!(yaml_serde::from_str::<VideoExport>("avi").is_err());
     }
     #[test]
     fn export_selection_and_format_configuration_fail_closed() {
@@ -1821,6 +1967,9 @@ pub(crate) mod tests {
         cfg.audio = crate::export_options::AudioExport::Flac;
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.audio = Default::default();
+        cfg.video = crate::export_options::VideoExport::Mp4;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.video = Default::default();
         cfg.selection.embedded_audio = false;
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.selection.embedded_audio = true;
