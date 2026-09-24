@@ -40,6 +40,8 @@ impl Retry {
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
+    pub api_proxy: Option<crate::proxy::ProxyConfig>,
+    pub cdn_proxy: Option<crate::proxy::ProxyConfig>,
     pub connect_timeout_ms: u64,
     pub download_timeout_ms: u64,
     pub snapshot_timeout_ms: u64,
@@ -52,6 +54,8 @@ pub struct Network {
 impl Default for Network {
     fn default() -> Self {
         Self {
+            api_proxy: None,
+            cdn_proxy: None,
             connect_timeout_ms: 10_000,
             download_timeout_ms: 60_000,
             snapshot_timeout_ms: 10_000,
@@ -68,6 +72,9 @@ impl Default for Network {
 }
 impl Network {
     pub fn validate(&self) -> Result<(), Error> {
+        for proxy in self.api_proxy.iter().chain(self.cdn_proxy.iter()) {
+            proxy.validate()?;
+        }
         if [
             self.connect_timeout_ms,
             self.download_timeout_ms,

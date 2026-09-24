@@ -238,7 +238,7 @@ impl CatalogClient {
         asset: &Asset,
     ) -> Result<(u64, String), Error> {
         let mut response = self
-            .http
+            .cdn_http
             .get(url)
             .basic_auth(username, Some(password))
             .send()

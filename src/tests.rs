@@ -2649,3 +2649,6 @@ fn access_log_configuration_rejects_bad_trust_headers_and_unbounded_queues() {
     )
     .is_err());
 }
+
+#[path = "network_tests.rs"]
+mod network_tests;

@@ -41,3 +41,41 @@ is mandatory regardless of this setting. Version refresh still requires the
 separate `refresh_token_env`; snapshot reads always use the internal token.
 Credentials remain scoped to their original API or CDN origins, with redirects
 disabled.
+
+## Explicit API and CDN forward proxies
+
+API version refresh/snapshot requests and CDN catalog/asset requests use separate clients:
+
+```yaml
+network:
+  api_proxy:
+    url_env: SIRIUS_API_PROXY_URL
+    authorization_env: SIRIUS_API_PROXY_AUTHORIZATION # optional full header value
+  cdn_proxy:
+    url_env: SIRIUS_CDN_PROXY_URL
+    authorization_env: SIRIUS_CDN_PROXY_AUTHORIZATION
+```
+
+Each URL must be an HTTP or HTTPS proxy origin, without userinfo, path, query or fragment
+(for example `http://127.0.0.1:8080`). Authorization is the complete Proxy-Authorization value,
+for example `Basic BASE64_VALUE` or a proxy-supported bearer scheme, stored in the referenced
+environment variable. Proxy URLs and authentication values are never serialized in receipts
+or offline check results. Missing environment variables and malformed values fail before requests.
+
+Omitting a proxy uses direct connections. Ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY` and OS proxy discovery are disabled. To migrate an environment-based deployment,
+explicitly reference the desired URL variable in the appropriate configuration. A configured
+proxy applies to every request in that client, including loopback destinations, with no bypass
+or fallback to direct connections. Different region profiles may use different proxies.
+
+HTTPS origins use CONNECT, followed by normal origin certificate validation inside the tunnel;
+HTTPS proxy certificates are also validated. Proxy authentication belongs to the proxy transport,
+never an origin default header. HTTP origins use standard forward-proxy requests, whose headers
+(including origin authentication) are visible to that proxy. The existing API/CDN credential
+scope checks and no-redirect policy still apply. SOCKS/PAC/custom trust roots are not configured
+by these fields. Storage publication has its own transport and is unaffected.
+
+Existing connection and request deadlines bound proxy connections and requests. An HTTP 407
+response is terminal. A failed HTTPS CONNECT may be reported as a transport error by reqwest
+and retried within the configured attempt bound; it never bypasses the proxy. Redirects remain
+terminal and are never followed with either proxy or origin credentials.

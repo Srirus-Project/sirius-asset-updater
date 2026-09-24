@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod export;
 pub mod export_verify;
 pub mod network;
+pub mod proxy;
 pub mod readiness;
 pub mod storage;
 mod update;
@@ -293,6 +294,7 @@ impl SnapshotResponse {
 pub struct CatalogClient {
     config: Config,
     http: Client,
+    cdn_http: Client,
 }
 impl CatalogClient {
     pub fn new(config: Config) -> Result<Self, Error> {
@@ -300,19 +302,19 @@ impl CatalogClient {
         Self::build(config)
     }
     fn build(config: Config) -> Result<Self, Error> {
-        let http = Client::builder()
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(config.network.download_timeout_ms))
-            .connect_timeout(Duration::from_millis(config.network.connect_timeout_ms))
+        let http = proxy::builder(&config.network, config.network.api_proxy.as_ref())?
             .build()
             .map_err(|_| Error::Transport)?;
-        Ok(Self { config, http })
+        let cdn_http = proxy::builder(&config.network, config.network.cdn_proxy.as_ref())?
+            .build()
+            .map_err(|_| Error::Transport)?;
+        Ok(Self {
+            config,
+            http,
+            cdn_http,
+        })
     }
+
     pub async fn fetch(&self) -> Result<PathBuf, Error> {
         if !self.config.check_secrets().ready {
             return Err(Error::Preflight);
@@ -363,7 +365,7 @@ impl CatalogClient {
         path: &Path,
     ) -> Result<(u64, String), Error> {
         let mut response = self
-            .http
+            .cdn_http
             .get(url)
             .basic_auth(username, Some(password))
             .send()

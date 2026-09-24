@@ -36,6 +36,9 @@ regional_routes: false
 
 # Optional request policy; these are the defaults. See docs/NETWORK.md.
 # network:
+#   # Optional independent HTTP/HTTPS forward proxies; absent means direct.
+#   # api_proxy: {url_env: SIRIUS_API_PROXY_URL, authorization_env: SIRIUS_API_PROXY_AUTHORIZATION}
+#   # cdn_proxy: {url_env: SIRIUS_CDN_PROXY_URL, authorization_env: SIRIUS_CDN_PROXY_AUTHORIZATION}
 #   connect_timeout_ms: 10000
 #   download_timeout_ms: 60000
 #   snapshot_timeout_ms: 10000

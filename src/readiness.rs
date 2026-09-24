@@ -37,6 +37,15 @@ impl Config {
         if let Some(decrypt) = self.assets.as_ref().and_then(|c| c.decrypt.as_ref()) {
             names.extend([&decrypt.key_hex_env, &decrypt.nonce_seed_hex_env]);
         }
+        for proxy in self
+            .network
+            .api_proxy
+            .iter()
+            .chain(self.network.cdn_proxy.iter())
+        {
+            names.push(&proxy.url_env);
+            names.extend(proxy.authorization_env.iter());
+        }
         for name in names {
             if secret(name).is_err() {
                 report.missing_env.insert(name.clone());
@@ -75,6 +84,16 @@ impl Config {
             ) {
                 if BundleKey::from_hex(&key, &seed).is_err() {
                     report.invalid_fields.push("bundle_key_or_nonce_seed");
+                }
+            }
+        }
+        for (field, proxy) in [
+            ("network.api_proxy", &self.network.api_proxy),
+            ("network.cdn_proxy", &self.network.cdn_proxy),
+        ] {
+            if let Some(proxy) = proxy {
+                if matches!(proxy.resolve(), Err(Error::Config)) {
+                    report.invalid_fields.push(field);
                 }
             }
         }
