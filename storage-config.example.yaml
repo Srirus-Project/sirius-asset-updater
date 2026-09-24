@@ -11,6 +11,9 @@ providers:
   #     type: s3
   #     endpoint: https://s3.example.com
   #     path_style: true # false for bucket.endpoint virtual-host addressing
+  #     public_read: false
+  #     public_read_include: [] # e.g. ['\.png$']
+  #     public_read_exclude: [] # exclusions always win
   #     bucket: sirius-assets
   #     region: auto
   #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID

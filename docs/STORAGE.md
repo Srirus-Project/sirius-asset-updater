@@ -19,6 +19,28 @@ redirects. No credentials, endpoints or signed requests appear in publication re
 Local destination roots must not overlap the export tree. Both trees must be owned by the updater
 and immutable to other writers; these checks are not a filesystem security boundary.
 
+## S3 public-read policy
+
+S3 providers accept `public_read` (default false), `public_read_include` and
+`public_read_exclude` (default empty lists). A file receives `x-amz-acl: public-read` when
+public_read is true or any include regex matches, unless an exclude regex matches.
+Exclusions always win, including over the provider-wide flag. Match paths relative to the
+export root, with forward slashes and without bucket/publication prefixes. The same rules
+apply to `summary.json`, `resources.jsonl` and `complete.json`; include those explicitly if
+anonymous consumers need the publication receipts. Local providers reject these S3-only fields.
+
+Rules are compiled before publishing: each list has at most 128 nonempty patterns, each
+at most 4096 bytes with a 1 MiB regex compilation limit. Invalid rules fail configuration.
+ACLs are attached to ordinary writes and multipart initiation, not applied after publication.
+Denied/unsupported ACLs fail the publication and preserve local output; there is no fallback
+that silently removes the requested ACL. All object read-back checks remain authenticated.
+
+With no matching rule, the uploader omits the ACL header. This preserves existing behavior;
+it does not override bucket policies or prove anonymous access is denied. Stores with ACLs
+disabled should leave public-read off and manage public access through their bucket policy.
+Unlike the original Haruki provider-wide flag, Sirius exclusions can override public_read=true;
+move original global file patterns into each selected S3 provider's include/exclude lists.
+
 ## Publication contract
 
 1. Independently verify the retained export and create a bounded, disk-backed object allowlist.
@@ -63,5 +85,5 @@ Do not delete prefixes merely because an active transfer has not written a marke
   export. Once verified cleanup begins it runs to completion without cancellation; a filesystem
   deletion error can leave a partially removed local tree, while all remote copies are complete.
 
-This restores the local/S3 publication path. Public ACL rules, publication URLs, mutable registries,
+This restores the local/S3 publication path. Publication URLs, mutable registries,
 notifications, scheduling and production storage acceptance remain in the restoration audit.

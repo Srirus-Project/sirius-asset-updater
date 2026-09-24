@@ -67,6 +67,7 @@ async fn local_publication_readback_region_scope_and_explicit_cleanup() {
 #[derive(Default)]
 struct Fake {
     objects: Mutex<HashMap<String, Vec<u8>>>,
+    acls: Mutex<HashMap<String, Option<String>>>,
     parts: Mutex<BTreeMap<usize, Vec<u8>>>,
     mode: AtomicUsize,
     puts: AtomicUsize,
@@ -86,6 +87,17 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
         .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 Credential=synthetic-access/"))
     {
         state.unsigned.store(true, Ordering::SeqCst);
+    }
+    if method == "PUT" && !query.contains("uploadId=")
+        || method == "POST" && query.contains("uploads")
+    {
+        state.acls.lock().unwrap().insert(
+            key.clone(),
+            request
+                .headers()
+                .get("x-amz-acl")
+                .map(|v| v.to_str().unwrap().to_string()),
+        );
     }
     let mode = state.mode.load(Ordering::SeqCst);
     if mode == 6 && method == "GET" {
@@ -228,6 +240,9 @@ async fn server() -> Server {
         backend: Backend::S3 {
             endpoint,
             path_style: true,
+            public_read: false,
+            public_read_include: vec![],
+            public_read_exclude: vec![],
             bucket: "synthetic-bucket".into(),
             region: "test-region".into(),
             access_key_id_env: env[0].clone(),
@@ -482,4 +497,113 @@ async fn s3_address_style_changes_signed_request_and_preserves_legacy_default() 
         }
         assert!(server.config.validate().is_err());
     }
+}
+
+#[tokio::test]
+async fn s3_public_read_rules_apply_to_uploads_and_markers() {
+    for mode in 0..4 {
+        let source = if mode == 1 { large_source() } else { fixture() };
+        let mut server = server().await;
+        if let Backend::S3 {
+            public_read,
+            public_read_include,
+            public_read_exclude,
+            ..
+        } = &mut server.config.providers[0].backend
+        {
+            *public_read = mode == 2;
+            *public_read_include = if mode == 1 {
+                vec![r"\.bin$".into()]
+            } else if mode == 3 {
+                vec![".*".into()]
+            } else {
+                vec![]
+            };
+            *public_read_exclude = if mode >= 2 {
+                vec![r"^resources\.jsonl$".into(), r"^00000/".into()]
+            } else {
+                vec![]
+            };
+        }
+        let (_tx, rx) = watch::channel(false);
+        let publication = server
+            .config
+            .publish(source.path(), Region::Jp, rx)
+            .await
+            .unwrap();
+        let acls = server.state.acls.lock().unwrap();
+        for path in [
+            "00000/payload.bin",
+            "summary.json",
+            "resources.jsonl",
+            "complete.json",
+        ] {
+            let key = format!(
+                "/synthetic-bucket/{}/{}",
+                publication.providers[0].prefix, path
+            );
+            let expected = match mode {
+                1 => path.ends_with(".bin"),
+                2 | 3 => path == "summary.json" || path == "complete.json",
+                _ => false,
+            };
+            assert_eq!(
+                acls.get(&key).unwrap().as_deref(),
+                expected.then_some("public-read"),
+                "mode {mode}, {path}"
+            );
+        }
+        assert!(source.path().exists());
+        assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    }
+    let mut server = server().await;
+    for rules in [
+        vec!["[".into()],
+        vec!["".into()],
+        vec!["x".repeat(4097)],
+        vec!["x".into(); 129],
+    ] {
+        if let Backend::S3 {
+            public_read_include,
+            ..
+        } = &mut server.config.providers[0].backend
+        {
+            *public_read_include = rules;
+        }
+        assert!(server.config.validate().is_err());
+    }
+    assert_eq!(server.state.puts.load(Ordering::SeqCst), 0);
+    if let Backend::S3 {
+        public_read,
+        public_read_include,
+        ..
+    } = &mut server.config.providers[0].backend
+    {
+        *public_read = true;
+        public_read_include.clear();
+    }
+    server.state.mode.store(3, Ordering::SeqCst);
+    server.config.remove_local_after_upload = true;
+    let source = fixture();
+    let (_tx, rx) = watch::channel(false);
+    assert!(server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .is_err());
+    assert!(source.path().exists());
+    assert!(server
+        .state
+        .acls
+        .lock()
+        .unwrap()
+        .values()
+        .all(|acl| acl.as_deref() == Some("public-read")));
+    assert!(!server
+        .state
+        .objects
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|key| key.ends_with("complete.json")));
 }

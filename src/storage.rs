@@ -73,6 +73,12 @@ pub enum Backend {
         endpoint: String,
         #[serde(default = "path_style")]
         path_style: bool,
+        #[serde(default)]
+        public_read: bool,
+        #[serde(default)]
+        public_read_include: Vec<String>,
+        #[serde(default)]
+        public_read_exclude: Vec<String>,
         bucket: String,
         region: String,
         access_key_id_env: String,
@@ -80,6 +86,34 @@ pub enum Backend {
         #[serde(default)]
         session_token_env: Option<String>,
     },
+}
+struct PublicReadPolicy {
+    all: bool,
+    include: Vec<regex::Regex>,
+    exclude: Vec<regex::Regex>,
+}
+impl PublicReadPolicy {
+    fn matches(&self, path: &str) -> bool {
+        (self.all || self.include.iter().any(|r| r.is_match(path)))
+            && !self.exclude.iter().any(|r| r.is_match(path))
+    }
+}
+fn acl_rules(patterns: &[String]) -> Result<Vec<regex::Regex>, Error> {
+    if patterns.len() > 128 {
+        return Err(Error::Config);
+    }
+    patterns
+        .iter()
+        .map(|pattern| {
+            if pattern.trim().is_empty() || pattern.len() > 4096 {
+                return Err(Error::Config);
+            }
+            regex::RegexBuilder::new(pattern)
+                .size_limit(1024 * 1024)
+                .build()
+                .map_err(|_| Error::Config)
+        })
+        .collect()
 }
 #[derive(Serialize)]
 pub struct Publication {
@@ -144,6 +178,7 @@ impl Config {
         }
         let mut names = HashSet::new();
         for p in &self.providers {
+            p.public_read_policy()?;
             if !component(&p.name)
                 || !names.insert(&p.name)
                 || p.prefix.len() > 512
@@ -165,6 +200,7 @@ impl Config {
                     access_key_id_env,
                     secret_access_key_env,
                     session_token_env,
+                    ..
                 } => {
                     let url = reqwest::Url::parse(endpoint).map_err(|_| Error::Config)?;
                     let loopback = url.host_str().is_some_and(|h| {
@@ -238,9 +274,17 @@ impl Config {
         let mut operators = Vec::new();
         for provider in &self.providers {
             let op = provider.operator(&input)?;
+            let policy = provider.public_read_policy()?;
+            let public_op = if policy.all || !policy.include.is_empty() {
+                Some(provider.operator_with_acl(&input, true)?)
+            } else {
+                None
+            };
             let prefix = format!("{}/{}/publications/{id}", provider.prefix, region.name());
             operators.push((
                 op,
+                public_op,
+                policy,
                 Target {
                     name: provider.name.clone(),
                     prefix,
@@ -249,7 +293,7 @@ impl Config {
         }
         let mut total_bytes = 0_u64;
         let mut total_files = 0_usize;
-        for (op, target) in &operators {
+        for (op, public_op, policy, target) in &operators {
             let inventory = tokio::fs::File::open(verified.inventory.path())
                 .await
                 .map_err(|_| Error::Io)?;
@@ -279,6 +323,11 @@ impl Config {
                         }
                         let result = async {
                             let object = object?;
+                            let op = if policy.matches(&object.path) {
+                                public_op.as_ref().unwrap_or(op)
+                            } else {
+                                op
+                            };
                             self.upload(op, &target.prefix, input, &object, stop)
                                 .await?;
                             Ok(object.bytes)
@@ -317,7 +366,12 @@ impl Config {
         }
         // Consumers must ignore prefixes without this last, verified completion marker.
         let marker = sonic_rs::to_vec(&verified.report).map_err(|_| Error::Verification)?;
-        for (op, target) in &operators {
+        for (op, public_op, policy, target) in &operators {
+            let op = if policy.matches("complete.json") {
+                public_op.as_ref().unwrap_or(op)
+            } else {
+                op
+            };
             let key = format!("{}/complete.json", target.prefix);
             let expected = hex::encode(Sha256::digest(&marker));
             for attempt in 0..self.attempts {
@@ -367,7 +421,10 @@ impl Config {
             region,
             files: total_files,
             bytes: total_bytes,
-            providers: operators.into_iter().map(|(_, target)| target).collect(),
+            providers: operators
+                .into_iter()
+                .map(|(_, _, _, target)| target)
+                .collect(),
             local_removed: self.remove_local_after_upload,
         })
     }
@@ -510,7 +567,29 @@ async fn check_remote(op: &Operator, key: &str, bytes: u64, hash: &str) -> Resul
     Ok(())
 }
 impl Provider {
+    fn public_read_policy(&self) -> Result<PublicReadPolicy, Error> {
+        match &self.backend {
+            Backend::S3 {
+                public_read,
+                public_read_include,
+                public_read_exclude,
+                ..
+            } => Ok(PublicReadPolicy {
+                all: *public_read,
+                include: acl_rules(public_read_include)?,
+                exclude: acl_rules(public_read_exclude)?,
+            }),
+            Backend::Local { .. } => Ok(PublicReadPolicy {
+                all: false,
+                include: vec![],
+                exclude: vec![],
+            }),
+        }
+    }
     fn operator(&self, source: &Path) -> Result<Operator, Error> {
+        self.operator_with_acl(source, false)
+    }
+    fn operator_with_acl(&self, source: &Path, public: bool) -> Result<Operator, Error> {
         match &self.backend {
             Backend::Local { directory } => {
                 let source = std::fs::canonicalize(source).map_err(|_| Error::Io)?;
@@ -558,6 +637,7 @@ impl Provider {
                 access_key_id_env,
                 secret_access_key_env,
                 session_token_env,
+                ..
             } => {
                 let mut builder = services::S3::default()
                     .endpoint(endpoint)
@@ -567,6 +647,9 @@ impl Provider {
                     .secret_access_key(&secret(secret_access_key_env)?)
                     .disable_config_load()
                     .disable_ec2_metadata();
+                if public {
+                    builder = builder.default_acl("public-read");
+                }
                 if !path_style {
                     builder = builder.enable_virtual_host_style();
                 }
