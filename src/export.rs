@@ -1258,6 +1258,9 @@ impl ExportConfig {
             self.record(root, wav, &format!("{codec}_wav"), report)?;
             return Ok(wav.into());
         }
+        if self.audio == crate::export_options::AudioExport::Mp3 {
+            return self.record_mp3(root, wav, codec, report);
+        }
         let target = wav.with_extension("flac");
         self.ffmpeg(&[
             "-protocol_whitelist".into(),
@@ -1294,6 +1297,71 @@ impl ExportConfig {
         self.record(root, &target, &format!("{codec}_flac"), report)?;
         fs::remove_file(wav).map_err(err)?;
         Ok(target)
+    }
+    fn record_mp3(
+        &self,
+        root: &Path,
+        wav: &Path,
+        codec: &str,
+        report: &mut ResourceReport,
+    ) -> Result<PathBuf, Error> {
+        let original = fs::read(wav).map_err(err)?;
+        let (channels, rate, pcm) = pcm_identity(&original)?;
+        if !matches!(channels, 1 | 2) || pcm.is_empty() {
+            return Err(err("MP3 requires nonempty mono/stereo PCM"));
+        }
+        let bitrate = match rate {
+            32000 | 44100 | 48000 => "192k",
+            16000 | 22050 | 24000 => "128k",
+            8000 | 11025 | 12000 => "64k",
+            _ => return Err(err("MP3 sample rate is unsupported without resampling")),
+        };
+        let target = wav.with_extension("mp3");
+        self.ffmpeg(&[
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-i".into(),
+            wav.as_os_str().to_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-c:a".into(),
+            "libmp3lame".into(),
+            "-b:a".into(),
+            bitrate.into(),
+            target.as_os_str().to_owned(),
+        ])?;
+        let decoded = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile_in(root)
+            .map_err(err)?;
+        self.ffmpeg(&[
+            "-y".into(),
+            "-xerror".into(),
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-i".into(),
+            target.as_os_str().to_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            decoded.path().as_os_str().to_owned(),
+        ])?;
+        let roundtrip = fs::read(decoded.path()).map_err(err)?;
+        let (decoded_channels, decoded_rate, decoded_pcm) = pcm_identity(&roundtrip)?;
+        let original_frames = pcm.len() / (usize::from(channels) * 2);
+        let decoded_frames = decoded_pcm.len() / (usize::from(decoded_channels) * 2);
+        if channels != decoded_channels
+            || rate != decoded_rate
+            || decoded_pcm.is_empty()
+            || original_frames.abs_diff(decoded_frames) > 1152
+        {
+            return Err(err("MP3 channel/rate/duration verification failed"));
+        }
+        self.record(root, wav, &format!("{codec}_wav"), report)?;
+        self.record(root, &target, &format!("{codec}_mp3"), report)?;
+        // Keep preservation PCM for subsequent video muxing, avoiding a lossy intermediate.
+        Ok(wav.into())
     }
     fn record(
         &self,
@@ -1549,6 +1617,96 @@ pub(crate) mod tests {
         }
         assert!(yaml_serde::from_str::<VideoExport>("avi").is_err());
     }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for MP3 encode/decode and PCM preservation checks"]
+    fn mp3_output_preserves_pcm_and_verifies_supported_audio_shapes() {
+        use crate::export_options::AudioExport;
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        cfg.audio = AudioExport::Mp3;
+        for rate in [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000] {
+            for channels in [1, 2] {
+                let wav = directory.path().join(format!("{rate}-{channels}.wav"));
+                cfg.ffmpeg(&[
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    format!("sine=frequency=440:sample_rate={rate}:duration=0.25").into(),
+                    "-ac".into(),
+                    channels.to_string().into(),
+                    "-c:a".into(),
+                    "pcm_s16le".into(),
+                    wav.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                let original = fs::read(&wav).unwrap();
+                let mut report = ResourceReport::default();
+                assert_eq!(
+                    cfg.record_audio(directory.path(), &wav, "fixture", &mut report)
+                        .unwrap(),
+                    wav
+                );
+                assert_eq!(fs::read(&wav).unwrap(), original);
+                assert_eq!(report.outputs.len(), 2);
+                assert_eq!(report.outputs[0].kind, "fixture_wav");
+                assert_eq!(report.outputs[1].kind, "fixture_mp3");
+                let raw = wav.with_extension("pcm");
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    wav.with_extension("mp3").into_os_string(),
+                    "-map".into(),
+                    "0:a:0".into(),
+                    "-f".into(),
+                    "s16le".into(),
+                    raw.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                let decoded = fs::read(&raw).unwrap();
+                assert!(decoded.iter().any(|b| *b != 0));
+                let frames = decoded.len() / (channels * 2);
+                assert!(frames.abs_diff(rate / 4) <= 1152);
+            }
+        }
+        for (rate, channels) in [(48000, 3), (12345, 1)] {
+            let wav = directory
+                .path()
+                .join(format!("unsupported-{rate}-{channels}.wav"));
+            cfg.ffmpeg(&[
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                format!("sine=sample_rate={rate}:duration=0.25").into(),
+                "-ac".into(),
+                channels.to_string().into(),
+                "-c:a".into(),
+                "pcm_s16le".into(),
+                wav.as_os_str().to_owned(),
+            ])
+            .unwrap();
+            let original = fs::read(&wav).unwrap();
+            let mut report = ResourceReport::default();
+            assert!(cfg
+                .record_audio(directory.path(), &wav, "fixture", &mut report)
+                .is_err());
+            assert!(report.outputs.is_empty() && !wav.with_extension("mp3").exists());
+            assert_eq!(fs::read(wav).unwrap(), original);
+        }
+        let acb = directory.path().join("acb");
+        fs::create_dir(&acb).unwrap();
+        let mut report = ResourceReport::default();
+        cfg.acb(
+            &synthetic_acb(0x12345678),
+            &acb,
+            0x12345678,
+            &mut report,
+            &acb,
+        )
+        .unwrap();
+        assert!(acb.join("00000.wav").is_file() && acb.join("00000.mp3").is_file());
+        assert!(report.outputs.iter().any(|o| o.kind == "hca_mp3"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn media_process_gate_bounds_children_and_cancels_or_times_out_before_spawn() {
@@ -2076,6 +2234,8 @@ pub(crate) mod tests {
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
         cfg.audio = crate::export_options::AudioExport::Flac;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.audio = crate::export_options::AudioExport::Mp3;
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.audio = Default::default();
         cfg.video = crate::export_options::VideoExport::Mp4;

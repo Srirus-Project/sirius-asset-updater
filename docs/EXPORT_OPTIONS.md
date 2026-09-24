@@ -55,6 +55,21 @@ is FLAC recorded and the intermediate WAV removed. Cue metadata remains unchange
 This applies to embedded ACB, standalone ACB and USM audio. Matroska video muxing keeps
 the selected WAV/FLAC audio and original video stream; alpha video handling is unchanged.
 
+`audio: mp3` adds a lossy compatibility file using FFmpeg/libmp3lame and also records the
+original decoded PCM WAV. MP3 never replaces the preservation source. Subsequent USM video
+muxing uses that WAV, avoiding an extra lossy intermediate before MP4 encoding.
+
+The encoder preserves mono/stereo and native MP3 sample rates: 32/44.1/48 kHz at 192 kbit/s,
+16/22.05/24 kHz at 128 kbit/s, and 8/11.025/12 kHz at 64 kbit/s. Unsupported rates, empty PCM
+or more than two channels fail explicitly; no implicit resampling or downmixing is performed.
+The complete MP3 is decoded with errors treated as failures. Channels and sample rate must
+match; sample-frame count may differ by at most 1,152 for codec framing/padding. This verifies
+structure/duration, not lossless PCM equivalence. Both WAV and MP3 count toward the resource
+output budget, journal, storage publication and independent hash verification.
+
+Audio mode participates in cache identity. Arbitrary simultaneous format lists and codec
+quality tuning remain outside the current scalar audio configuration.
+
 ## Video output
 
 `video` accepts `source`, `mkv` (default), `mp4`, or `mkv_and_mp4`.

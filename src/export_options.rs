@@ -124,6 +124,7 @@ pub enum AudioExport {
     #[default]
     Wav,
     Flac,
+    Mp3,
 }
 
 /// Native elementary streams are always preserved with their actual codec extension.
