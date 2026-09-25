@@ -147,4 +147,32 @@ is opt-in through [CPU worker sizing](EXPORT.md#cpu-worker-sizing). Each worker 
 `max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
 assets. Media admission remains separately bounded by `media_concurrency` and the service's
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
-can multiply resource workers across regions. CPU load throttling and independent stage controls remain separate restoration work.
+can multiply resource workers across regions. CPU load throttling and separate audio/video encoder widths remain restoration work.
+
+## Independent decoder stages
+
+Each export profile may constrain specific processing stages independently:
+
+```yaml
+stage_limits:
+  acb: 2
+  usm: 1
+  hca: 4
+  image: 4
+  wait_timeout_seconds: 3600
+```
+
+Each stage defaults to omitted/null (no additional limit), or accepts 1..64. ACB slots cover
+container parsing, waveforms and their publication, including embedded and SplitAcb containers.
+USM slots cover one color/alpha container's extraction, decoding, validation and output, including
+its plaintext fallback. HCA slots cover native PCM decoding in both ACB and USM and are released
+before media validation or optional audio encoding. Image slots cover Texture2D/Sprite decoding
+and image encoding; the encoded bytes may remain resident while output is written.
+
+Admission checks cancellation at least every 20 ms. `wait_timeout_seconds` (1..3600) bounds
+waiting for each stage, not the synchronous decoder's execution. RAII releases slots on success,
+error or unwind. Workers acquire container stages before HCA/media; no stage recursively acquires
+itself. Waiting still occupies a resource worker, so these controls do not guarantee fair task
+ordering. They do not impose a memory ceiling or widen automatically with CPU tuning. Decode-cache
+hits bypass these stages; scheduling controls do not change cache identity. Limits are per export,
+with existing shared service media and byte budgets still applying across jobs.

@@ -50,6 +50,10 @@ pub struct ExportConfig {
     #[serde(default)]
     pub cpu: crate::cpu_policy::Config,
     #[serde(default)]
+    pub stage_limits: crate::stage_limits::Config,
+    #[serde(skip)]
+    stage_gates: crate::stage_limits::Gates,
+    #[serde(default)]
     pub max_in_flight_bundle_bytes: u64,
     #[serde(skip)]
     local_resource_budget: std::sync::OnceLock<crate::resource_budget::Budget>,
@@ -167,6 +171,7 @@ impl ExportConfig {
             log.validate().map_err(|_| Error::Config)?;
         }
         self.cpu.validate()?;
+        self.stage_limits.validate()?;
         self.selection.validate()?;
         self.media_backend.validate()?;
         self.image.validate()?;
@@ -609,6 +614,11 @@ impl ExportConfig {
                 let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
                 let (data, extension, kind) = match object.class_id() {
                     28 | 213 => {
+                        let _stage = self.stage_gates.acquire(
+                            &self.stage_limits,
+                            crate::stage_limits::Stage::Image,
+                            &self.cancel,
+                        )?;
                         let image = if object.class_id() == 28 {
                             object
                                 .decode_texture_mip(0, TextureReadLimits::default())
@@ -866,6 +876,11 @@ impl ExportConfig {
         report: &mut ResourceReport,
         root: &Path,
     ) -> Result<(), Error> {
+        let _stage = self.stage_gates.acquire(
+            &self.stage_limits,
+            crate::stage_limits::Stage::Acb,
+            &self.cancel,
+        )?;
         use cridecoder::acb::{AfsArchive, TrackList, UtfTable};
         let utf = UtfTable::new(Cursor::new(bytes)).map_err(err)?;
         let tracks = TrackList::new(&utf).map_err(err)?;
@@ -892,6 +907,11 @@ impl ExportConfig {
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
+            let hca_stage = self.stage_gates.acquire(
+                &self.stage_limits,
+                crate::stage_limits::Stage::Hca,
+                &self.cancel,
+            )?;
             let hca = awb.file_data(entry).map_err(err)?;
             let mut decoder = cridecoder::HcaDecoder::from_reader(Cursor::new(hca)).map_err(err)?;
             decoder.set_encryption_key(key, awb.subkey as u64);
@@ -908,6 +928,7 @@ impl ExportConfig {
             decoder
                 .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                 .map_err(err)?;
+            drop(hca_stage);
             self.media_check(&target)?;
             self.record_audio(root, &target, "hca", report)?;
             let cues: Vec<_> = tracks
@@ -954,6 +975,11 @@ impl ExportConfig {
         report: &mut ResourceReport,
         report_root: &Path,
     ) -> Result<(), Error> {
+        let _stage = self.stage_gates.acquire(
+            &self.stage_limits,
+            crate::stage_limits::Stage::Usm,
+            &self.cancel,
+        )?;
         let start = report.outputs.len();
         match self.usm_decode(
             &bytes,
@@ -1075,12 +1101,18 @@ impl ExportConfig {
                         return Err(err("multiple audio streams are unsupported"));
                     }
                     let target = output.join(format!("{i:05}.wav"));
+                    let hca_stage = self.stage_gates.acquire(
+                        &self.stage_limits,
+                        crate::stage_limits::Stage::Hca,
+                        &self.cancel,
+                    )?;
                     let mut decoder = cridecoder::HcaDecoder::from_reader(Cursor::new(stream.data))
                         .map_err(err)?;
                     decoder.set_encryption_key(crypto.value, 0);
                     decoder
                         .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                         .map_err(err)?;
+                    drop(hca_stage);
                     self.media_check(&target)?;
                     audio = Some(self.record_audio(report_root, &target, "hca", report)?);
                 }
@@ -1737,6 +1769,8 @@ pub(crate) mod tests {
             split_acb_xor_env: None,
             concurrency: 1,
             cpu: Default::default(),
+            stage_limits: Default::default(),
+            stage_gates: Default::default(),
             max_in_flight_bundle_bytes: 0,
             local_resource_budget: Default::default(),
             service_resource_budget: None,
@@ -2917,6 +2951,43 @@ pub(crate) mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    #[test]
+    fn acb_and_hca_stage_waits_cancel_before_output_and_release_nested_permits() {
+        for stage in [
+            crate::stage_limits::Stage::Acb,
+            crate::stage_limits::Stage::Hca,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut cfg = config(root.path());
+            cfg.stage_limits.acb = Some(1);
+            cfg.stage_limits.hca = Some(1);
+            let permit = cfg
+                .stage_gates
+                .acquire(&cfg.stage_limits, stage, &cfg.cancel)
+                .unwrap();
+            let mut report = ResourceReport::default();
+            std::thread::scope(|scope| {
+                let cancel = &cfg.cancel;
+                scope.spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                assert!(matches!(
+                    cfg.acb(&synthetic_acb(0), root.path(), 0, &mut report, root.path()),
+                    Err(Error::Cancelled)
+                ));
+            });
+            assert!(report.outputs.is_empty());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            drop(permit);
+            cfg.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            cfg.acb(&synthetic_acb(0), root.path(), 0, &mut report, root.path())
+                .unwrap();
+            validate_wav(&fs::read(root.path().join("00000.wav")).unwrap()).unwrap();
+            assert_eq!(report.outputs.len(), 2);
+        }
+    }
     #[test]
     fn encrypted_acb_exports_pcm_and_keeps_cue_names_out_of_paths() {
         let root = tempfile::tempdir().unwrap();
