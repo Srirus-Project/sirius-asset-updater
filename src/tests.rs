@@ -1510,6 +1510,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     let env = format!("SERVICE_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&env, "service-only-token");
     let service = Service::open(ServiceConfig {
+        completion_notifications: vec![],
         logging: None,
         tls: None,
         access_log: None,
@@ -2159,6 +2160,7 @@ async fn check_job_service_media_backend(ffi: bool) {
     let storage = directory.path().join("storage.yaml");
     let destination = directory.path().join("published");
     let config = || ServiceConfig {
+        completion_notifications: vec![],
         logging: None,
         tls: None,
         access_log: None,
@@ -2947,4 +2949,302 @@ async fn service_download_budget_bounds_clients_and_recovers_after_cancellation(
     drop(held);
     assert_eq!(gate.available_permits(), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn completion_delivery_restarts_retries_and_does_not_repeat_pipeline() {
+    use crate::{
+        completion_notify,
+        jobs::{Completion, Job},
+        service::{Service, ServiceConfig},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tower::ServiceExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = directory.path().join("input");
+    let (catalog_client, _, upstream) = serve(cfg, StatusCode::OK, catalog(), Duration::ZERO).await;
+    let publication = catalog_client.fetch().await.unwrap();
+    upstream.abort();
+    let notice_env = format!("NOTICE_{}", uuid::Uuid::new_v4().simple());
+    let service_env = format!("SERVICE_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&notice_env, "synthetic-notice-only");
+    std::env::set_var(&service_env, "synthetic-service-only");
+    let healthy_env = format!("NOTICE_HEALTHY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&healthy_env, "synthetic-healthy-only");
+    let healthy_hits = Arc::new(AtomicUsize::new(0));
+    let healthy = healthy_hits.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::<Completion>::new()));
+    let count = attempts.clone();
+    let events = received.clone();
+    let receiver = axum::Router::new().route(
+        "/notice",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let count = count.clone();
+            let events = events.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer synthetic-notice-only");
+                let event: Completion = sonic_rs::from_slice(&body).unwrap();
+                assert_eq!(headers["idempotency-key"], event.job_id);
+                assert!(event.outcome.verification.catalog_verified);
+                events.lock().await.push(event.clone());
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => (StatusCode::SERVICE_UNAVAILABLE, "retry later".to_string()),
+                    1 => (
+                        StatusCode::ACCEPTED,
+                        r#"{"schema_version":1,"job_id":"wrong"}"#.into(),
+                    ),
+                    2 => (
+                        StatusCode::ACCEPTED,
+                        sonic_rs::to_string(
+                            &sonic_rs::json!({"schema_version":1,"job_id":event.job_id}),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => std::future::pending().await,
+                }
+            }
+        }),
+    );
+    let receiver = receiver.route(
+        "/healthy",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let healthy = healthy.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer synthetic-healthy-only");
+                let event: Completion = sonic_rs::from_slice(&body).unwrap();
+                healthy.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::ACCEPTED,
+                    sonic_rs::to_string(
+                        &sonic_rs::json!({"schema_version":1,"job_id":event.job_id}),
+                    )
+                    .unwrap(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/notice", listener.local_addr().unwrap());
+    let healthy_endpoint = format!("http://{}/healthy", listener.local_addr().unwrap());
+    let receiver_task = tokio::spawn(async move {
+        axum::serve(listener, receiver).await.unwrap();
+    });
+    let mut cfg: ServiceConfig = sonic_rs::from_value(&sonic_rs::json!({
+        "listen":"127.0.0.1:0","token_env":service_env,"state_directory":directory.path().join("state"),
+        "output_directory":directory.path().join("outputs"), "profiles":{"verify":{"region":"jp","input":publication}},
+    })).unwrap();
+    cfg.completion_notifications = vec![completion_notify::Config {
+        name: "consumer".into(),
+        region: region::Region::Jp,
+        endpoint,
+        token_env: notice_env,
+        timeout_seconds: 60,
+        retry_seconds: 3600,
+    }];
+    cfg.completion_notifications
+        .push(completion_notify::Config {
+            name: "healthy".into(),
+            region: region::Region::Jp,
+            endpoint: healthy_endpoint,
+            token_env: healthy_env,
+            timeout_seconds: 1,
+            retry_seconds: 1,
+        });
+    let mut invalid = cfg.clone();
+    invalid.completion_notifications[0].token_env = invalid.token_env.clone();
+    assert!(Service::open(invalid).is_err());
+    let mut invalid = cfg.clone();
+    invalid.completion_notifications[0].region = region::Region::En;
+    assert!(Service::open(invalid).is_err());
+    async fn request(
+        service: &Service,
+        method: &str,
+        path: &str,
+        authorized: bool,
+        body: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        if authorized {
+            request = request.header("authorization", "Bearer synthetic-service-only");
+        }
+        let response = service
+            .router()
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+    }
+    let service = Service::open(cfg.clone()).unwrap();
+    assert_eq!(
+        request(
+            &service,
+            "GET",
+            "/api/v1/completion-notifications",
+            false,
+            ""
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, bytes) = request(
+        &service,
+        "POST",
+        "/api/v1/jobs",
+        true,
+        r#"{"region":"jp","profile":"verify","operation":"verify"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job: Job = sonic_rs::from_slice(&bytes).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let worker_service = service.clone();
+    let worker = tokio::spawn(async move { worker_service.run_workers(rx).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, bytes) = request(
+                &service,
+                "GET",
+                "/api/v1/completion-notifications",
+                true,
+                "",
+            )
+            .await;
+            let text = String::from_utf8(bytes).unwrap();
+            if text.contains("receiver_rejected")
+                && healthy_hits.load(Ordering::SeqCst) == 1
+                && text.contains("\"pending\":0")
+            {
+                assert!(text.contains("\"pending_events\":1"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, prior) = request(
+        &service,
+        "GET",
+        &format!("/api/v1/jobs/{}", job.id),
+        true,
+        "",
+    )
+    .await;
+    let before: Job = sonic_rs::from_slice(&prior).unwrap();
+    assert_eq!(before.status, crate::jobs::Status::Completed);
+    stop.send(true).unwrap();
+    worker.await.unwrap().unwrap();
+    drop(service);
+    // No recipient configured: keep persisted events visible and do not reroute them.
+    let mut missing = cfg.clone();
+    missing.completion_notifications.clear();
+    let service = Service::open(missing).unwrap();
+    let (_, bytes) = request(
+        &service,
+        "GET",
+        "/api/v1/completion-notifications",
+        true,
+        "",
+    )
+    .await;
+    assert!(String::from_utf8(bytes)
+        .unwrap()
+        .contains("\"unconfigured_deliveries\":1"));
+    drop(service);
+    cfg.completion_notifications[0].retry_seconds = 1;
+    let service = Service::open(cfg.clone()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let worker_service = service.clone();
+    let worker = tokio::spawn(async move { worker_service.run_workers(rx).await });
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let (_, bytes) = request(
+                &service,
+                "GET",
+                "/api/v1/completion-notifications",
+                true,
+                "",
+            )
+            .await;
+            let text = String::from_utf8(bytes).unwrap();
+            if text.contains("\"pending_events\":0") {
+                assert!(text.contains("\"attempts\":2"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    let (_, after) = request(
+        &service,
+        "GET",
+        &format!("/api/v1/jobs/{}", job.id),
+        true,
+        "",
+    )
+    .await;
+    assert_eq!(prior, after);
+    let events = received.lock().await;
+    assert_eq!(events.len(), 3);
+    for event in events.iter() {
+        assert_eq!(event.job_id, job.id);
+        assert_eq!(event.completed_at, before.updated_at);
+    }
+    drop(events);
+    // A receiver stalled for the entire request deadline must not delay service shutdown.
+    let (status, _) = request(
+        &service,
+        "POST",
+        "/api/v1/jobs",
+        true,
+        r#"{"region":"jp","profile":"verify","operation":"verify"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attempts.load(Ordering::SeqCst) < 4 || healthy_hits.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(service);
+    let service = Service::open(cfg).unwrap();
+    let (_, bytes) = request(
+        &service,
+        "GET",
+        "/api/v1/completion-notifications",
+        true,
+        "",
+    )
+    .await;
+    assert!(String::from_utf8(bytes)
+        .unwrap()
+        .contains("\"pending_events\":1"));
+    receiver_task.abort();
 }

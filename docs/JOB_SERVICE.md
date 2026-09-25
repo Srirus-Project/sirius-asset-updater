@@ -170,13 +170,13 @@ all concurrent exports (1..256, default omitted/null). It composes with profile-
 `cpu.limit_stages` and existing stage/media/byte budgets. See [CPU admission](EXPORT.md#aggregate-cpu-stage-admission)
 for acquisition order, timeouts and the distinction from an OS CPU quota.
 
-## Completion delivery ledger (internal foundation)
+## Completion notifications
 
 The job ledger now writes schema version 2 and reads versions 1 and 2. Opening a legacy
 ledger migrates it; older binaries that only understand version 1 cannot reopen the migrated
 state. Back up stopped-service state before upgrading; do not downgrade a live ledger.
 
-When completion targets are configured internally, a successful job with an outcome records
+When `completion_notifications` targets are configured, a successful job with an outcome records
 its completion event and pending recipient identities in the same atomic ledger write. Events
 survive terminal-job pruning and restart; acknowledging one recipient leaves other recipients
 pending. Changing configured recipients does not reroute existing events. Failed/cancelled jobs
@@ -187,6 +187,45 @@ Admission reserves room for accepted queued/running work in configured regions. 
 reject new affected work rather than losing completion notices. Persistence failure leaves
 the previous in-memory state intact. Recipient identities are opaque hashes, not credentials.
 
-This is internal persistence groundwork: service configuration, HTTP delivery, retry scheduling
-and delivery-status routes are not connected yet. Current deployments do not send completion
-notifications or configure targets through the public service configuration.
+Configure up to 16 named regional recipients (empty/omitted disables new notifications):
+
+```yaml
+completion_notifications:
+  - name: asset-index
+    region: jp
+    endpoint: https://index.example.com/internal/asset-completions
+    token_env: SIRIUS_ASSET_COMPLETION_TOKEN
+    timeout_seconds: 10 # 1..60; includes response body
+    retry_seconds: 30   # 1..3600; fixed delay after every unsuccessful attempt
+```
+
+The region must have a service profile. Endpoints require HTTPS, or HTTP with a literal loopback
+IP for local services/tests. URL credentials, query strings and fragments are rejected. Requests
+use a dedicated Bearer token, verified TLS, no redirects, no ambient proxy and no transparent HTTP
+retries. Tokens must differ from the service token, configured download API/CDN credentials and
+other completion-target tokens. Do not reuse storage or other service credentials. Tokens are
+loaded on startup; rotate them with a restart. No endpoint or token is included in delivery status.
+
+Each POST body is `{schema_version:1,job_id,request,outcome,completed_at}`; `request` and `outcome`
+use the job contracts above. `Idempotency-Key` is the job UUID. Accept by returning HTTP 202 and
+exact JSON `{"schema_version":1,"job_id":"THE_RECEIVED_UUID"}` (at most 1 KiB; no extra fields).
+Other statuses, mismatched/malformed acknowledgements, timeouts and failed acknowledgement
+persistence leave the event pending. The receiver must durably deduplicate by job UUID before
+acknowledging: delivery is at least once and a crash after acceptance can cause a duplicate.
+Check outcome scope/version before updating an index; completion does not imply a full export.
+
+Each target has an independent worker, at most one request in flight and FIFO pending-event
+selection. One failed recipient does not block other recipients or jobs. A recipient's rejected
+head event remains pending and blocks later events to that recipient until corrected. Workers
+reconcile on startup and task completion, and poll at one-second intervals. Retries resend only
+the persisted notice, never rerun the pipeline. All failures retry with the configured delay;
+there is no automatic discard. Shutdown cancels pending HTTP requests and retains unacknowledged
+events. Events for removed or changed recipients remain pending: restore the original name,
+region and canonical endpoint to resume them. Credential rotation keeps recipient identity.
+There is currently no administrative discard/retarget operation.
+
+`GET /api/v1/completion-notifications` requires the service token. It reports total pending events,
+per-target pending counts, attempts, last attempt/acknowledgement times and sanitized error codes,
+plus the number of deliveries whose recipient is no longer configured. Pending events are durable;
+attempt counters/timestamps and retry timers reset on restart. Acknowledged events disappear from
+the outbox. Backlog can eventually reject new affected jobs under the capacity rule above.

@@ -633,3 +633,5 @@ pub mod cpu_throttle;
 pub mod storage_sts;
 
 pub mod storage_credentials;
+
+pub mod completion_notify;

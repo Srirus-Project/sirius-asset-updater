@@ -42,3 +42,12 @@ profiles:
 #   format: json
 #   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
 #   queue_capacity: 4096
+
+# Optional durable completion notices. Separate tokens; see docs/JOB_SERVICE.md.
+# completion_notifications:
+#   - name: asset-index
+#     region: jp
+#     endpoint: https://index.example.com/internal/asset-completions
+#     token_env: SIRIUS_ASSET_COMPLETION_TOKEN
+#     timeout_seconds: 10
+#     retry_seconds: 30

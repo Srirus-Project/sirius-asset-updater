@@ -33,6 +33,8 @@ use tokio::sync::{watch, Mutex, Notify};
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     #[serde(default)]
+    pub completion_notifications: Vec<crate::completion_notify::Config>,
+    #[serde(default)]
     pub logging: Option<crate::application_log::Config>,
     pub listen: SocketAddr,
     #[serde(default)]
@@ -103,6 +105,9 @@ struct Inner {
     token: String,
     store: Mutex<JobStore>,
     wake: Notify,
+    completion_wake: Notify,
+    completion_targets: Vec<crate::completion_notify::Target>,
+    completion_states: Mutex<Vec<crate::completion_notify::DeliveryState>>,
     accepting: AtomicBool,
     media_gate: Arc<crate::media_gate::Gate>,
     cpu_gate: Arc<crate::media_gate::Gate>,
@@ -132,6 +137,7 @@ impl Service {
         {
             return Err(Error::Config);
         }
+        let mut forbidden_tokens = Vec::new();
         for (name, p) in &config.profiles {
             if name.is_empty()
                 || name.len() > 64
@@ -148,6 +154,14 @@ impl Service {
                     return Err(Error::Config);
                 }
                 c.validate()?;
+                for key in std::iter::once(&c.internal_token_env)
+                    .chain(c.refresh_token_env.iter())
+                    .chain(c.cdn_roots.values().map(|auth| &auth.credential_env))
+                {
+                    if let Ok(secret) = std::env::var(key) {
+                        forbidden_tokens.push(secret);
+                    }
+                }
             }
             if let Some(path) = &p.export_config {
                 let export: crate::export::ExportConfig = read_yaml(path)?;
@@ -171,6 +185,19 @@ impl Service {
         if token.trim().is_empty() || token.contains(['\r', '\n']) {
             return Err(Error::Config);
         }
+        forbidden_tokens.push(token.clone());
+        let completion_targets =
+            crate::completion_notify::load(&config.completion_notifications, &forbidden_tokens)?;
+        if completion_targets
+            .iter()
+            .any(|t| !config.profiles.values().any(|p| p.region == t.region))
+        {
+            return Err(Error::Config);
+        }
+        let completion_states = Mutex::new(vec![
+            crate::completion_notify::DeliveryState::default();
+            completion_targets.len()
+        ]);
         let access_log = config
             .access_log
             .clone()
@@ -178,7 +205,7 @@ impl Service {
             .transpose()
             .map_err(|_| Error::Config)?;
         std::fs::create_dir_all(&config.output_directory).map_err(|_| Error::Io)?;
-        let store = JobStore::open(
+        let mut store = JobStore::open(
             &config.state_directory,
             Limits {
                 max_running: config.max_concurrent_jobs,
@@ -187,6 +214,14 @@ impl Service {
             },
         )
         .map_err(|_| Error::Io)?;
+        store
+            .configure_completions(
+                completion_targets
+                    .iter()
+                    .map(|t| t.ledger_target())
+                    .collect(),
+            )
+            .map_err(|_| Error::Config)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 access_log,
@@ -201,6 +236,9 @@ impl Service {
                 token,
                 store: Mutex::new(store),
                 wake: Notify::new(),
+                completion_wake: Notify::new(),
+                completion_targets,
+                completion_states,
                 accepting: AtomicBool::new(true),
                 media_gate: Arc::default(),
                 cpu_gate: Arc::default(),
@@ -209,6 +247,7 @@ impl Service {
     }
     pub fn router(&self) -> Router {
         let protected = Router::new()
+            .route("/api/v1/completion-notifications", get(completion_status))
             .route("/api/v1/jobs", get(list).post(submit))
             .route("/api/v1/jobs/{id}", get(detail))
             .route("/api/v1/jobs/{id}/cancel", post(cancel))
@@ -224,7 +263,89 @@ impl Service {
             None => router,
         }
     }
-    pub async fn run_workers(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
+    pub async fn run_workers(&self, shutdown: watch::Receiver<bool>) -> Result<(), Error> {
+        let jobs = self.run_job_workers(shutdown.clone());
+        let notices = self.run_completion_notifications(shutdown);
+        tokio::pin!(jobs, notices);
+        tokio::select! {
+            result = &mut jobs => result,
+            _ = &mut notices => jobs.await,
+        }
+    }
+    async fn run_completion_notifications(&self, shutdown: watch::Receiver<bool>) {
+        futures_util::future::join_all(
+            self.inner
+                .completion_targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| self.run_completion_target(index, target, shutdown.clone())),
+        )
+        .await;
+    }
+    async fn run_completion_target(
+        &self,
+        index: usize,
+        target: &crate::completion_notify::Target,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let due = self.inner.completion_states.lock().await[index]
+                .due
+                .is_none_or(|due| due <= std::time::Instant::now());
+            let event = if due {
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .completions()
+                    .iter()
+                    .find(|d| d.pending_targets.contains(&target.identity))
+                    .map(|d| d.event.clone())
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                {
+                    let mut states = self.inner.completion_states.lock().await;
+                    states[index].attempts = states[index].attempts.saturating_add(1);
+                    states[index].last_attempt_at = Some(chrono::Utc::now());
+                }
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut shutdown) => return,
+                    result = target.deliver(&event) => result,
+                };
+                let result = match result {
+                    Ok(()) => self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .acknowledge_completion(&event.job_id, &target.identity)
+                        .map_err(|_| "acknowledgement_not_persisted"),
+                    Err(code) => Err(code),
+                };
+                let mut states = self.inner.completion_states.lock().await;
+                let state = &mut states[index];
+                state.last_error = result.err();
+                state.due = state
+                    .last_error
+                    .map(|_| std::time::Instant::now() + Duration::from_secs(target.retry_seconds));
+                if state.last_error.is_none() {
+                    state.last_acknowledged_at = Some(chrono::Utc::now());
+                }
+            }
+            tokio::select! {
+                _ = cancelled(&mut shutdown) => return,
+                _ = self.inner.completion_wake.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
+    }
+    async fn run_job_workers(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
         let mut tasks = tokio::task::JoinSet::new();
         let mut controls: HashMap<String, watch::Sender<bool>> = HashMap::new();
         let mut stopping = false;
@@ -289,6 +410,7 @@ impl Service {
                         controls.remove(&id);
                         match self.inner.store.lock().await.finish_with_outcome(&id,code,outcome) {
                             Ok(job) => {
+                                self.inner.completion_wake.notify_waiters();
                                 if job.status == Status::Failed { tracing::warn!(job_id=%job.id, region=job.request.region.name(), status=?job.status, error_code=job.failure.as_deref(), "Job ended"); }
                                 else { tracing::info!(job_id=%job.id, region=job.request.region.name(), status=?job.status, "Job ended"); }
                             }
@@ -706,6 +828,51 @@ async fn retry(State(service): State<Service>, HttpPath(id): HttpPath<String>) -
         Err(e) => failure(e),
     }
 }
+async fn completion_status(State(service): State<Service>) -> Response {
+    #[derive(Serialize)]
+    struct TargetStatus<'a> {
+        name: &'a str,
+        identity: &'a str,
+        region: Region,
+        pending: usize,
+        delivery: crate::completion_notify::DeliveryState,
+    }
+    #[derive(Serialize)]
+    struct Report<'a> {
+        pending_events: usize,
+        unconfigured_deliveries: usize,
+        targets: Vec<TargetStatus<'a>>,
+    }
+    let store = service.inner.store.lock().await;
+    let states = service.inner.completion_states.lock().await;
+    let configured = &service.inner.completion_targets;
+    let targets = configured
+        .iter()
+        .zip(states.iter())
+        .map(|(t, s)| TargetStatus {
+            name: &t.name,
+            identity: &t.identity,
+            region: t.region,
+            pending: store
+                .completions()
+                .iter()
+                .filter(|d| d.pending_targets.contains(&t.identity))
+                .count(),
+            delivery: s.clone(),
+        })
+        .collect();
+    let report = Report {
+        pending_events: store.completions().len(),
+        unconfigured_deliveries: store
+            .completions()
+            .iter()
+            .flat_map(|d| &d.pending_targets)
+            .filter(|id| !configured.iter().any(|t| &t.identity == *id))
+            .count(),
+        targets,
+    };
+    json(StatusCode::OK, &report)
+}
 pub async fn run_file(path: &Path) -> Result<(), Error> {
     let config: ServiceConfig = read_yaml(path)?;
     let listen = config.listen;
@@ -800,6 +967,7 @@ mod lifecycle_tests {
         });
         std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
         let config = ServiceConfig {
+            completion_notifications: vec![],
             logging: None,
             tls: None,
             access_log: None,
