@@ -29,6 +29,8 @@ pub struct ExportConfig {
     pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
     pub video: crate::export_options::VideoExport,
+    #[serde(default)]
+    pub media_backend: crate::media_backend::Backend,
     pub output: PathBuf,
     #[serde(default)]
     pub retain_outputs: bool,
@@ -53,6 +55,10 @@ pub struct ExportConfig {
     pub media_timeout_seconds: u64,
     #[serde(skip)]
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[serde(skip)]
+    ffi_conversions: std::sync::atomic::AtomicUsize,
+    #[serde(skip)]
+    media_fallbacks: std::sync::atomic::AtomicUsize,
     pub ffmpeg: PathBuf,
     #[serde(default = "max_output")]
     pub max_resource_output_bytes: u64,
@@ -71,6 +77,10 @@ fn max_output() -> u64 {
 }
 #[derive(Default, Deserialize, Serialize)]
 pub struct ExportSummary {
+    #[serde(default)]
+    pub ffi_conversions: usize,
+    #[serde(default)]
+    pub media_fallbacks: usize,
     pub full_catalog: bool,
     #[serde(default)]
     pub full_export: bool,
@@ -82,6 +92,8 @@ pub struct ExportSummary {
     pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
     pub video: crate::export_options::VideoExport,
+    #[serde(default)]
+    pub media_backend: crate::media_backend::Backend,
     #[serde(default)]
     pub selected_unity_objects: usize,
     #[serde(default)]
@@ -145,6 +157,7 @@ impl ExportConfig {
             log.validate().map_err(|_| Error::Config)?;
         }
         self.selection.validate()?;
+        self.media_backend.validate()?;
         self.image.validate()?;
         if self.cache_directory.is_some() && !self.retain_outputs
             || self
@@ -325,6 +338,7 @@ impl ExportConfig {
             image: self.image.clone(),
             audio: self.audio.clone(),
             video: self.video,
+            media_backend: self.media_backend,
             full_catalog: complete_selection && assets.len() == catalog_files,
             schema_version: 4,
             region: receipt.snapshot.region.unwrap_or_default(),
@@ -423,6 +437,12 @@ impl ExportConfig {
                         "Resource export progress"
                     );
                 }
+                summary.ffi_conversions = self
+                    .ffi_conversions
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                summary.media_fallbacks = self
+                    .media_fallbacks
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 write_json(&root.join("summary.json"), &summary)?;
             }
             Ok(())
@@ -1157,35 +1177,40 @@ impl ExportConfig {
         use crate::export_options::VideoExport;
         if matches!(self.video, VideoExport::Mp4 | VideoExport::MkvAndMp4) {
             let mp4 = movie.with_extension("mp4");
-            self.ffmpeg(&[
-                "-protocol_whitelist".into(),
-                "file,pipe".into(),
-                "-i".into(),
-                movie.as_os_str().to_owned(),
-                "-map".into(),
-                "0:v:0".into(),
-                "-map".into(),
-                "0:a:0?".into(),
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "medium".into(),
-                "-crf".into(),
-                "18".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-threads".into(),
-                "2".into(),
-                "-fps_mode".into(),
-                "passthrough".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "192k".into(),
-                "-movflags".into(),
-                "+faststart".into(),
-                mp4.as_os_str().to_owned(),
-            ])?;
+            self.encode_media(
+                crate::media_backend::Encoding::Mp4,
+                movie,
+                &mp4,
+                &[
+                    "-protocol_whitelist".into(),
+                    "file,pipe".into(),
+                    "-i".into(),
+                    movie.as_os_str().to_owned(),
+                    "-map".into(),
+                    "0:v:0".into(),
+                    "-map".into(),
+                    "0:a:0?".into(),
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "medium".into(),
+                    "-crf".into(),
+                    "18".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                    "-threads".into(),
+                    "2".into(),
+                    "-fps_mode".into(),
+                    "passthrough".into(),
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    "192k".into(),
+                    "-movflags".into(),
+                    "+faststart".into(),
+                    mp4.as_os_str().to_owned(),
+                ],
+            )?;
             self.check_video_frames(&mp4, expected_frames)?;
             self.record(root, &mp4, "usm_mp4", report)?;
         }
@@ -1216,12 +1241,95 @@ impl ExportConfig {
             "-".into(),
         ])
     }
+    fn encode_media(
+        &self,
+        encoding: crate::media_backend::Encoding,
+        input: &Path,
+        output: &Path,
+        cli_args: &[std::ffi::OsString],
+    ) -> Result<(), Error> {
+        use crate::media_backend::Backend;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(self.media_timeout_seconds);
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if self.media_backend == Backend::Cli {
+            return self.ffmpeg_deadline(cli_args, deadline);
+        }
+        self.media_backend.validate()?;
+        match fs::symlink_metadata(output) {
+            Ok(_) => return Err(Error::Config),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(err(error)),
+        }
+        #[cfg(feature = "media-ffi")]
+        {
+            let result = {
+                let _permit =
+                    self.media_gate
+                        .acquire(self.media_concurrency, &self.cancel, deadline)?;
+                crate::media_ffi::controlled(self.cancel.clone(), deadline, || match encoding {
+                    crate::media_backend::Encoding::Flac => {
+                        crate::media_ffi::convert_wav_to_flac(input, output)
+                    }
+                    crate::media_backend::Encoding::Mp3 => {
+                        crate::media_ffi::convert_wav_to_mp3(input, output)
+                    }
+                    crate::media_backend::Encoding::Mp4 => {
+                        crate::media_ffi::convert_video_to_mp4(input, output)
+                    }
+                })
+            };
+            match result {
+                Ok(()) => {
+                    self.ffi_conversions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(error) => {
+                    match fs::remove_file(output) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(err(e)),
+                    }
+                    match error {
+                        crate::media_ffi::MediaError::Cancelled => return Err(Error::Cancelled),
+                        crate::media_ffi::MediaError::Timeout => {
+                            return Err(err("media conversion timed out"))
+                        }
+                        _ if self.media_backend == Backend::Ffi => {
+                            return Err(err("FFI media conversion failed"))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "media-ffi"))]
+        let _ = (encoding, input);
+        self.media_fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            stage = "media_cli_fallback",
+            "Media encoding fell back to CLI"
+        );
+        self.ffmpeg_deadline(cli_args, deadline)
+    }
     fn ffmpeg(&self, args: &[std::ffi::OsString]) -> Result<(), Error> {
-        let started = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(self.media_timeout_seconds);
-        let _permit =
-            self.media_gate
-                .acquire(self.media_concurrency, &self.cancel, started + timeout)?;
+        self.ffmpeg_deadline(
+            args,
+            std::time::Instant::now() + std::time::Duration::from_secs(self.media_timeout_seconds),
+        )
+    }
+    fn ffmpeg_deadline(
+        &self,
+        args: &[std::ffi::OsString],
+        deadline: std::time::Instant,
+    ) -> Result<(), Error> {
+        let _permit = self
+            .media_gate
+            .acquire(self.media_concurrency, &self.cancel, deadline)?;
         let stderr = tempfile::tempfile().map_err(err)?;
         let mut child = Command::new(&self.ffmpeg)
             .env_remove(&self.cri_key_env)
@@ -1236,7 +1344,7 @@ impl ExportConfig {
                 break status;
             }
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-                || started.elapsed() >= timeout
+                || std::time::Instant::now() >= deadline
             {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1283,17 +1391,22 @@ impl ExportConfig {
             return Ok(wav.into());
         }
         let target = wav.with_extension("flac");
-        self.ffmpeg(&[
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-i".into(),
-            wav.as_os_str().to_owned(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-c:a".into(),
-            "flac".into(),
-            target.as_os_str().to_owned(),
-        ])?;
+        self.encode_media(
+            crate::media_backend::Encoding::Flac,
+            wav,
+            &target,
+            &[
+                "-protocol_whitelist".into(),
+                "file,pipe".into(),
+                "-i".into(),
+                wav.as_os_str().to_owned(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-c:a".into(),
+                "flac".into(),
+                target.as_os_str().to_owned(),
+            ],
+        )?;
         let decoded = tempfile::Builder::new()
             .suffix(".wav")
             .tempfile_in(root)
@@ -1334,19 +1447,24 @@ impl ExportConfig {
             _ => return Err(err("MP3 sample rate is unsupported without resampling")),
         };
         let target = wav.with_extension("mp3");
-        self.ffmpeg(&[
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-i".into(),
-            wav.as_os_str().to_owned(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-c:a".into(),
-            "libmp3lame".into(),
-            "-b:a".into(),
-            bitrate.into(),
-            target.as_os_str().to_owned(),
-        ])?;
+        self.encode_media(
+            crate::media_backend::Encoding::Mp3,
+            wav,
+            &target,
+            &[
+                "-protocol_whitelist".into(),
+                "file,pipe".into(),
+                "-i".into(),
+                wav.as_os_str().to_owned(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-c:a".into(),
+                "libmp3lame".into(),
+                "-b:a".into(),
+                bitrate.into(),
+                target.as_os_str().to_owned(),
+            ],
+        )?;
         let decoded = tempfile::Builder::new()
             .suffix(".wav")
             .tempfile_in(root)
@@ -1530,6 +1648,9 @@ pub(crate) mod tests {
             image: Default::default(),
             audio: Default::default(),
             video: Default::default(),
+            media_backend: Default::default(),
+            ffi_conversions: Default::default(),
+            media_fallbacks: Default::default(),
             output: root.join("out"),
             retain_outputs: false,
             cache_directory: None,
@@ -1548,11 +1669,173 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn media_backend_config_is_explicit_and_cancel_does_not_fallback() {
+        use crate::media_backend::{Backend, Encoding};
+        assert!(yaml_serde::from_str::<Backend>("unknown").is_err());
+        assert_eq!(Backend::default(), Backend::Cli);
+        assert!(Backend::Auto.validate().is_ok());
+        assert_eq!(Backend::Ffi.validate().is_ok(), cfg!(feature = "media-ffi"));
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.media_backend = Backend::Auto;
+        cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            cfg.encode_media(
+                Encoding::Flac,
+                &directory.path().join("in.wav"),
+                &directory.path().join("out.flac"),
+                &[]
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            cfg.media_fallbacks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+    #[test]
     #[ignore = "requires SIRIUS_TEST_FFMPEG for video format and independent decode checks"]
     fn video_formats_preserve_source_and_validate_mp4_frames_and_audio() {
+        check_video_backend(crate::media_backend::Backend::Cli);
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for actual backend encoding and independent verification"]
+    fn auto_video_formats_preserve_source_and_validate_mp4_frames_and_audio() {
+        check_video_backend(crate::media_backend::Backend::Auto);
+    }
+    #[cfg(feature = "media-ffi")]
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for actual FFI export integration"]
+    fn ffi_video_formats_preserve_source_and_validate_mp4_frames_and_audio() {
+        check_video_backend(crate::media_backend::Backend::Ffi);
+    }
+    #[cfg(feature = "media-ffi")]
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG and ffprobe for real timing fallback verification"]
+    fn auto_video_timing_fallback_cleans_partial_output_and_matches_cli() {
+        use crate::media_backend::{Backend, Encoding};
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        let ffprobe = cfg.ffmpeg.with_file_name(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        for (name, filter) in [
+            ("mpeg-pcm", "null"),
+            ("offset", "setpts=PTS+2/TB"),
+            ("variable", "setpts=if(lt(N\\,4)\\,N\\,2*N-4)/(25*TB)"),
+        ] {
+            let source = directory.path().join(format!("{name}.mkv"));
+            cfg.ffmpeg(&[
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "testsrc2=size=16x16:rate=25:duration=0.48".into(),
+                "-vf".into(),
+                filter.into(),
+                "-fps_mode".into(),
+                "passthrough".into(),
+                "-c:v".into(),
+                "ffv1".into(),
+                source.as_os_str().to_owned(),
+            ])
+            .unwrap();
+            if name == "mpeg-pcm" {
+                fs::remove_file(&source).unwrap();
+                let elementary = directory.path().join("source.m2v");
+                cfg.ffmpeg(&[
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "testsrc2=size=16x16:rate=25:duration=0.48".into(),
+                    "-c:v".into(),
+                    "mpeg2video".into(),
+                    elementary.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                cfg.ffmpeg(&[
+                    "-fflags".into(),
+                    "+genpts".into(),
+                    "-r".into(),
+                    "25".into(),
+                    "-i".into(),
+                    elementary.as_os_str().to_owned(),
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "sine=sample_rate=44100:duration=0.48".into(),
+                    "-c:v".into(),
+                    "copy".into(),
+                    "-c:a".into(),
+                    "pcm_s16le".into(),
+                    "-t".into(),
+                    "0.48".into(),
+                    source.as_os_str().to_owned(),
+                ])
+                .unwrap();
+            }
+            let original = fs::read(&source).unwrap();
+            let output = directory.path().join(format!("{name}.mp4"));
+            let baseline = directory.path().join(format!("{name}-cli.mp4"));
+            let args = |target: &Path| {
+                vec![
+                    "-i".into(),
+                    source.as_os_str().to_owned(),
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "medium".into(),
+                    "-crf".into(),
+                    "18".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                    "-movflags".into(),
+                    "+faststart".into(),
+                    target.as_os_str().to_owned(),
+                ]
+            };
+            cfg.media_backend = Backend::Ffi;
+            assert!(cfg
+                .encode_media(Encoding::Mp4, &source, &output, &args(&output))
+                .is_err());
+            assert!(!output.exists(), "failed FFI must remove partial output");
+            assert_eq!(cfg.media_fallbacks.load(Ordering::Relaxed), 0);
+            cfg.media_backend = Backend::Auto;
+            cfg.encode_media(Encoding::Mp4, &source, &output, &args(&output))
+                .unwrap();
+            assert_eq!(cfg.media_fallbacks.swap(0, Ordering::Relaxed), 1);
+            assert_eq!(cfg.ffi_conversions.load(Ordering::Relaxed), 0);
+            cfg.ffmpeg(&args(&baseline)).unwrap();
+            let frames = |path: &Path| {
+                let probe = Command::new(&ffprobe)
+                    .args([
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "frame=media_type,best_effort_timestamp_time,pkt_duration_time",
+                        "-of",
+                        "csv",
+                    ])
+                    .arg(path)
+                    .output()
+                    .unwrap();
+                assert!(probe.status.success());
+                assert!(!probe.stdout.is_empty());
+                probe.stdout
+            };
+            assert_eq!(frames(&output), frames(&baseline));
+            assert_eq!(fs::read(&source).unwrap(), original);
+        }
+    }
+    fn check_video_backend(backend: crate::media_backend::Backend) {
         use crate::export_options::VideoExport;
         let directory = tempfile::tempdir().unwrap();
         let mut cfg = config(directory.path());
+        cfg.media_backend = backend;
         cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
         let source = directory.path().join("source.mkv");
         cfg.ffmpeg(&[
@@ -1632,6 +1915,21 @@ pub(crate) mod tests {
             assert_eq!(fs::read(&source).unwrap(), original);
         }
         assert!(yaml_serde::from_str::<VideoExport>("avi").is_err());
+        let ffi = cfg
+            .ffi_conversions
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let fallback = cfg
+            .media_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if backend == crate::media_backend::Backend::Cli {
+            assert_eq!((ffi, fallback), (0, 0));
+        } else if cfg!(feature = "media-ffi") {
+            assert!(ffi > 0);
+            assert_eq!(fallback, 0);
+        } else {
+            assert_eq!(ffi, 0);
+            assert!(fallback > 0);
+        }
     }
     #[test]
     fn audio_format_lists_are_canonical_and_reject_invalid_selections() {
@@ -1665,9 +1963,24 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires SIRIUS_TEST_FFMPEG for simultaneous audio-format verification"]
     fn simultaneous_audio_formats_preserve_requested_lossless_outputs() {
+        check_audio_backend(crate::media_backend::Backend::Cli);
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for actual backend encoding and independent verification"]
+    fn auto_simultaneous_audio_formats_preserve_requested_lossless_outputs() {
+        check_audio_backend(crate::media_backend::Backend::Auto);
+    }
+    #[cfg(feature = "media-ffi")]
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for actual FFI export integration"]
+    fn ffi_simultaneous_audio_formats_preserve_requested_lossless_outputs() {
+        check_audio_backend(crate::media_backend::Backend::Ffi);
+    }
+    fn check_audio_backend(backend: crate::media_backend::Backend) {
         use crate::export_options::AudioExport;
         let directory = tempfile::tempdir().unwrap();
         let mut cfg = config(directory.path());
+        cfg.media_backend = backend;
         cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
         let source = directory.path().join("source.wav");
         cfg.ffmpeg(&[
@@ -1740,6 +2053,21 @@ pub(crate) mod tests {
                     pcm_identity(&original).unwrap()
                 );
             }
+        }
+        let ffi = cfg
+            .ffi_conversions
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let fallback = cfg
+            .media_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if backend == crate::media_backend::Backend::Cli {
+            assert_eq!((ffi, fallback), (0, 0));
+        } else if cfg!(feature = "media-ffi") {
+            assert!(ffi > 0);
+            assert_eq!(fallback, 0);
+        } else {
+            assert_eq!(ffi, 0);
+            assert!(fallback > 0);
         }
     }
     #[test]
@@ -2369,6 +2697,9 @@ pub(crate) mod tests {
         cfg.selection.embedded_audio = false;
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.selection.embedded_audio = true;
+        cfg.media_backend = crate::media_backend::Backend::Auto;
+        assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.media_backend = crate::media_backend::Backend::Cli;
         cfg.cache_revision = "new-shared-libraries".into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.cache_revision.clear();

@@ -1,9 +1,18 @@
-# FFmpeg FFI development backend
+# FFmpeg encoding backends
 
 The optional `media-ffi` Cargo feature currently compiles a real codec bridge adapted from
 Haruki-Sekai-Asset-Updater commit `3d33ed037f0ef5009e361e0535b3b19f8c239947`, under its retained MIT
-notice. No Sekai account, encryption, model or chart logic is included. This is implementation
-work toward 1.2.0, not an available export backend setting: the export pipeline still uses CLI.
+notice. No Sekai account, encryption, model or chart logic is included. Export configuration accepts `media_backend: cli` (default), `ffi`, or `auto`.
+FLAC, MP3 and MP4 encoding uses the selected backend. Stream-copy muxing, ADX decoding and
+independent output verification still require the configured FFmpeg executable.
+
+`ffi` requires a feature-enabled build and fails explicitly on unavailable codecs or unsupported
+input. `auto` tries FFI when compiled in, removes a failed attempt's partial output and retries
+with CLI using the original remaining deadline. Feature-disabled Auto uses CLI. Cancellation
+and timeout never trigger a retry. Both backends share the configured media admission gate.
+The export summary records the requested backend, completed FFI encodings and fallback attempts;
+these counters do not replace verification results. Cache hits do not count as new encodings.
+Backend policy and the linked library version/build digest participate in decoded-cache identity.
 
 ## Build and verified behavior
 
@@ -32,16 +41,10 @@ the current buffer, including a buffer replaced by libavformat.
 
 ## Required integration before release
 
-- Connect explicit CLI/FFI/Auto policy to actual export operations, with visible fallback semantics.
-- Preserve Sirius stream-copy MKV, M2V/IVF timing, separate alpha, H.264/AAC parameters, source
-  preservation and independent frame-count verification. Generic video entry points are ported
-  but not yet accepted as equivalent to the Sirius CLI pipeline.
-- Wire the existing controlled wrapper to job cancellation/deadlines, media admission and worker
-  drain; the export pipeline does not call the bridge yet.
-- Review remaining unsafe/error paths and output staging/cleanup before pipeline activation.
-- Include library versions/backend policy in decoded-cache identity; validate feature-disabled
-  selections explicitly before job admission. Audit library licensing/runtime dependencies for
-  all release targets, and test both enabled and disabled packages.
+- Preserve and accept real Sirius stream-copy MKV, M2V/IVF timing and separate alpha alongside
+  H.264/AAC output. Synthetic bridge and actual export/service tests are necessary but insufficient.
+- Audit library licensing/runtime dependencies for all release targets and test enabled/disabled
+  packages. Default archives still use CLI without dynamically linked FFmpeg libraries.
 - Complete real Sirius fixture comparisons and the full yhm01 service acceptance.
 
 This feature does not remove the separately installed FFmpeg executable requirement and does not
@@ -67,7 +70,7 @@ application must account for this process-wide logging setting.
 
 The caller must still use private output staging and remove partial files on errors/cancellation.
 These codec helpers do not publish, delete or atomically replace export outputs themselves. The
-updater's existing CLI execution path remains in use until the complete adapter is integrated.
+export adapter removes failed FFI outputs before a permitted fallback and drains admitted workers.
 
 ## Video bridge verification
 
@@ -75,18 +78,23 @@ The H.264 encoder is explicitly libx264 with medium/CRF 18, yuv420p and two code
 AAC remains 192 kbit/s. MP3 explicitly selects libmp3lame. Missing encoders are errors. MP4 uses
 faststart. Positive even dimensions are required; changing decoded dimensions is rejected,
 not resized. Explicit frame rates must be positive, and absent stream frame rates are errors
-rather than guessed 30 fps. The bridge currently uses constant-rate frame indexing; variable-rate
-and nonzero-start timestamp equivalence still require review before pipeline integration.
+rather than guessed 30 fps. The bridge uses constant-rate frame indexing and validates decoded timestamps against that
+clock (allowing one input timestamp tick for rounding). Nonzero muxed stream starts, variable
+video timing and discontinuous audio require CLI; explicit FFI fails instead of flattening the
+timeline. Raw M2V entry points allow a demuxer origin. Auto fallback is tested with real nonzero
+and variable-rate movies, including partial-output removal and frame timestamps compared to CLI.
 
-An ignored integration test generates 12-frame M2V and IVF inputs, converts each directly and
-through an MKV with PCM audio, and independently checks H.264/yuv420p, dimensions, frame rate,
+An ignored integration test generates 12-frame M2V and IVF inputs, converts direct native
+streams and zero-start IVF/PCM MKV, and independently checks H.264/yuv420p, dimensions, frame rate,
 12 decoded frames, AAC sample rate/channels/padding, preserved inputs and moov-before-mdat
-placement with CLI FFmpeg and adjacent ffprobe. Invalid explicit frame rates and odd dimensions
+placement with CLI FFmpeg and adjacent ffprobe. MPEG-2/PCM muxing produces a 40 ms video offset;
+the bridge explicitly rejects this case, and the export Auto test verifies its CLI fallback
+against independently probed audio/video frame timestamps. Invalid explicit frame rates and odd dimensions
 are rejected before output creation. Run `ffi_video_preserves_m2v_ivf_frames_and_muxed_audio`
 with the same environment/feature flags as the audio integration test. CI runs both tests.
 
 This found and fixed a real tail-frame loss: FFmpeg 7 libx264 can leave packet duration zero
 although frame duration is set. MP4 then ends at the last PTS and its edit list hides the final
 frame. Video packets with unspecified duration now receive one encoder-timebase tick before
-muxer timebase rescaling. Real Sirius/alpha fixtures, production verification and adapter wiring
-remain separate acceptance gates; synthetic success does not complete them.
+muxer timebase rescaling. Real Sirius/alpha fixtures and production verification remain separate acceptance gates;
+synthetic success does not complete them.

@@ -1,5 +1,5 @@
 //! FFmpeg 7.1 codec bridge adapted from Haruki's MIT-licensed generic media layer.
-//! Development backend: not yet connected to export configuration.
+//! Optional in-process encoding backend with explicit CLI fallback policy.
 //! See docs/MEDIA_FFI.md for integration gates and build requirements.
 use std::path::Path;
 use std::ptr;
@@ -98,6 +98,37 @@ pub fn convert_wav_bytes_to_flac(wav_bytes: &[u8], flac_file: &Path) -> Result<(
     unsafe { transcode_memory_to_file(wav_bytes, Some("wav"), flac_file, OutputCodec::Flac, None) }
 }
 
+/// Digest the linked codec versions and build options without publishing local build paths.
+pub fn runtime_identity() -> Result<String, MediaError> {
+    ensure_ffmpeg_loaded()?;
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    unsafe {
+        for version in [
+            ffi::avcodec_version(),
+            ffi::avformat_version(),
+            ffi::avutil_version(),
+            ffi::swresample_version(),
+            ffi::swscale_version(),
+        ] {
+            hash.update(version.to_le_bytes());
+        }
+        for configuration in [
+            ffi::avcodec_configuration(),
+            ffi::avformat_configuration(),
+            ffi::avutil_configuration(),
+            ffi::swresample_configuration(),
+            ffi::swscale_configuration(),
+        ] {
+            if configuration.is_null() {
+                return Err(media_error("missing FFmpeg build identity"));
+            }
+            hash.update(std::ffi::CStr::from_ptr(configuration).to_bytes());
+            hash.update([0]);
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
+}
 fn ensure_ffmpeg_loaded() -> Result<(), MediaError> {
     control::check()?;
     let avformat_version = unsafe { ffi::avformat_version() };
@@ -158,6 +189,17 @@ unsafe fn transcode_video_file_to_mp4(input: &Path, output: &Path) -> Result<(),
     let audio_stream_index =
         unsafe { find_optional_best_stream(input_ctx.ptr, ffi::AVMEDIA_TYPE_AUDIO) };
 
+    // Sequential audio/video encoders cannot preserve independent start offsets.
+    // Auto delegates these inputs to CLI; explicit FFI must fail rather than desync.
+    for index in [Some(video_stream_index), audio_stream_index]
+        .into_iter()
+        .flatten()
+    {
+        let start = unsafe { (**(*input_ctx.ptr).streams.add(index as usize)).start_time };
+        if start != ffi::AV_NOPTS_VALUE && start != 0 {
+            return Err(media_error("nonzero stream start requires CLI encoding"));
+        }
+    }
     let output_url = path_cstring(output)?;
     let mut output_ctx = OutputContext::create(&output_url)?;
     let mut video = unsafe {
@@ -311,7 +353,7 @@ unsafe fn transcode_open_input_to_file(
     let decoded = Frame::new()?;
     let converted = Frame::new()?;
     let mut audio_fifo = AudioFifo::new(encoder_ctx.ptr)?;
-    let mut frame_index = 0_i64;
+    let mut frame_index = FrameClock::default();
 
     loop {
         let read = unsafe { ffi::av_read_frame(input_ctx.ptr, packet.ptr) };
@@ -354,7 +396,7 @@ unsafe fn transcode_open_input_to_file(
             encoder_ctx.ptr,
             output_ctx.ptr,
             output_stream,
-            &mut frame_index,
+            &mut frame_index.index,
             true,
         )?;
     }
@@ -370,6 +412,38 @@ unsafe fn transcode_open_input_to_file(
     Ok(())
 }
 
+/// Constant-rate native streams may have a demuxer origin, but must never silently
+/// collapse gaps or variable-rate timing into sequential frames.
+#[derive(Default)]
+struct FrameClock {
+    index: i64,
+    origin: Option<i64>,
+    audio_samples: i64,
+}
+impl FrameClock {
+    fn check_video(
+        &mut self,
+        timestamp: i64,
+        input_base: ffi::AVRational,
+        output_base: ffi::AVRational,
+    ) -> Result<(), MediaError> {
+        if timestamp == ffi::AV_NOPTS_VALUE || valid_rational(input_base).is_none() {
+            return Ok(());
+        }
+        let expected = unsafe { ffi::av_rescale_q(self.index, output_base, input_base) };
+        let origin = *self
+            .origin
+            .get_or_insert(timestamp.saturating_sub(expected));
+        // Container timestamp quantization can round a CFR frame by one tick.
+        if timestamp.abs_diff(origin.saturating_add(expected)) > 1 {
+            return Err(media_error(
+                "non-constant video timing requires CLI encoding",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct TranscodeStream {
     input_stream_index: i32,
     decoder_ctx: CodecContext,
@@ -378,7 +452,7 @@ struct TranscodeStream {
     decoded: Frame,
     converted: Frame,
     audio_fifo: Option<AudioFifo>,
-    frame_index: i64,
+    frame_index: FrameClock,
 }
 
 impl TranscodeStream {
@@ -458,7 +532,10 @@ impl TranscodeStream {
             decoded,
             converted,
             audio_fifo,
-            frame_index: 0,
+            frame_index: FrameClock {
+                origin: Some(0),
+                ..Default::default()
+            },
         })
     }
 
@@ -500,7 +577,7 @@ impl TranscodeStream {
                 self.encoder_ctx.ptr,
                 output_ctx,
                 self.output_stream,
-                &mut self.frame_index,
+                &mut self.frame_index.index,
                 true,
             )?;
         }
@@ -634,7 +711,7 @@ unsafe fn send_packet_and_encode(
     decoded: *mut ffi::AVFrame,
     converted: *mut ffi::AVFrame,
     audio_fifo: &mut Option<AudioFifo>,
-    frame_index: &mut i64,
+    frame_index: &mut FrameClock,
 ) -> Result<(), MediaError> {
     check(
         unsafe { ffi::avcodec_send_packet(decoder_ctx, packet) },
@@ -661,7 +738,7 @@ unsafe fn drain_decoder_to_encoder(
     decoded: *mut ffi::AVFrame,
     converted: *mut ffi::AVFrame,
     audio_fifo: &mut Option<AudioFifo>,
-    frame_index: &mut i64,
+    frame_index: &mut FrameClock,
 ) -> Result<(), MediaError> {
     loop {
         let ret = unsafe { ffi::avcodec_receive_frame(decoder_ctx, decoded) };
@@ -669,16 +746,53 @@ unsafe fn drain_decoder_to_encoder(
             break;
         }
         check(ret, "avcodec_receive_frame")?;
+        // Audio is also encoded sequentially. Reject discontinuities instead of
+        // silently removing silence/gaps from a muxed input.
+        if unsafe { (*encoder_ctx).codec_type } == ffi::AVMEDIA_TYPE_AUDIO {
+            let timestamp = unsafe { (*decoded).best_effort_timestamp };
+            let rate = unsafe { (*decoded).sample_rate };
+            let time_base = unsafe { (*decoder_ctx).pkt_timebase };
+            if rate <= 0 {
+                return Err(media_error("invalid decoded audio sample rate"));
+            }
+            if timestamp != ffi::AV_NOPTS_VALUE && valid_rational(time_base).is_some() {
+                let expected = unsafe {
+                    ffi::av_rescale_q(
+                        frame_index.audio_samples,
+                        ffi::AVRational { num: 1, den: rate },
+                        time_base,
+                    )
+                };
+                let origin = *frame_index
+                    .origin
+                    .get_or_insert(timestamp.saturating_sub(expected));
+                if timestamp.abs_diff(origin.saturating_add(expected)) > 1 {
+                    return Err(media_error(
+                        "discontinuous audio timing requires CLI encoding",
+                    ));
+                }
+            }
+            frame_index.audio_samples = frame_index
+                .audio_samples
+                .checked_add(unsafe { (*decoded).nb_samples } as i64)
+                .ok_or_else(|| media_error("audio timeline overflow"))?;
+        }
         let frame =
             prepare_frame_for_encoder(decoder_ctx, encoder_ctx, decoded, converted, frame_index)?;
         if let Some(fifo) = audio_fifo.as_mut() {
             fifo.push(frame)?;
-            fifo.encode_available(encoder_ctx, output_ctx, output_stream, frame_index, false)?;
+            fifo.encode_available(
+                encoder_ctx,
+                output_ctx,
+                output_stream,
+                &mut frame_index.index,
+                false,
+            )?;
         } else {
             unsafe {
                 if (*encoder_ctx).codec_type == ffi::AVMEDIA_TYPE_AUDIO {
-                    (*frame).pts = *frame_index;
-                    *frame_index += (*frame).nb_samples as i64;
+                    (*frame).pts = frame_index.index;
+                    frame_index.index += (*frame).nb_samples as i64;
                 }
             }
             check(
@@ -698,7 +812,7 @@ unsafe fn prepare_frame_for_encoder(
     encoder_ctx: *mut ffi::AVCodecContext,
     decoded: *mut ffi::AVFrame,
     converted: *mut ffi::AVFrame,
-    frame_index: &mut i64,
+    frame_index: &mut FrameClock,
 ) -> Result<*mut ffi::AVFrame, MediaError> {
     unsafe {
         let codec_type = (*encoder_ctx).codec_type;
@@ -708,6 +822,11 @@ unsafe fn prepare_frame_for_encoder(
             {
                 return Err(media_error("video dimensions changed during decoding"));
             }
+            frame_index.check_video(
+                (*decoded).best_effort_timestamp,
+                (*decoder_ctx).pkt_timebase,
+                (*encoder_ctx).time_base,
+            )?;
             let needs_scale = (*decoded).format != (*encoder_ctx).pix_fmt
                 || (*decoded).width != (*encoder_ctx).width
                 || (*decoded).height != (*encoder_ctx).height;
@@ -716,9 +835,9 @@ unsafe fn prepare_frame_for_encoder(
             } else {
                 decoded
             };
-            (*frame).pts = *frame_index;
+            (*frame).pts = frame_index.index;
             (*frame).duration = 1;
-            *frame_index += 1;
+            frame_index.index += 1;
             Ok(frame)
         } else if codec_type == ffi::AVMEDIA_TYPE_AUDIO {
             let needs_resample = (*decoded).format != (*encoder_ctx).sample_fmt
@@ -1168,6 +1287,17 @@ mod tests {
                     );
                 }
                 let output = dir.path().join(format!("{extension}-{audio}.mp4"));
+                if extension == "m2v" && audio {
+                    // MPEG-2 B-frame muxing gives video a 40 ms start while PCM starts
+                    // at zero. This previously passed frame-count checks despite the
+                    // bridge flattening the offset. Require CLI until FFI preserves it.
+                    let error = convert_video_to_mp4(&movie, &output).unwrap_err();
+                    assert!(error.to_string().contains("nonzero stream start"));
+                    assert!(!output.exists());
+                    assert_eq!(std::fs::read(&input).unwrap(), original);
+                    continue;
+                }
+
                 if extension == "m2v" && !audio {
                     convert_m2v_to_mp4(
                         &input,

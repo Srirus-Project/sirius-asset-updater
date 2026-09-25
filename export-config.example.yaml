@@ -44,3 +44,8 @@ audio: wav # Or a list: [wav, flac, mp3]. MP3 always retains WAV or verified FLA
 # Video containers: source, mkv (default), mp4, mkv_and_mp4.
 # MP4 is lossy; native video and WAV/FLAC audio remain preserved. See docs/EXPORT_OPTIONS.md.
 video: mkv
+
+# Encoding policy: cli (default), ffi (requires a media-ffi build), or auto.
+# Auto falls back to CLI on unsupported FFI inputs; cancellation/timeouts never retry.
+# FFmpeg executable is still required for muxing and independent verification.
+media_backend: cli

@@ -68,3 +68,11 @@ jobs:
       - run: cargo test --locked --features media-ffi ffi_video_preserves_m2v_ivf_frames_and_muxed_audio -- --ignored
         env:
           SIRIUS_TEST_FFMPEG: /usr/bin/ffmpeg
+      - name: Verify actual FFI export and fallback paths
+        run: |
+          cargo test --locked --features media-ffi ffi_simultaneous_audio_formats -- --ignored
+          cargo test --locked --features media-ffi ffi_video_formats -- --ignored
+          cargo test --locked --features media-ffi ffi_job_service_exports -- --ignored
+          cargo test --locked --features media-ffi auto_ -- --ignored
+        env:
+          SIRIUS_TEST_FFMPEG: /usr/bin/ffmpeg

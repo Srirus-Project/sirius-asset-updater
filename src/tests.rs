@@ -2105,6 +2105,15 @@ fn download_network_policy_defaults_caps_backoff_and_rejects_invalid_values() {
 #[tokio::test]
 #[ignore = "requires SIRIUS_TEST_FFMPEG for the real service export pipeline"]
 async fn job_service_exports_and_reuses_content_cache_after_restart() {
+    check_job_service_media_backend(false).await;
+}
+#[cfg(feature = "media-ffi")]
+#[tokio::test]
+#[ignore = "requires SIRIUS_TEST_FFMPEG for FFI service/cache/storage integration"]
+async fn ffi_job_service_exports_and_reuses_content_cache_after_restart() {
+    check_job_service_media_backend(true).await;
+}
+async fn check_job_service_media_backend(ffi: bool) {
     use crate::{
         jobs::{Job, Status},
         service::{Profile, Service, ServiceConfig},
@@ -2135,6 +2144,12 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
     let export = directory.path().join("export.yaml");
     let cache = directory.path().join("export-cache");
     let yaml = format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {key}\nffmpeg: {:?}\ncache_directory: {:?}\n", std::env::var("SIRIUS_TEST_FFMPEG").unwrap(), cache);
+    let yaml = if ffi {
+        format!("{yaml}media_backend: ffi\naudio: [wav, flac]\n")
+    } else {
+        yaml
+    };
+    let expected_files = if ffi { 3 } else { 2 };
     std::fs::write(&export, yaml).unwrap();
     let storage = directory.path().join("storage.yaml");
     let destination = directory.path().join("published");
@@ -2226,7 +2241,7 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
         );
         if !failed {
             assert_eq!(finished.progress.phase, "publish");
-            assert_eq!(finished.progress.completed, 4);
+            assert_eq!(finished.progress.completed, expected_files + 2);
         }
         let output = directory
             .path()
@@ -2237,12 +2252,20 @@ async fn job_service_exports_and_reuses_content_cache_after_restart() {
             sonic_rs::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
         assert!(summary.complete && summary.full_catalog && summary.full_export);
         assert_eq!(summary.cache_hits, expected_hits);
-        assert_eq!(summary.output_files, 2);
+        assert_eq!(summary.output_files, expected_files as usize);
+        assert_eq!(summary.media_fallbacks, 0);
+        assert_eq!(
+            summary.ffi_conversions,
+            usize::from(ffi && expected_hits == 0)
+        );
         let verification: sonic_rs::Value = sonic_rs::from_slice(
             &std::fs::read(output.parent().unwrap().join("export-verification.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(verification["files_verified"].as_u64(), Some(2));
+        assert_eq!(
+            verification["files_verified"].as_u64(),
+            Some(expected_files)
+        );
         assert_eq!(
             verification["bytes_verified"].as_u64(),
             Some(summary.output_bytes)
