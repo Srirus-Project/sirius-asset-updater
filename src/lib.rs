@@ -623,3 +623,5 @@ pub mod application_log;
 mod media_gate;
 
 mod resource_budget;
+
+pub mod cpu_policy;

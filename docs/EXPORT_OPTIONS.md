@@ -142,10 +142,9 @@ Set 4 explicitly for the previous potential parallelism. These options control s
 output identity, and do not invalidate content caches by themselves. They are not hard RSS limits;
 output byte budgets, download concurrency and storage upload concurrency are separate controls.
 
-Resource workers are explicitly configurable beyond four for larger hosts. No automatic widening
-is applied. Each worker can hold a decoded resource and its dependencies; configure
+Resource workers are explicitly configurable beyond four for larger hosts. Automatic widening
+is opt-in through [CPU worker sizing](EXPORT.md#cpu-worker-sizing). Each worker can hold a decoded resource and its dependencies; configure
 `max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
 assets. Media admission remains separately bounded by `media_concurrency` and the service's
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
-can multiply resource workers across regions. CPU auto-tuning and independent stage controls
-remain separate restoration work; this setting restores operator-selected resource parallelism.
+can multiply resource workers across regions. CPU load throttling and independent stage controls remain separate restoration work.

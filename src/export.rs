@@ -48,6 +48,8 @@ pub struct ExportConfig {
     #[serde(default = "default_workers")]
     pub concurrency: usize,
     #[serde(default)]
+    pub cpu: crate::cpu_policy::Config,
+    #[serde(default)]
     pub max_in_flight_bundle_bytes: u64,
     #[serde(skip)]
     local_resource_budget: std::sync::OnceLock<crate::resource_budget::Budget>,
@@ -164,6 +166,7 @@ impl ExportConfig {
         if let Some(log) = &self.logging {
             log.validate().map_err(|_| Error::Config)?;
         }
+        self.cpu.validate()?;
         self.selection.validate()?;
         self.media_backend.validate()?;
         self.image.validate()?;
@@ -359,9 +362,16 @@ impl ExportConfig {
         };
         let mut journal = fs::File::create(root.join("resources.jsonl")).map_err(err)?;
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = self.cpu.workers(self.concurrency)?.min(assets.len());
+        tracing::info!(
+            workers,
+            configured_workers = self.concurrency,
+            auto_tune = self.cpu.auto_tune,
+            "export resource worker pool"
+        );
         std::thread::scope(|scope| -> Result<(), Error> {
-            let (send, recv) = std::sync::mpsc::sync_channel(self.concurrency);
-            for _ in 0..self.concurrency {
+            let (send, recv) = std::sync::mpsc::sync_channel(workers);
+            for _ in 0..workers {
                 let send = send.clone();
                 let assets = &assets;
                 let next = &next;
@@ -1726,6 +1736,7 @@ pub(crate) mod tests {
             cri_key_env: "UNUSED_TEST_KEY".into(),
             split_acb_xor_env: None,
             concurrency: 1,
+            cpu: Default::default(),
             max_in_flight_bundle_bytes: 0,
             local_resource_budget: Default::default(),
             service_resource_budget: None,

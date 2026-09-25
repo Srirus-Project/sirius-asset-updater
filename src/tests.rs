@@ -2154,7 +2154,7 @@ async fn check_job_service_media_backend(ffi: bool) {
         yaml
     };
     let expected_files = if ffi { 3 } else { 2 };
-    std::fs::write(&export, yaml).unwrap();
+    std::fs::write(&export, &yaml).unwrap();
     let storage = directory.path().join("storage.yaml");
     let destination = directory.path().join("published");
     let config = || ServiceConfig {
@@ -2186,6 +2186,15 @@ async fn check_job_service_media_backend(ffi: bool) {
     };
     let mut previous = None;
     for (round, expected_hits) in [0, 1, 1].into_iter().enumerate() {
+        // Worker policy changes across restarts must preserve verified cache identity.
+        std::fs::write(
+            &export,
+            format!(
+                "{yaml}cpu: {{auto_tune: {}, budget_ratio: 0.5, reserved: 1}}\n",
+                round == 1
+            ),
+        )
+        .unwrap();
         let failed = round == 2;
         let target = if failed {
             let path = directory.path().join("not-a-directory");

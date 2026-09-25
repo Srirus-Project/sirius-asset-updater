@@ -42,7 +42,7 @@ and recovery across retries/restarts.
 
 Consumers must wait for `complete=true`. `retain_outputs: false` still writes, reads and
 validates outputs before deleting each resource's temporary products; report bytes measure
-cumulative processing, not final disk use. Concurrency is 1–4. Default resource output budget
+cumulative processing, not final disk use. Concurrency is 1–64 (default 4). Default resource output budget
 is 2 GiB, configurable up to 16 GiB. Each external media invocation has a bounded timeout.
 
 ## Formats and validation
@@ -79,3 +79,34 @@ Success covers the selected receipt and this format contract, not Unity runtime 
 scene/animation reconstruction, complete Live2D model3 applications, embedded package assets
 or untested future game formats. Synthetic regression tests and optional local FFmpeg/catalog
 tests are documented in the main README.
+
+## CPU worker sizing
+
+Manual `concurrency` remains unchanged by default. Opt in per export profile:
+
+```yaml
+concurrency: 4
+cpu:
+  auto_tune: true
+  budget_auto: true
+  budget_ratio: 0.75
+  reserved: 1
+```
+
+With automatic sizing, the CPU budget is `max(1, floor(available CPUs * budget_ratio)
+- reserved)`, with saturating subtraction. `budget_auto: false` uses all available CPUs
+instead and ignores ratio/reservation for sizing. The worker count is the larger of the
+configured concurrency and budget, capped at twice available CPUs and 64, then at the
+number of selected resources. For example, 16 available CPUs with the settings above
+produce 11 workers. Ratios must be finite, greater than zero and at most one, even when
+automatic sizing is disabled. CPU discovery uses Rust's `available_parallelism`, falling
+back to one if unavailable; discovery is performed once per export, not continuously.
+The effective worker count is logged when the resource pool starts.
+
+This restores the original generic post-process sizing policy. Configured concurrency
+is a floor before caps, so a reservation is not a hard CPU-use limit. FFmpeg and native
+libraries may use their own threads; use OS CPU quotas for strict isolation. Each job
+sizes independently: shared service media/download/upload/byte admission still applies.
+Network and media concurrency are not automatically widened, and this option does not
+implement CPU load sampling or independent codec/image stage controls. Validate workload
+memory and performance before increasing concurrency on a production host.
