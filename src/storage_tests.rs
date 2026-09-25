@@ -791,6 +791,7 @@ async fn s3_write_options_reach_put_multipart_and_completion_markers() {
     std::env::set_var(&env, "alias/synthetic-key");
     if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
         **write_options = S3WriteOptions {
+            default_acl: None,
             customer_key_base64_env: None,
             checksum_algorithm: None,
             storage_class: Some("STANDARD_IA".into()),
@@ -1235,4 +1236,123 @@ fn s3_customer_key_rejects_wrong_size_encoding_and_mixed_encryption_modes() {
     options.kms_key_id_env = Some("NO_SUCH_KEY".into());
     assert!(options.validate().is_err());
     std::env::remove_var(env);
+}
+
+#[tokio::test]
+async fn s3_default_acl_policies_reach_objects_multipart_and_markers_with_exclusion_priority() {
+    for acl in [
+        "private",
+        "public-read",
+        "public-read-write",
+        "authenticated-read",
+        "aws-exec-read",
+        "bucket-owner-read",
+        "bucket-owner-full-control",
+    ] {
+        let public = matches!(acl, "public-read" | "public-read-write");
+        let source = if acl == "bucket-owner-full-control" {
+            large_source()
+        } else {
+            fixture()
+        };
+        let mut server = server().await;
+        if let Backend::S3 {
+            write_options,
+            public_read_include,
+            public_read_exclude,
+            ..
+        } = &mut server.config.providers[0].backend
+        {
+            write_options.default_acl = Some(acl.into());
+            *public_read_include = vec![r"^summary\.json$".into(), r"^resources\.jsonl$".into()];
+            *public_read_exclude = vec![r"^resources\.jsonl$".into()];
+        }
+        let (_tx, rx) = watch::channel(false);
+        let result = server
+            .config
+            .publish(source.path(), Region::Jp, rx)
+            .await
+            .unwrap();
+        for file in [
+            "00000/payload.bin",
+            "summary.json",
+            "resources.jsonl",
+            "complete.json",
+        ] {
+            let expected = if file == "resources.jsonl" {
+                if public {
+                    "private"
+                } else {
+                    acl
+                }
+            } else if public {
+                acl
+            } else if file == "summary.json" {
+                "public-read"
+            } else {
+                acl
+            };
+            let key = format!("/synthetic-bucket/{}/{file}", result.providers[0].prefix);
+            assert_eq!(
+                server
+                    .state
+                    .acls
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected),
+                "ACL {acl}, file {file}"
+            );
+        }
+        if acl == "bucket-owner-full-control" {
+            assert!(server.state.multipart_puts.load(Ordering::SeqCst) >= 2);
+        }
+        assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn s3_default_acl_rejects_unknown_values_and_preserves_source_on_backend_denial() {
+    for acl in [
+        "",
+        "public",
+        "bucket-owner-full-control\n",
+        "log-delivery-write",
+    ] {
+        let options = S3WriteOptions {
+            default_acl: Some(acl.into()),
+            ..Default::default()
+        };
+        assert!(options.validate().is_err());
+    }
+    let source = fixture();
+    let mut server = server().await;
+    if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
+        write_options.default_acl = Some("bucket-owner-full-control".into());
+    }
+    server.config.remove_local_after_upload = true;
+    server.state.mode.store(3, Ordering::SeqCst);
+    let (_tx, rx) = watch::channel(false);
+    assert!(server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .is_err());
+    assert!(source.path().join("summary.json").is_file());
+    assert!(server
+        .state
+        .acls
+        .lock()
+        .unwrap()
+        .values()
+        .all(|acl| acl.as_deref() == Some("bucket-owner-full-control")));
+    assert!(!server
+        .state
+        .objects
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|k| k.ends_with("complete.json")));
 }

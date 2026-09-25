@@ -19,6 +19,7 @@ providers:
   #     public_read_include: [] # e.g. ['\.png$']
   #     public_read_exclude: [] # exclusions always win
   #     write_options: # optional, applies to objects and publication markers
+  #       # default_acl: bucket-owner-full-control # optional; see ACL precedence in docs/STORAGE.md
   #       checksum_algorithm: crc32c # optional; destination must support multipart CRC32C
   #       storage_class: STANDARD
   #       server_side_encryption: aws:kms # alternatively AES256; omit for bucket default

@@ -98,6 +98,7 @@ pub enum Backend {
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3WriteOptions {
+    pub default_acl: Option<String>,
     pub customer_key_base64_env: Option<String>,
     pub checksum_algorithm: Option<String>,
     pub storage_class: Option<String>,
@@ -106,6 +107,20 @@ pub struct S3WriteOptions {
 }
 impl S3WriteOptions {
     fn validate(&self) -> Result<(), Error> {
+        if self.default_acl.as_deref().is_some_and(|v| {
+            !matches!(
+                v,
+                "private"
+                    | "public-read"
+                    | "public-read-write"
+                    | "authenticated-read"
+                    | "aws-exec-read"
+                    | "bucket-owner-read"
+                    | "bucket-owner-full-control"
+            )
+        }) {
+            return Err(Error::Config);
+        }
         self.customer_key()?;
         if self
             .checksum_algorithm
@@ -136,6 +151,11 @@ impl S3WriteOptions {
             }
         }
         Ok(())
+    }
+    fn public_acl(&self) -> Option<&str> {
+        self.default_acl
+            .as_deref()
+            .filter(|v| matches!(*v, "public-read" | "public-read-write"))
     }
     fn customer_key(&self) -> Result<Option<[u8; 32]>, Error> {
         use base64::Engine;
@@ -840,12 +860,13 @@ impl Provider {
     fn public_read_policy(&self) -> Result<PublicReadPolicy, Error> {
         match &self.backend {
             Backend::S3 {
+                write_options,
                 public_read,
                 public_read_include,
                 public_read_exclude,
                 ..
             } => Ok(PublicReadPolicy {
-                all: *public_read,
+                all: *public_read || write_options.public_acl().is_some(),
                 include: acl_rules(public_read_include)?,
                 exclude: acl_rules(public_read_exclude)?,
             }),
@@ -924,7 +945,15 @@ impl Provider {
                 }
                 builder = write_options.apply(builder)?;
                 if public {
-                    builder = builder.default_acl("public-read");
+                    builder =
+                        builder.default_acl(write_options.public_acl().unwrap_or("public-read"));
+                } else if let Some(acl) = &write_options.default_acl {
+                    // A public default participates in selection; exclusions use explicit private ACL.
+                    builder = builder.default_acl(if write_options.public_acl().is_some() {
+                        "private"
+                    } else {
+                        acl
+                    });
                 }
                 if !path_style {
                     builder = builder.enable_virtual_host_style();

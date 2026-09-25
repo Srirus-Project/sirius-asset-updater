@@ -48,6 +48,7 @@ registries and notifications remain separate restoration work.
 S3 providers accept `public_read` (default false), `public_read_include` and
 `public_read_exclude` (default empty lists). A file receives `x-amz-acl: public-read` when
 public_read is true or any include regex matches, unless an exclude regex matches.
+A public default ACL also selects all paths, subject to the same exclusions (see below).
 Exclusions always win, including over the provider-wide flag. Match paths relative to the
 export root, with forward slashes and without bucket/publication prefixes. The same rules
 apply to `summary.json`, `resources.jsonl` and `complete.json`; include those explicitly if
@@ -59,7 +60,7 @@ ACLs are attached to ordinary writes and multipart initiation, not applied after
 Denied/unsupported ACLs fail the publication and preserve local output; there is no fallback
 that silently removes the requested ACL. All object read-back checks remain authenticated.
 
-With no matching rule, the uploader omits the ACL header. This preserves existing behavior;
+With no matching rule and no default_acl, the uploader omits the ACL header. This preserves existing behavior;
 it does not override bucket policies or prove anonymous access is denied. Stores with ACLs
 disabled should leave public-read off and manage public access through their bucket policy.
 Unlike the original Haruki provider-wide flag, Sirius exclusions can override public_read=true;
@@ -233,7 +234,7 @@ implemented mappings from operations the immutable publication pipeline does not
 | bucket / endpoint / region | Explicit backend fields; signing region stays independent of game region |
 | access_key_id / secret_access_key / session_token | Environment-referenced credentials, including externally refreshed temporary credentials |
 | enable_virtual_host_style | Inverse of `path_style` |
-| default_acl | `public_read` plus per-path include/exclude rules; other ACL modes are not yet exposed |
+| default_acl | `write_options.default_acl` plus the per-path public-read policy documented below |
 | default_storage_class / server_side_encryption / server_side_encryption_aws_kms_key_id | Typed write policy documented above |
 | server_side_encryption_customer_* | Validated SSE-C environment reference documented above |
 | checksum_algorithm / aws_checksum_algorithm | CRC32C; multipart-incompatible MD5 fails validation |
@@ -248,6 +249,33 @@ implemented mappings from operations the immutable publication pipeline does not
 | enable_write_with_append | No append operation: complete objects and multipart parts are written under fresh publication prefixes |
 | skip_signature / allow_anonymous | Not exposed: publication and read-back require configured authenticated storage; public-read ACLs do not disable signing |
 
-Profile/STS acquisition and additional ACL modes remain explicit gaps in broad scalar-option
-parity. Notifications/registry integration and production acceptance are also not completed by
+Profile/STS acquisition remains an explicit gap in broad scalar-option parity. Notifications/registry integration and production acceptance are also not completed by
 this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
+
+
+### Default S3 object ACL
+
+Haruki `options.default_acl` maps to `backend.write_options.default_acl`. Supported object
+canned ACLs are `private`, `public-read`, `public-read-write`, `authenticated-read`,
+`aws-exec-read`, `bucket-owner-read`, and `bucket-owner-full-control`. Unknown values and
+bucket-only `log-delivery-write` fail validation; the uploader does not modify bucket ACLs.
+Omission preserves the previous per-path public-read behavior.
+
+ACL precedence for each path (including export receipts and completion markers):
+
+- A public default (`public-read` or `public-read-write`) selects all paths. Matching exclusions
+  use explicit `private`; other paths retain the configured public default.
+- For non-public defaults, `public_read` or matching includes select `public-read`, unless an
+  exclusion matches. Unselected/excluded paths retain the non-public default.
+- Without a default, unselected/excluded paths omit the ACL header as before.
+
+Thus public exclusions cannot be bypassed by a public default. Exclusions from public-read do
+not remove other grants of a non-public default such as `authenticated-read` or bucket-owner
+access, nor do ACLs override external bucket/CDN policy. A configured `public-read-write` is
+used explicitly as requested; the uploader never promotes a read-only setting to that ACL.
+
+The policy applies at PUT/multipart initiation, including markers; no separate mutation follows
+successful upload. Destinations with ACLs disabled can reject any ACL header, including private.
+Backend denials preserve local exports and never trigger a retry with the ACL removed. Tests
+verify actual request headers and failure behavior; effective cloud permissions require deployed
+bucket acceptance.
