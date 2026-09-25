@@ -31,6 +31,8 @@ pub struct ExportConfig {
     #[serde(default)]
     pub read_kinds: crate::read_policy::Policy,
     #[serde(default)]
+    pub raw_bundles: Option<crate::raw_bundles::Config>,
+    #[serde(default)]
     pub image: crate::export_options::ImageFormats,
     #[serde(default)]
     pub audio: crate::export_options::AudioFormats,
@@ -49,6 +51,7 @@ pub struct ExportConfig {
     pub cache_max_bytes: Option<u64>,
     #[serde(default)]
     pub cache_max_entries: Option<usize>,
+    #[serde(default)]
     pub cri_key_env: String,
     #[serde(default)]
     pub split_acb_xor_env: Option<String>,
@@ -86,6 +89,7 @@ pub struct ExportConfig {
     ffi_conversions: std::sync::atomic::AtomicUsize,
     #[serde(skip)]
     media_fallbacks: std::sync::atomic::AtomicUsize,
+    #[serde(default)]
     pub ffmpeg: PathBuf,
     #[serde(default = "max_output")]
     pub max_resource_output_bytes: u64,
@@ -115,6 +119,8 @@ pub struct ExportSummary {
     pub selection: crate::export_options::Selection,
     #[serde(default)]
     pub read_kinds: crate::read_policy::Policy,
+    #[serde(default)]
+    pub raw_bundles: Option<crate::raw_bundles::Config>,
     #[serde(default)]
     pub image: crate::export_options::ImageFormats,
     #[serde(default)]
@@ -181,6 +187,11 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
 impl ExportConfig {
+    fn raw_only(&self) -> bool {
+        self.raw_bundles
+            .as_ref()
+            .is_some_and(|r| r.mode == crate::raw_bundles::Mode::Only)
+    }
     fn effective_stage_limits(&self) -> Result<crate::stage_limits::Config, Error> {
         self.stage_limits.effective(&self.cpu, self.detected_cpus)
     }
@@ -188,12 +199,18 @@ impl ExportConfig {
         if let Some(log) = &self.logging {
             log.validate().map_err(|_| Error::Config)?;
         }
+        if !self.raw_only() && (self.cri_key_env.is_empty() || self.ffmpeg.as_os_str().is_empty()) {
+            return Err(Error::Config);
+        }
         self.cpu.validate()?;
         self.stage_limits.validate()?;
         self.selection.validate()?;
         self.read_kinds.validate()?;
         self.media_backend.validate()?;
         self.image.validate()?;
+        if let Some(raw) = &self.raw_bundles {
+            raw.validate()?;
+        }
         if self.cache_directory.is_some() && !self.retain_outputs
             || self
                 .cache_directory
@@ -243,10 +260,14 @@ impl ExportConfig {
         if *stop.borrow() {
             return Err(Error::Cancelled);
         }
-        let key = std::env::var(&self.cri_key_env)
-            .map_err(|_| Error::Secret)?
-            .parse::<u64>()
-            .map_err(|_| Error::Secret)?;
+        let key = if self.raw_only() {
+            0
+        } else {
+            std::env::var(&self.cri_key_env)
+                .map_err(|_| Error::Secret)?
+                .parse::<u64>()
+                .map_err(|_| Error::Secret)?
+        };
         let input = fs::canonicalize(&self.input).map_err(err)?;
         let verified = tokio::select! {
             result = crate::verify::verify(&input) => result?,
@@ -260,13 +281,14 @@ impl ExportConfig {
         let receipt: Receipt =
             sonic_rs::from_slice(&fs::read(input.join("receipt.json")).map_err(err)?)
                 .map_err(err)?;
-        if !Command::new(&self.ffmpeg)
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(err)?
-            .success()
+        if !self.raw_only()
+            && !Command::new(&self.ffmpeg)
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(err)?
+                .success()
         {
             return Err(Error::Config);
         }
@@ -362,11 +384,20 @@ impl ExportConfig {
                 return Err(Error::AssetPath);
             }
         }
+        if self.raw_only() {
+            assets.retain(|a| {
+                self.raw_bundles
+                    .as_ref()
+                    .is_some_and(|r| r.matches(a.provider, &a.relative_path))
+            });
+        }
         if assets.is_empty() {
             return Err(Error::Selection);
         }
         let mut summary = ExportSummary {
-            full_export: complete_selection
+            raw_bundles: self.raw_bundles.clone(),
+            full_export: !self.raw_only()
+                && complete_selection
                 && assets.len() == catalog_files
                 && self.selection.full()
                 && self.read_kinds.is_native(),
@@ -553,17 +584,27 @@ impl ExportConfig {
             source_sha256: asset.stored_sha256.clone(),
             ..ResourceReport::default()
         };
-        let result = match asset.provider {
-            Provider::EncryptedBundle | Provider::UnityBundle => self.unity(
-                &path,
-                work.path(),
-                key,
-                &mut report,
-                dependencies,
-                &input.join("assets"),
-            ),
-            Provider::Cri => self.cri(&path, work.path(), key, &mut report),
-        };
+        let result = (|| -> Result<(), Error> {
+            if let Some(raw) = &self.raw_bundles {
+                if raw.matches(asset.provider, &asset.relative_path) {
+                    self.copy_raw_bundle(&path, work.path(), asset, raw, &mut report)?;
+                }
+            }
+            if self.raw_only() {
+                return Ok(());
+            }
+            match asset.provider {
+                Provider::EncryptedBundle | Provider::UnityBundle => self.unity(
+                    &path,
+                    work.path(),
+                    key,
+                    &mut report,
+                    dependencies,
+                    &input.join("assets"),
+                ),
+                Provider::Cri => self.cri(&path, work.path(), key, &mut report),
+            }
+        })();
         if let Err(error) = result {
             report.errors.push(error.to_string());
         }
@@ -571,6 +612,65 @@ impl ExportConfig {
             fs::rename(work.path(), root.join(format!("{i:05}"))).map_err(err)?;
         }
         Ok(report)
+    }
+    fn copy_raw_bundle(
+        &self,
+        source: &Path,
+        root: &Path,
+        asset: &crate::update::AssetReceipt,
+        raw: &crate::raw_bundles::Config,
+        report: &mut ResourceReport,
+    ) -> Result<(), Error> {
+        use std::io::Read;
+        let metadata = fs::symlink_metadata(source).map_err(err)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Error::Verification);
+        }
+        let prior: u64 = report.outputs.iter().map(|r| r.bytes).sum();
+        if prior.saturating_add(metadata.len()) > self.max_resource_output_bytes {
+            return Err(Error::Size);
+        }
+        let relative = raw.output_path(&asset.relative_path)?;
+        let target = root.join(&relative);
+        fs::create_dir_all(target.parent().ok_or(Error::AssetPath)?).map_err(err)?;
+        let mut input = fs::File::open(source).map_err(err)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(err)?;
+        let mut bytes = 0u64;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let n = input.read(&mut buffer).map_err(err)?;
+            if n == 0 {
+                break;
+            }
+            bytes = bytes.checked_add(n as u64).ok_or(Error::Size)?;
+            if bytes > metadata.len()
+                || prior.saturating_add(bytes) > self.max_resource_output_bytes
+            {
+                return Err(Error::Size);
+            }
+            digest.update(&buffer[..n]);
+            output.write_all(&buffer[..n]).map_err(err)?;
+        }
+        let sha256 = hex::encode(digest.finalize());
+        if bytes != metadata.len() || sha256 != asset.stored_sha256 {
+            return Err(Error::Verification);
+        }
+        report.outputs.push(OutputRecord {
+            path: relative,
+            kind: "raw_bundle".into(),
+            bytes,
+            sha256,
+            object: None,
+        });
+        Ok(())
     }
     fn unity(
         &self,
@@ -2053,6 +2153,7 @@ pub(crate) mod tests {
             paths: Vec::new(),
             selection: Default::default(),
             read_kinds: Default::default(),
+            raw_bundles: None,
             image: Default::default(),
             audio: Default::default(),
             video: Default::default(),
@@ -3102,6 +3203,162 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn raw_bundles_publish_verified_source_bytes_alone_or_with_decoded_images() {
+        for only in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let input = root.path().join("input");
+            fs::create_dir_all(input.join("assets/nested")).unwrap();
+            let (texture, _) = synthetic_texture();
+            let source = if only {
+                b"opaque verified bundle fixture".to_vec()
+            } else {
+                texture
+            };
+            fs::write(input.join("assets/nested/a.bundle"), &source).unwrap();
+            let asset = crate::update::AssetReceipt {
+                relative_path: "nested/a.bundle".into(),
+                provider: Provider::EncryptedBundle,
+                bytes: source.len() as u64,
+                downloaded_sha256: "c".repeat(64),
+                stored_sha256: hex::encode(Sha256::digest(&source)),
+                decrypted: true,
+            };
+            let mut cfg = config(root.path());
+            cfg.retain_outputs = true;
+            cfg.raw_bundles = Some(
+                yaml_serde::from_str(&format!(
+                    "mode: {}\ninclude: ['^nested/']\nexclude: ['debug']\noutput_prefix: bundles",
+                    if only { "only" } else { "alongside" }
+                ))
+                .unwrap(),
+            );
+            cfg.validate().unwrap();
+            let out = root.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            let report = cfg
+                .process_resource(&input, &out, &asset, 0, 0, None)
+                .unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.outputs.len(), if only { 1 } else { 2 });
+            let raw = report
+                .outputs
+                .iter()
+                .find(|r| r.kind == "raw_bundle")
+                .unwrap();
+            assert_eq!(raw.sha256, asset.stored_sha256);
+            assert!(raw.object.is_none());
+            assert_eq!(
+                fs::read(out.join("00000/bundles/nested/a.bundle")).unwrap(),
+                source
+            );
+            let mut summary = ExportSummary {
+                schema_version: 4,
+                region: crate::region::Region::Jp,
+                platform: "iOS".into(),
+                complete: true,
+                retained: true,
+                input_files: 1,
+                catalog_files: 1,
+                succeeded: 1,
+                output_files: report.outputs.len(),
+                output_bytes: report.outputs.iter().map(|r| r.bytes).sum(),
+                unity_objects: report.objects,
+                selected_unity_objects: report.selected_objects,
+                skipped_unity_objects: report.skipped_objects,
+                catalog_sha256: "b".repeat(64),
+                full_catalog: true,
+                full_export: !only,
+                raw_bundles: cfg.raw_bundles.clone(),
+                ..Default::default()
+            };
+            for record in &report.outputs {
+                *summary.payloads.entry(record.kind.clone()).or_default() += 1;
+            }
+            write_json(&out.join("summary.json"), &summary).unwrap();
+            let mut journal = sonic_rs::to_vec(&report).unwrap();
+            journal.push(b'\n');
+            fs::write(out.join("resources.jsonl"), journal).unwrap();
+            let verified = crate::export_verify::verify(&out, crate::region::Region::Jp)
+                .await
+                .unwrap();
+            assert_eq!(verified.full_export, !only);
+            let storage_root = root.path().join("published");
+            let storage: crate::storage::Config = yaml_serde::from_str(&format!(
+                "providers:\n  - name: local\n    backend:\n      type: local\n      directory: '{}'\n", storage_root.display()
+            )).unwrap();
+            let published = storage.run(&out, crate::region::Region::Jp).await.unwrap();
+            assert_eq!(
+                fs::read(
+                    storage_root
+                        .join(&published.providers[0].prefix)
+                        .join("00000/bundles/nested/a.bundle")
+                )
+                .unwrap(),
+                source
+            );
+            if only {
+                summary.full_export = true;
+                write_json(&out.join("summary.json"), &summary).unwrap();
+                assert!(
+                    crate::export_verify::verify(&out, crate::region::Region::Jp)
+                        .await
+                        .is_err()
+                );
+                summary.full_export = false;
+            }
+            summary.raw_bundles = None;
+            write_json(&out.join("summary.json"), &summary).unwrap();
+            assert!(
+                crate::export_verify::verify(&out, crate::region::Region::Jp)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn raw_bundles_fail_without_partial_publication_on_corruption_limits_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        fs::create_dir_all(input.join("assets")).unwrap();
+        let (source, _) = synthetic_texture();
+        fs::write(input.join("assets/a.bundle"), &source).unwrap();
+        let mut asset = crate::update::AssetReceipt {
+            relative_path: "a.bundle".into(),
+            provider: Provider::UnityBundle,
+            bytes: source.len() as u64,
+            downloaded_sha256: hex::encode(Sha256::digest(&source)),
+            stored_sha256: hex::encode(Sha256::digest(&source)),
+            decrypted: false,
+        };
+        for failure in ["hash", "limit", "later-image", "cancel"] {
+            let mut cfg = config(root.path());
+            cfg.retain_outputs = true;
+            cfg.raw_bundles = Some(Default::default());
+            if failure == "hash" {
+                asset.stored_sha256 = "a".repeat(64)
+            } else {
+                asset.stored_sha256 = hex::encode(Sha256::digest(&source))
+            }
+            if failure == "limit" {
+                cfg.max_resource_output_bytes = source.len() as u64 - 1
+            }
+            if failure == "later-image" {
+                cfg.max_resource_output_bytes = source.len() as u64
+            }
+            if failure == "cancel" {
+                cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed)
+            }
+            let out = root.path().join(failure);
+            fs::create_dir(&out).unwrap();
+            let r = cfg
+                .process_resource(&input, &out, &asset, 0, 0, None)
+                .unwrap();
+            assert!(!r.errors.is_empty(), "{failure}");
+            assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+        }
+    }
+
     // Synthetic named-object records; payloads are opaque markers, not playable media.
     fn synthetic_unity_media(
         class: i32,
@@ -4059,6 +4316,12 @@ pub(crate) mod tests {
         cfg.image = crate::export_options::ImageExport::Webp {}.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
+        cfg.raw_bundles = Some(Default::default());
+        let raw_bundle_key = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(base, raw_bundle_key);
+        cfg.raw_bundles.as_mut().unwrap().mode = crate::raw_bundles::Mode::Only;
+        assert_ne!(raw_bundle_key, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.raw_bundles = None;
         cfg.read_kinds = yaml_serde::from_str("default: object_raw").unwrap();
         let raw = id(&cfg, &snapshot, &asset, &deps, 1);
         assert_ne!(base, raw);

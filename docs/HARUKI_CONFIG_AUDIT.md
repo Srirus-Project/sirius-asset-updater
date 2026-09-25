@@ -83,8 +83,12 @@ not dismissed as Sekai-specific merely because the current implementation is sma
   now preserve native encoded payloads, including catalog dependencies, with actual serialized
   fixture tests for inline/external data, safe naming, missing/truncated references and bounds.
   This is payload extraction, not universal codec decoding/transcoding.
-- `regions.*.export.raw_bundles`: independently audit filtered raw-bundle publication and paths;
-  retaining downloaded inputs alone does not prove equivalent export/publication behavior.
+- `regions.*.export.raw_bundles`: restored as export `raw_bundles` with native relative-path
+  include/exclude regexes, alongside/only modes and a safe output_prefix inside staged output.
+  Original writes deobfuscated payloads; Sirius copies verified stored/decrypted Unity bundles.
+  This reaches normal hash journals, cache, offline verification and storage publication.
+  Arbitrary output_dir maps to storage placement, not untracked writes outside receipts.
+  Raw-only skips decoding and cannot claim full_export; see [EXPORT_OPTIONS.md](EXPORT_OPTIONS.md).
 - Complete field-by-field logging, environment override, region-path, export-stage and upload
   migration coverage, including aliases and defaults. Existing specialized docs are evidence,
   not a substitute for this remaining inventory.

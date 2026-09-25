@@ -349,3 +349,39 @@ logged alongside the actual worker width. Scheduling configuration remains outsi
 content-cache identity, so changing it alone does not invalidate verified export results.
 This policy intentionally does not import corpus-specific Sekai performance ratios;
 Sirius production throughput still requires measurement on the final candidate.
+
+## Raw Unity bundles
+
+`raw_bundles` publishes verified stored Unity bundle bytes, after download decryption when
+applicable. It is independent of object representation (`object_raw` is one serialized object).
+Omit it to keep decoded-only behavior:
+
+```yaml
+raw_bundles:
+  mode: alongside
+  include: ['\.bundle$']
+  exclude: ['debug']
+  output_prefix: raw
+```
+
+`alongside` adds matching Unity bundles to the usual decoded outputs. `only` selects matching
+Unity bundles without invoking Unity/CRI decoders or FFmpeg; `cri_key_env` and `ffmpeg` may be
+omitted in that mode. Standalone CRI resources are excluded from raw-bundle selection. Regexes
+match Sirius receipt relative paths, with empty include meaning all Unity bundles and exclusion
+winning. Patterns are bounded and validated. These filters operate within the downloaded catalog
+selection and export `paths`/provider selection; they do not download unselected resources or
+invent Sekai categories. Raw-only empty selections fail.
+
+Each bundle is stored at `{resource_index}/{output_prefix}/{source_relative_path}`. Prefixes
+must be safe relative paths inside the staged export; choose the storage provider directory/prefix
+for external placement instead of bypassing publication with an arbitrary output directory.
+Original Sirius filenames/extensions are preserved. Records use kind `raw_bundle`, the complete
+stored-source SHA-256 and no object identity. Copying is streamed and cancellable, shares the
+resource output budget with decoded images/audio, and verifies the source hash before publication.
+Any copy/decode failure prevents publication of that resource, including previously staged files.
+
+Raw policy contributes to decoded-cache identity and is recorded in the export summary. Offline
+verification checks raw paths, source hashes and policy; normal storage publication uploads and
+reads back raw files alongside receipts. Raw-only always sets `full_export=false`, even when all
+catalog resources are represented. `full_catalog` remains an independent scope declaration;
+retained raw bundles alone never satisfy full decoded acceptance.

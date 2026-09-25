@@ -204,6 +204,15 @@ async fn prepare_with_progress(
         || summary.input_files > summary.catalog_files
         || summary.output_files == 0
         || summary.read_kinds.validate().is_err()
+        || summary
+            .raw_bundles
+            .as_ref()
+            .is_some_and(|r| r.validate().is_err())
+        || (summary.full_export
+            && summary
+                .raw_bundles
+                .as_ref()
+                .is_some_and(|r| r.mode == crate::raw_bundles::Mode::Only))
         || !valid_digest(&summary.catalog_sha256)
         || (summary.full_export && (!summary.full_catalog || !summary.read_kinds.is_native()))
         || (summary.full_catalog && summary.input_files != summary.catalog_files)
@@ -264,8 +273,32 @@ async fn prepare_with_progress(
         {
             return Err(Error::Verification);
         }
+        let raw_only = summary
+            .raw_bundles
+            .as_ref()
+            .is_some_and(|r| r.mode == crate::raw_bundles::Mode::Only);
+        if raw_only
+            && (resource.outputs.len() != 1
+                || resource.objects != 0
+                || resource.selected_objects != 0
+                || resource.skipped_objects != 0)
+        {
+            return Err(Error::Verification);
+        }
         let mut paths = HashSet::new();
         for item in &resource.outputs {
+            if item.kind == "raw_bundle" {
+                let raw = summary.raw_bundles.as_ref().ok_or(Error::Verification)?;
+                if !raw.matches_path(&resource.source)
+                    || item.path != raw.output_path(&resource.source)?
+                    || item.sha256 != resource.source_sha256
+                    || item.object.is_some()
+                {
+                    return Err(Error::Verification);
+                }
+            } else if raw_only {
+                return Err(Error::Verification);
+            }
             if !safe_path(&item.path)
                 || !paths.insert(item.path.clone())
                 || !valid_digest(&item.sha256)

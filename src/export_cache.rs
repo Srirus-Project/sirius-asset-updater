@@ -63,7 +63,11 @@ impl Cache {
         }
         let guard = crate::cache::Guard::acquire(&root)?;
         let binary = fs::canonicalize(std::env::current_exe().map_err(err)?).map_err(err)?;
-        let ffmpeg = executable(&config.ffmpeg)?;
+        let ffmpeg = if config.raw_only() {
+            None
+        } else {
+            Some(executable(&config.ffmpeg)?)
+        };
         let split = config
             .split_acb_xor_env
             .as_ref()
@@ -77,7 +81,7 @@ impl Cache {
             (&snapshot.platform, &snapshot.effective_cdn_root),
             &snapshot.client_version,
             &snapshot.protocol_version,
-            (&config.selection, &config.read_kinds),
+            (&config.selection, &config.read_kinds, &config.raw_bundles),
             &config.image,
             (
                 &config.audio,
@@ -89,7 +93,10 @@ impl Cache {
             split,
             &config.cache_revision,
             file_hash(&binary, &config.cancel)?,
-            file_hash(&ffmpeg, &config.cancel)?,
+            ffmpeg
+                .as_ref()
+                .map(|p| file_hash(p, &config.cancel))
+                .transpose()?,
         ))?;
         let cache = Self {
             root,

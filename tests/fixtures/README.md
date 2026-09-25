@@ -32,3 +32,8 @@ orientation and alpha. Inline and streamed payloads (offset3 with prefix/trailer
 resolution. Unknown graphics format and stripped mip0 are negative fixtures. Layouts follow
 unity-rs-core0.5.1 readers (Unity2022.3 and2023.2); no game data is included. Optional FFmpeg
 checks independently decode both PNG/WebP renditions of both layers.
+
+Raw-bundle tests reuse the synthetic Texture2D file for alongside decoding. Raw-only transport
+fixtures have the UnityFS signature followed by a deterministic opaque marker; they intentionally
+do not represent decodable UnityFS archives. They prove byte retention without decoder/FFmpeg/key
+dependencies, filtered catalog scope, cache reuse, journal verification and local storage readback.

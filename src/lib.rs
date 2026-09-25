@@ -9,6 +9,7 @@ pub mod media_backend;
 pub mod media_ffi;
 pub mod network;
 pub mod proxy;
+pub mod raw_bundles;
 pub mod readiness;
 pub mod storage;
 mod update;

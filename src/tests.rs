@@ -3331,3 +3331,64 @@ async fn cdn_http_policy_negotiates_tls_and_preserves_origin_auth_and_redirect_p
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn raw_bundles_run_from_verified_download_with_filtered_scope_and_incremental_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = root.path().join("downloads");
+    enable_assets(&mut cfg, false);
+    let catalog = catalog_fixture(
+        &[
+            ("{Fwk.Resource.RemoteAssetDir}/keep.bundle", UNITY_PROVIDER),
+            ("{Fwk.Resource.RemoteAssetDir}/debug.bundle", UNITY_PROVIDER),
+            ("{Fwk.Resource.RemoteAssetDir}/sound.acb", CRI_PROVIDER),
+        ],
+        false,
+    );
+    let (client, fixture, upstream) = serve(cfg, StatusCode::OK, catalog, Duration::ZERO).await;
+    // Minimal opaque byte fixtures meet the transport signature; raw-only must not decode them.
+    for name in ["keep.bundle", "debug.bundle"] {
+        fixture.assets.lock().unwrap().insert(
+            name.into(),
+            (StatusCode::OK, b"UnityFS\0synthetic-opaque-bundle".to_vec()),
+        );
+    }
+    fixture.assets.lock().unwrap().insert(
+        "sound.acb".into(),
+        (StatusCode::OK, b"opaque-audio".to_vec()),
+    );
+    let input = client.fetch().await.unwrap();
+    upstream.abort();
+    for round in 0..2 {
+        let output = root.path().join(format!("export-{round}"));
+        let yaml = format!("input: {:?}\noutput: {:?}\nretain_outputs: true\ncache_directory: {:?}\nraw_bundles:\n  mode: only\n  include: ['bundle$']\n  exclude: ['debug']\n", input, output, root.path().join("cache"));
+        let export: crate::export::ExportConfig = yaml_serde::from_str(&yaml).unwrap();
+        let summary = export.run().await.unwrap();
+        assert!(summary.complete);
+        assert!(!summary.full_catalog && !summary.full_export);
+        assert_eq!(
+            (
+                summary.input_files,
+                summary.catalog_files,
+                summary.output_files
+            ),
+            (1, 3, 1)
+        );
+        assert_eq!(summary.cache_hits, round);
+        assert_eq!(
+            std::fs::read(output.join("00000/raw/keep.bundle")).unwrap(),
+            b"UnityFS\0synthetic-opaque-bundle"
+        );
+        crate::export_verify::verify(&output, region::Region::Jp)
+            .await
+            .unwrap();
+    }
+    let yaml = format!(
+        "input: {:?}\noutput: {:?}\nraw_bundles: {{mode: only, include: ['not-present']}}\n",
+        input,
+        root.path().join("empty")
+    );
+    let export: crate::export::ExportConfig = yaml_serde::from_str(&yaml).unwrap();
+    assert!(matches!(export.run().await, Err(Error::Selection)));
+}
