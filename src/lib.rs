@@ -410,7 +410,7 @@ impl CatalogClient {
             .assets
             .as_ref()
             .and_then(|c| c.cache_directory.as_ref())
-            .map(|root| cache::Guard::acquire(root))
+            .map(|root| cache::Guard::acquire_download(root))
             .transpose()?;
         tracing::info!(
             stage = "snapshot",

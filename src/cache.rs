@@ -125,7 +125,7 @@ impl Pending {
             .await
             .map_err(|_| Error::Io)?;
         let directory = tempfile::Builder::new()
-            .prefix(".pending-")
+            .prefix(".pending-download-")
             .tempdir_in(root)
             .map_err(|_| Error::Io)?;
         tokio::fs::copy(source, directory.path().join("data"))
@@ -151,6 +151,7 @@ impl Pending {
             .map_err(|_| Error::Io)?;
         file.write_all(&metadata).await.map_err(|_| Error::Io)?;
         file.sync_all().await.map_err(|_| Error::Io)?;
+        sync_directory(directory.path()).await?;
         Ok(Self {
             directory,
             target: root.join(id),
@@ -172,8 +173,22 @@ impl Pending {
         }
         tokio::fs::rename(self.directory.path(), &self.target)
             .await
-            .map_err(|_| Error::Io)
+            .map_err(|_| Error::Io)?;
+        sync_directory(self.target.parent().ok_or(Error::Io)?).await
     }
+}
+
+async fn sync_directory(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|_| Error::Io)?
+        .sync_all()
+        .await
+        .map_err(|_| Error::Io)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 pub(crate) struct Guard {
@@ -187,6 +202,31 @@ impl Drop for Guard {
     }
 }
 impl Guard {
+    /// Reap only this download cache's generated temporary names, while exclusively owned.
+    pub(crate) fn acquire_download(root: &Path) -> Result<Self, Error> {
+        let guard = Self::acquire(root)?;
+        for entry in std::fs::read_dir(root).map_err(|_| Error::Io)? {
+            let entry = entry.map_err(|_| Error::Io)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // tempfile uses six alphanumeric suffix characters. Retain unrelated names,
+            // including decoded-export cache staging and operator-created directories.
+            let suffix = name
+                .strip_prefix(".pending-download-")
+                .or_else(|| name.strip_prefix(".pending-"));
+            if !suffix.is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            {
+                continue;
+            }
+            let kind = entry.file_type().map_err(|_| Error::Io)?;
+            if kind.is_dir() {
+                std::fs::remove_dir_all(entry.path()).map_err(|_| Error::Io)?;
+            } else if kind.is_file() || kind.is_symlink() {
+                std::fs::remove_file(entry.path()).map_err(|_| Error::Io)?;
+            }
+        }
+        Ok(guard)
+    }
     pub(crate) fn acquire(root: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(root).map_err(|_| Error::Io)?;
         let path = root.join(".lock");
@@ -208,6 +248,88 @@ impl Guard {
 #[cfg(all(test, unix))]
 mod guard_tests {
     use super::*;
+    #[test]
+    fn download_cache_recovers_after_process_kill() {
+        const ENV: &str = "SIRIUS_TEST_CACHE_CRASH_DIRECTORY";
+        if let Some(root) = std::env::var_os(ENV) {
+            let root = PathBuf::from(root);
+            let _guard = Guard::acquire_download(&root).unwrap();
+            let source = root.parent().unwrap().join("source");
+            let digest = hex::encode(Sha256::digest(b"verified resource"));
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                Pending::prepare(&root, &"a".repeat(64), &source, 17, &digest)
+                    .await
+                    .unwrap()
+                    .commit()
+                    .await
+                    .unwrap();
+                let _pending = Pending::prepare(&root, &"b".repeat(64), &source, 17, &digest)
+                    .await
+                    .unwrap();
+                std::fs::write(root.parent().unwrap().join("ready"), b"ready").unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            });
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        std::fs::write(temp.path().join("source"), b"verified resource").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cache::guard_tests::download_cache_recovers_after_process_kill",
+                "--nocapture",
+            ])
+            .env(ENV, &root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !temp.path().join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = temp.path().join("ready").exists();
+        let busy = matches!(Guard::acquire_download(&root), Err(Error::Busy));
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        assert!(ready, "child never prepared crash fixture");
+        assert!(busy);
+        killed.unwrap();
+        assert!(!status.success());
+        // Unknown directories and decoded-export staging are not download-owned names.
+        for name in [".pending-operator", ".pending-export-Ab1234"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        std::fs::create_dir(root.join(".pending-Ab1234")).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".pending-download-Cd5678")).unwrap();
+        let _guard = Guard::acquire_download(&root).unwrap();
+        assert!(!root.join(".pending-Ab1234").exists());
+        assert!(!root.join(".pending-download-Cd5678").exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"unrelated");
+        for name in [".pending-operator", ".pending-export-Ab1234"] {
+            assert!(root.join(name).is_dir());
+        }
+        assert!(!std::fs::read_dir(&root).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pending-download-")));
+        let destination = temp.path().join("restored");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime
+            .block_on(restore(&root, &"a".repeat(64), &destination, 1024))
+            .unwrap()
+            .is_some());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"verified resource");
+        assert!(runtime
+            .block_on(restore(&root, &"b".repeat(64), &destination, 1024))
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn ownership_ends_even_if_a_duplicate_descriptor_remains_open() {
         let root = tempfile::tempdir().unwrap();

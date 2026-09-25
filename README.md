@@ -66,6 +66,12 @@ Unknown providers, unsafe paths, mismatched versions, stale observations and unk
 fail closed. CDN requests do not follow redirects. Transient failures have bounded retries;
 401/403 and validation failures are terminal. Failed/cancelled updates preserve previous publications.
 Verified complete cache entries survive interruption; partial files restart from byte zero.
+Download cache metadata is committed per validated resource, so completed resources remain reusable
+even when a later resource fails. Startup removes abandoned generated download staging entries
+only after acquiring the exclusive cache lock; unrelated names and decoded-export staging remain.
+On Unix, cache data, metadata and committed directory entries are synced. Other platforms sync
+files but do not claim Unix directory-fsync guarantees. This is restart recovery, not byte-range
+resume; configure a download cache to retain this progress.
 
 ## Offline export
 
