@@ -18,6 +18,7 @@ default = []
 media-ffi = ["dep:rsmpeg"]
 
 [dependencies]
+base64 = "0.22"
 libc = "0.2"
 rsmpeg = { version = "=0.18.0", default-features = false, features = ["ffmpeg7_1", "link_system_ffmpeg"], optional = true }
 tracing = "0.1"
@@ -55,6 +56,5 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
-base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }

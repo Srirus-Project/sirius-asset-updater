@@ -73,6 +73,7 @@ struct Fake {
     write_headers: Mutex<Vec<(String, String, String, String)>>,
     checksums: Mutex<Vec<(String, String, String)>>,
     payer_headers: Mutex<Vec<(String, bool)>>,
+    customer_headers: Mutex<Vec<(String, String, String, String)>>,
     parts: Mutex<BTreeMap<usize, Vec<u8>>>,
     mode: AtomicUsize,
     puts: AtomicUsize,
@@ -83,6 +84,23 @@ struct Fake {
 }
 async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
     let method = request.method().clone();
+    {
+        let sse_header = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        state.customer_headers.lock().unwrap().push((
+            method.to_string(),
+            sse_header("x-amz-server-side-encryption-customer-algorithm"),
+            sse_header("x-amz-server-side-encryption-customer-key"),
+            sse_header("x-amz-server-side-encryption-customer-key-md5"),
+        ));
+    }
+
     let payer = request
         .headers()
         .get("x-amz-request-payer")
@@ -773,6 +791,7 @@ async fn s3_write_options_reach_put_multipart_and_completion_markers() {
     std::env::set_var(&env, "alias/synthetic-key");
     if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
         **write_options = S3WriteOptions {
+            customer_key_base64_env: None,
             checksum_algorithm: None,
             storage_class: Some("STANDARD_IA".into()),
             server_side_encryption: Some("aws:kms".into()),
@@ -1146,4 +1165,74 @@ async fn storage_region_templates_do_not_expand_credentials_or_bypass_overlap_ch
     }
     assert!(server.config.validate().is_err());
     assert!(server.state.objects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn s3_customer_key_reaches_multipart_and_verification_without_receipt_leaks() {
+    // Synthetic bytes 0..31; independently calculated base64 and MD5/base64.
+    let encoded = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    let md5 = "tP/LI3N87DFaSk0aoqYgzg==";
+    let env = format!("SIRIUS_TEST_SSEC_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, encoded);
+    let source = large_source();
+    let mut server = server().await;
+    if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
+        write_options.customer_key_base64_env = Some(env.clone());
+    }
+    let (_tx, rx) = watch::channel(false);
+    let publication = server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    assert!(server.state.multipart_puts.load(Ordering::SeqCst) >= 2);
+    let headers = server.state.customer_headers.lock().unwrap();
+    assert!(headers.iter().any(|(method, ..)| method == "GET"));
+    assert!(headers.iter().any(|(method, ..)| method == "PUT"));
+    assert!(headers.iter().any(|(method, ..)| method == "POST"));
+    for (_, algorithm, key, digest) in headers.iter() {
+        assert_eq!(algorithm, "AES256");
+        assert_eq!(key, encoded);
+        assert_eq!(digest, md5);
+    }
+    let receipt = sonic_rs::to_string(&publication).unwrap();
+    assert!(!receipt.contains(encoded) && !receipt.contains(&env));
+    for (path, bytes) in server.state.objects.lock().unwrap().iter() {
+        if path.ends_with(".json") {
+            assert!(!String::from_utf8_lossy(bytes).contains(encoded));
+        }
+    }
+    std::env::remove_var(env);
+}
+
+#[test]
+fn s3_customer_key_rejects_wrong_size_encoding_and_mixed_encryption_modes() {
+    use base64::Engine;
+    let env = format!("SIRIUS_TEST_SSEC_CONFIG_{}", uuid::Uuid::new_v4().simple());
+    let mut options = S3WriteOptions {
+        customer_key_base64_env: Some(env.clone()),
+        ..Default::default()
+    };
+    for value in [
+        "".to_string(),
+        "not-base64".into(),
+        base64::engine::general_purpose::STANDARD.encode([0; 16]),
+        base64::engine::general_purpose::STANDARD.encode([0; 33]),
+    ] {
+        std::env::set_var(&env, value);
+        assert!(options.validate().is_err());
+    }
+    std::env::set_var(
+        &env,
+        base64::engine::general_purpose::STANDARD.encode([0; 32]),
+    );
+    options.validate().unwrap();
+    for algorithm in ["AES256", "aws:kms"] {
+        options.server_side_encryption = Some(algorithm.into());
+        assert!(options.validate().is_err());
+    }
+    options.server_side_encryption = None;
+    options.kms_key_id_env = Some("NO_SUCH_KEY".into());
+    assert!(options.validate().is_err());
+    std::env::remove_var(env);
 }

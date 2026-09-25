@@ -204,3 +204,50 @@ S3 `backend.region`, provider names, ACL regexes and encryption options are not 
 Keep separate profiles for independent credentials, signing regions or other policies. Resolution
 never silently substitutes credentials from a different region. Public URLs remain declarations
 of CDN routing, not a claim that anonymous access was tested.
+
+### Customer-provided S3 encryption keys (SSE-C)
+
+Set `backend.write_options.customer_key_base64_env` to an environment variable containing
+exactly 32 bytes encoded as standard Base64. The uploader selects AES256 and derives the
+Base64 MD5 key checksum, so separate algorithm/key-MD5 settings are unnecessary. This maps
+Haruki's `server_side_encryption_customer_algorithm`, `server_side_encryption_customer_key`
+and `server_side_encryption_customer_key_md5` options to one validated reference.
+
+SSE-C cannot be combined with `server_side_encryption` or `kms_key_id_env`. Keys are never
+region-templated or included in publication receipts; store them outside the repository and
+retain the key needed to read each publication. S3 endpoints require HTTPS except explicit
+literal-loopback fixtures. The configured storage service receives the customer key as required
+by SSE-C, on both uploads and verification reads. Missing/wrong keys or unsupported encryption
+fail publication without a fallback to unencrypted writes. Local test fixtures verify headers,
+not server-side cryptography; deployed storage acceptance is still required.
+
+## Remaining OpenDAL option audit
+
+The original scalar option map could configure the backend beyond the operations used by the
+updater. Sirius exposes explicit fields and rejects unknown options. This audit distinguishes
+implemented mappings from operations the immutable publication pipeline does not perform:
+
+| Original S3 option | Sirius mapping or applicability |
+| --- | --- |
+| root | Provider `prefix`, with mandatory region/publication suffix; local root uses `backend.directory` |
+| bucket / endpoint / region | Explicit backend fields; signing region stays independent of game region |
+| access_key_id / secret_access_key / session_token | Environment-referenced credentials, including externally refreshed temporary credentials |
+| enable_virtual_host_style | Inverse of `path_style` |
+| default_acl | `public_read` plus per-path include/exclude rules; other ACL modes are not yet exposed |
+| default_storage_class / server_side_encryption / server_side_encryption_aws_kms_key_id | Typed write policy documented above |
+| server_side_encryption_customer_* | Validated SSE-C environment reference documented above |
+| checksum_algorithm / aws_checksum_algorithm | CRC32C; multipart-incompatible MD5 fails validation |
+| enable_request_payer | `request_payer` |
+| disable_config_load | Always enabled; storage identities come from explicit references |
+| profile / role_arn / external_id / role_session_name / assume_role_duration_seconds | Internal profile/STS credential acquisition remains unimplemented; explicit session tokens do not claim equivalent automatic refresh |
+| assume_role_session_tags | The original scalar-only option parser rejected nested maps; no tag-map migration is claimed |
+| enable_versioning | No version-list/get/delete API is used; server bucket versioning continues to operate independently |
+| batch_max_operations / delete_max_size | No remote deletion or batch-delete operation is performed; failed prefixes require bucket lifecycle/operator cleanup |
+| disable_stat_with_override | Deprecated backend compatibility flag; publication uses authenticated full-byte GET verification |
+| disable_write_with_if_match | Deprecated flag; immutable UUID publications do not perform conditional overwrite |
+| enable_write_with_append | No append operation: complete objects and multipart parts are written under fresh publication prefixes |
+| skip_signature / allow_anonymous | Not exposed: publication and read-back require configured authenticated storage; public-read ACLs do not disable signing |
+
+Profile/STS acquisition and additional ACL modes remain explicit gaps in broad scalar-option
+parity. Notifications/registry integration and production acceptance are also not completed by
+this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.

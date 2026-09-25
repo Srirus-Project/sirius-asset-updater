@@ -98,6 +98,7 @@ pub enum Backend {
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3WriteOptions {
+    pub customer_key_base64_env: Option<String>,
     pub checksum_algorithm: Option<String>,
     pub storage_class: Option<String>,
     pub server_side_encryption: Option<String>,
@@ -105,6 +106,7 @@ pub struct S3WriteOptions {
 }
 impl S3WriteOptions {
     fn validate(&self) -> Result<(), Error> {
+        self.customer_key()?;
         if self
             .checksum_algorithm
             .as_deref()
@@ -135,8 +137,26 @@ impl S3WriteOptions {
         }
         Ok(())
     }
+    fn customer_key(&self) -> Result<Option<[u8; 32]>, Error> {
+        use base64::Engine;
+        let Some(name) = &self.customer_key_base64_env else {
+            return Ok(None);
+        };
+        if self.server_side_encryption.is_some() || self.kms_key_id_env.is_some() {
+            return Err(Error::Config);
+        }
+        let value = secret(name)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map_err(|_| Error::Config)?;
+        let key: [u8; 32] = bytes.try_into().map_err(|_| Error::Config)?;
+        Ok(Some(key))
+    }
     fn apply(&self, mut builder: services::S3) -> Result<services::S3, Error> {
         self.validate()?;
+        if let Some(key) = self.customer_key()? {
+            builder = builder.server_side_encryption_with_customer_key("AES256", &key);
+        }
         if let Some(value) = &self.checksum_algorithm {
             builder = builder.checksum_algorithm(value);
         }
