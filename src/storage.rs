@@ -75,6 +75,8 @@ pub enum Backend {
     },
     S3 {
         #[serde(default)]
+        credentials_file: Option<Box<crate::storage_credentials::Config>>,
+        #[serde(default)]
         assume_role: Option<Box<crate::storage_sts::Config>>,
         #[serde(default)]
         request_payer: bool,
@@ -91,7 +93,9 @@ pub enum Backend {
         public_read_exclude: Vec<String>,
         bucket: String,
         region: String,
+        #[serde(default)]
         access_key_id_env: String,
+        #[serde(default)]
         secret_access_key_env: String,
         #[serde(default)]
         session_token_env: Option<String>,
@@ -343,6 +347,7 @@ impl Config {
                     }
                 }
                 Backend::S3 {
+                    credentials_file,
                     assume_role,
                     endpoint,
                     write_options,
@@ -390,10 +395,20 @@ impl Config {
                     {
                         return Err(Error::Config);
                     }
-                    secret(access_key_id_env)?;
-                    secret(secret_access_key_env)?;
-                    if let Some(env) = session_token_env {
-                        secret(env)?;
+                    if let Some(file) = credentials_file {
+                        if !access_key_id_env.is_empty()
+                            || !secret_access_key_env.is_empty()
+                            || session_token_env.is_some()
+                        {
+                            return Err(Error::Config);
+                        }
+                        file.read()?;
+                    } else {
+                        secret(access_key_id_env)?;
+                        secret(secret_access_key_env)?;
+                        if let Some(env) = session_token_env {
+                            secret(env)?;
+                        }
                     }
                 }
             }
@@ -927,6 +942,7 @@ impl Provider {
                 .map_err(storage_error)
             }
             Backend::S3 {
+                credentials_file,
                 assume_role,
                 request_payer,
                 endpoint,
@@ -943,8 +959,6 @@ impl Provider {
                     .endpoint(endpoint)
                     .bucket(bucket)
                     .region(region)
-                    .access_key_id(&secret(access_key_id_env)?)
-                    .secret_access_key(&secret(secret_access_key_env)?)
                     .disable_config_load()
                     .disable_ec2_metadata();
                 if *request_payer {
@@ -965,19 +979,30 @@ impl Provider {
                 if !path_style {
                     builder = builder.enable_virtual_host_style();
                 }
-                if let Some(name) = session_token_env {
-                    builder = builder.session_token(&secret(name)?);
-                }
-                if let Some(role) = assume_role {
+                if let Some(file) = credentials_file {
+                    let chain = match assume_role {
+                        Some(role) => role.chain_from_source((**file).clone())?,
+                        None => reqsign_core::ProvideCredentialChain::new().push((**file).clone()),
+                    };
+                    builder = builder.credential_provider_chain(chain);
+                } else {
+                    builder = builder
+                        .access_key_id(&secret(access_key_id_env)?)
+                        .secret_access_key(&secret(secret_access_key_env)?);
                     let token = session_token_env
                         .as_ref()
                         .map(|name| secret(name))
                         .transpose()?;
-                    builder = builder.credential_provider_chain(role.chain(
-                        &secret(access_key_id_env)?,
-                        &secret(secret_access_key_env)?,
-                        token.as_deref(),
-                    )?);
+                    if let Some(value) = &token {
+                        builder = builder.session_token(value);
+                    }
+                    if let Some(role) = assume_role {
+                        builder = builder.credential_provider_chain(role.chain(
+                            &secret(access_key_id_env)?,
+                            &secret(secret_access_key_env)?,
+                            token.as_deref(),
+                        )?);
+                    }
                 }
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())

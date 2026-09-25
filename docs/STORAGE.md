@@ -9,7 +9,7 @@ The command takes `input`, the expected `region`, and a `storage` configuration.
 
 OpenDAL 0.58.2 provides local filesystem and S3-compatible backends. All configured destinations
 are required. Names must be unique and providers are processed in order; per-provider object
-concurrency is bounded. Credentials are explicit environment-variable references. S3 requires
+concurrency is bounded. Credentials use explicit environment references or the shared-file source below. S3 requires
 HTTPS, except literal loopback IPs for local testing. `backend.path_style` defaults to true for
 existing configurations (`https://endpoint/bucket/key`). Set it to false for virtual-host-style
 requests (`https://bucket.endpoint/key`), including signing against that request target. Virtual-host
@@ -241,7 +241,7 @@ implemented mappings from operations the immutable publication pipeline does not
 | enable_request_payer | `request_payer` |
 | disable_config_load | Always enabled; storage identities come from explicit references |
 | role_arn / external_id / role_session_name / assume_role_duration_seconds | `backend.assume_role`, with environment-referenced external ID and explicit STS region, documented below |
-| profile | Shared AWS profile/file credential acquisition remains unimplemented; explicit base credential references are required |
+| profile | Explicit `credentials_file.path/profile` selects a shared static-key section; no ambient discovery, process or SSO provider chain |
 | assume_role_session_tags | The original scalar-only option parser rejected nested maps; no tag-map migration is claimed |
 | enable_versioning | No version-list/get/delete API is used; server bucket versioning continues to operate independently |
 | batch_max_operations / delete_max_size | No remote deletion or batch-delete operation is performed; failed prefixes require bucket lifecycle/operator cleanup |
@@ -250,8 +250,8 @@ implemented mappings from operations the immutable publication pipeline does not
 | enable_write_with_append | No append operation: complete objects and multipart parts are written under fresh publication prefixes |
 | skip_signature / allow_anonymous | Not exposed: publication and read-back require configured authenticated storage; public-read ACLs do not disable signing |
 
-Shared-profile/file credential acquisition remains an explicit gap in broad scalar-option parity. Notifications/registry integration and production acceptance are also not completed by
-this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
+General AWS SDK provider-chain parity is not claimed: process/SSO/metadata discovery is not
+exposed. Notifications/registry integration and production acceptance are also not completed by this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
 
 
 ### Default S3 object ACL
@@ -317,12 +317,53 @@ does not fetch STS credentials or contact storage.
 Credentials are cached in each operator's signer, with serialized concurrent refresh before
 expiry (the locked credential implementation refreshes within two minutes). Public/private
 operators and separate jobs may have separate caches. Refresh failure fails signing; an expired
-credential or base identity is never silently substituted. Source credential values are captured
-when constructing the operator: this does not implement shared-profile loading or base-credential
-file refresh. Role credentials can refresh throughout that operator's lifetime. Restart/retry
-constructs new operators and reads the explicit environment references again.
+credential or base identity is never silently substituted. Environment source values are captured
+when constructing the operator; a configured shared-file source instead reloads as described below.
+Role credentials can refresh throughout the operator lifetime. Restart/retry constructs new
+operators and reads source credentials again.
 
 Local tests cover expiration-aware refresh, concurrent single acquisition, malformed/expired/
 oversized/redirect/denied responses, actual S3 temporary-identity publication and a stalled STS
 request bounded by a one-second object attempt. They do not prove deployed IAM trust policies
 or cloud permissions; those remain part of production storage acceptance.
+
+
+## Explicit shared credential files
+
+As an alternative to access/secret/session environment references, configure:
+
+```yaml
+credentials_file:
+  path: /run/secrets/sirius-storage-credentials
+  profile: publisher
+  refresh_seconds: 60
+```
+
+Omit `access_key_id_env`, `secret_access_key_env` and `session_token_env` when using this source;
+combining sources fails validation. `profile` defaults to `default`; refresh is 1–3600 seconds,
+default 60. The path/profile are literal and are not region-templated. Configure independent
+files or profiles for independently authorized storage accounts. No AWS_PROFILE/HOME discovery,
+external credential commands, SSO or metadata fallback runs.
+
+The bounded UTF-8 file contains standard static key entries in `[publisher]` or `[profile publisher]`:
+`aws_access_key_id`, `aws_secret_access_key`, optional `aws_session_token`, and optional RFC3339
+`expiration`. Selected sections must be unique, with no duplicate or unknown fields. Inactive
+profiles are not fallback identities. Files are at most 64 KiB, regular and not symlinks; Unix
+permissions must have no group/other access (for example 0600 or 0400). Keep the parent directory
+trusted and replace files atomically rather than modifying them during reads. These checks do
+not isolate the updater from another process with the same operating-system identity.
+
+The source works for direct S3 signing and as the base identity for `assume_role`. Configuration
+and preview read/validate the selected credentials locally without contacting STS or storage.
+At runtime, signer cache freshness causes rereading after `refresh_seconds`; an explicit
+expiration can require earlier rereading and is never extended. Invalid/missing/expired files
+fail subsequent acquisition without retaining stale source keys or switching profiles. Fixing
+or atomically replacing the file permits the next acquisition to recover. Blocking file reads
+run off the async executor; cancellation drops their result but cannot interrupt an individual
+operating-system filesystem call.
+
+For AssumeRole, already-issued valid role credentials retain their own lifetime. Source-file
+rotation is consumed on the next STS acquisition; it is not immediate revocation of an existing
+role session. Environment-backed sources retain their previous operator-lifetime behavior.
+Tests verify live source rotation and malformed-file recovery in one cached signer, direct S3
+publication and file-backed STS acquisition; deployed credential rotation is still an acceptance gate.

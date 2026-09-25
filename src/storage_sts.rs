@@ -61,6 +61,16 @@ impl Config {
         secret: &str,
         token: Option<&str>,
     ) -> Result<ProvideCredentialChain<Credential>, Error> {
+        let mut base = StaticCredentialProvider::new(access, secret);
+        if let Some(token) = token {
+            base = base.with_session_token(token);
+        }
+        self.chain_from_source(base)
+    }
+    pub(crate) fn chain_from_source(
+        &self,
+        base: impl ProvideCredential<Credential = Credential>,
+    ) -> Result<ProvideCredentialChain<Credential>, Error> {
         self.validate()?;
         let transport = Transport::new(self.host()?)?;
         #[cfg(test)]
@@ -69,10 +79,6 @@ impl Config {
             ..transport
         };
         let context = Context::new().with_http_send(transport);
-        let mut base = StaticCredentialProvider::new(access, secret);
-        if let Some(token) = token {
-            base = base.with_session_token(token);
-        }
         let signer = Signer::new(
             Context::new(),
             base,

@@ -34,6 +34,11 @@ providers:
   #     #   session_name: sirius-assets
   #     #   duration_seconds: 3600
   #     #   external_id_env: SIRIUS_STORAGE_EXTERNAL_ID
+  #     # Alternative to all three credential env references below:
+  #     # credentials_file:
+  #     #   path: /run/secrets/sirius-storage-credentials
+  #     #   profile: publisher
+  #     #   refresh_seconds: 60
   #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID
   #     secret_access_key_env: SIRIUS_STORAGE_SECRET_ACCESS_KEY
   #     session_token_env: SIRIUS_STORAGE_SESSION_TOKEN # optional temporary credentials

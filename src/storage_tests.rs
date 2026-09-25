@@ -316,6 +316,7 @@ async fn server() -> Server {
         prefix: "assets".into(),
         public_base_url: None,
         backend: Backend::S3 {
+            credentials_file: None,
             assume_role: None,
             request_payer: false,
             endpoint,
@@ -1403,6 +1404,31 @@ async fn s3_assume_role_publishes_with_temporary_keys_and_bounds_stalled_acquisi
                 test_endpoint: Some(origin),
             }));
         }
+        let credential_root = tempfile::tempdir().unwrap();
+        if !stalled {
+            let file = credential_root.path().join("credentials");
+            std::fs::write(&file, "[default]\naws_access_key_id=synthetic-access\naws_secret_access_key=synthetic-secret\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            if let Backend::S3 {
+                credentials_file,
+                access_key_id_env,
+                secret_access_key_env,
+                ..
+            } = &mut storage.config.providers[0].backend
+            {
+                *credentials_file = Some(Box::new(crate::storage_credentials::Config {
+                    path: file,
+                    profile: "default".into(),
+                    refresh_seconds: 60,
+                }));
+                access_key_id_env.clear();
+                secret_access_key_env.clear();
+            }
+        }
         storage.config.plan(Region::Jp).unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         let (_tx, rx) = watch::channel(false);
@@ -1424,4 +1450,47 @@ async fn s3_assume_role_publishes_with_temporary_keys_and_bounds_stalled_acquisi
         }
         sts_task.abort();
     }
+}
+
+#[tokio::test]
+async fn s3_shared_file_publication_selects_explicit_profile_and_rejects_mixed_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("credentials");
+    std::fs::write(&path, "[unused]\naws_access_key_id=wrong\naws_secret_access_key=wrong\n[publisher]\naws_access_key_id=synthetic-access\naws_secret_access_key=synthetic-secret\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let source = fixture();
+    let mut server = server().await;
+    if let Backend::S3 {
+        credentials_file,
+        access_key_id_env,
+        secret_access_key_env,
+        ..
+    } = &mut server.config.providers[0].backend
+    {
+        *credentials_file = Some(Box::new(crate::storage_credentials::Config {
+            path,
+            profile: "publisher".into(),
+            refresh_seconds: 60,
+        }));
+        access_key_id_env.clear();
+        secret_access_key_env.clear();
+    }
+    let (_tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    if let Backend::S3 {
+        access_key_id_env, ..
+    } = &mut server.config.providers[0].backend
+    {
+        *access_key_id_env = server.env[0].clone();
+    }
+    assert!(server.config.validate().is_err());
 }
