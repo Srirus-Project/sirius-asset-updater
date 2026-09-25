@@ -39,8 +39,8 @@ omits the field. For example, base `https://cdn.example/storage/` with prefix `a
 
 This URL is configured routing information, not proof of anonymous availability. No CDN probe
 or public-access change is performed; configure matching CDN paths and ACL/bucket policies.
-Sirius profiles use explicit provider URLs rather than interpolating Sekai region templates;
-the region is always added to the immutable publication key by the updater. Mutable publication
+Sirius profiles may use the region templates described below. The region is always added to
+the immutable publication key by the updater. Mutable publication
 registries and notifications remain separate restoration work.
 
 ## S3 public-read policy
@@ -143,9 +143,8 @@ and complete a multipart publication against a local fixture; cloud bucket/KMS a
 remains a deployment test.
 
 This restores specific generic options, not arbitrary OpenDAL option passthrough. Endpoint,
-credentials, addressing and ACLs retain their explicit typed fields. Other scalar options and
-region-template migration remain under audit; unsupported fields must fail instead of being
-silently ignored.
+credentials, addressing and ACLs retain their explicit typed fields. Other scalar options remain under audit; unsupported fields fail instead of being silently
+ignored. Supported region-template migration is described below.
 
 
 ### Requester Pays and upload checksums
@@ -168,3 +167,40 @@ failing halfway through a large publication. Other algorithms also fail explicit
 must support CRC32C multipart/checksum semantics; unsupported/denied requests fail rather than
 silently retrying without checksums. Local fixture tests check actual request bodies with an
 independent CRC32C implementation; acceptance against the deployed object store remains required.
+
+
+## Sirius region templates
+
+`{region}` expands to the selected Sirius region (`jp`, `tw`, `en`, `kr`). `{server}` is a
+migration alias with exactly the same meaning. It does not refer to environment, platform,
+UI language, Sekai region names or S3 signing region. CN remains reserved and cannot be planned
+or published. Unknown placeholders and unmatched braces fail configuration.
+
+Templates are supported in provider `prefix`, `public_base_url`, local `backend.directory`,
+and S3 `backend.bucket` / `backend.endpoint`. They are expanded before the existing path, URL,
+bucket and directory-overlap checks. The same resolution function supplies preview and actual
+publication. Configuration validation checks all four operational expansions without accessing
+storage. Preview still creates no directories, performs no network requests and reserves no ID.
+
+For example:
+
+```yaml
+providers:
+  - name: regional-files
+    prefix: assets
+    public_base_url: https://cdn-{region}.example.invalid/
+    backend:
+      type: local
+      directory: ./published/{region}
+```
+
+An EN publication is placed under `./published/en/assets/en/publications/UUID/` and its public
+URL starts with `https://cdn-en.example.invalid/assets/en/publications/UUID/`. The mandatory
+`REGION/publications/UUID` suffix is always appended, even when `prefix` itself contains a region
+template; templates do not disable immutable region isolation or change existing literal paths.
+
+S3 deployments can similarly use `bucket: sirius-{region}`. Credential variable names/values,
+S3 `backend.region`, provider names, ACL regexes and encryption options are not interpolated.
+Keep separate profiles for independent credentials, signing regions or other policies. Resolution
+never silently substitutes credentials from a different region. Public URLs remain declarations
+of CDN routing, not a claim that anonymous access was tested.

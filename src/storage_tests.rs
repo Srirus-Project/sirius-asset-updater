@@ -1001,3 +1001,149 @@ async fn s3_requester_policy_defaults_off_and_denied_readback_preserves_exports(
         .iter()
         .all(|(_, payer)| *payer));
 }
+
+fn fixture_region(region: Region) -> tempfile::TempDir {
+    let source = fixture();
+    let file = source.path().join("summary.json");
+    let mut summary: crate::export::ExportSummary =
+        sonic_rs::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    summary.region = region;
+    summary.platform = region.default_platform().name().into();
+    std::fs::write(file, sonic_rs::to_vec(&summary).unwrap()).unwrap();
+    source
+}
+
+#[tokio::test]
+async fn storage_region_templates_match_preview_and_actual_local_and_s3_publication() {
+    let destination = tempfile::tempdir().unwrap();
+    let mut provider = local(destination.path().join("{region}"));
+    provider.prefix = "release-{server}".into();
+    provider.public_base_url = Some("https://cdn-{region}.example/store/{server}/".into());
+    let local_config = config(provider);
+    local_config.validate().unwrap();
+    let mut server = server().await;
+    if let Backend::S3 { bucket, .. } = &mut server.config.providers[0].backend {
+        *bucket = "sirius-{region}".into();
+    }
+    server.config.providers[0].prefix = "release-{server}".into();
+    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+        let source = fixture_region(region);
+        let preview = local_config.plan(region).unwrap();
+        let directory = destination.path().join(region.name());
+        assert!(
+            !directory.exists(),
+            "preview must not create resolved destination"
+        );
+        let (_tx, rx) = watch::channel(false);
+        let publication = local_config
+            .publish(source.path(), region, rx.clone())
+            .await
+            .unwrap();
+        let target = &publication.providers[0];
+        let prefix = format!("release-{}/{}/publications/", region.name(), region.name());
+        assert!(target.prefix.starts_with(&prefix));
+        assert!(preview.providers[0].prefix.starts_with(&prefix));
+        assert_eq!(
+            target.public_url.as_deref(),
+            Some(
+                format!(
+                    "https://cdn-{}.example/store/{}/{}/",
+                    region.name(),
+                    region.name(),
+                    target.prefix
+                )
+                .as_str()
+            )
+        );
+        assert!(directory
+            .join(&target.prefix)
+            .join("complete.json")
+            .is_file());
+        let published = server
+            .config
+            .publish(source.path(), region, rx)
+            .await
+            .unwrap();
+        let key = format!(
+            "/sirius-{}/{}/complete.json",
+            region.name(),
+            published.providers[0].prefix
+        );
+        assert!(server.state.objects.lock().unwrap().contains_key(&key));
+    }
+    assert!(!destination.path().join("{region}").exists());
+    assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    assert!(local_config.plan(Region::Cn).is_err());
+    let source = fixture();
+    let (_tx, rx) = watch::channel(false);
+    assert!(matches!(
+        local_config.publish(source.path(), Region::Cn, rx).await,
+        Err(Error::ReservedRegion)
+    ));
+    assert!(!destination.path().join("cn").exists());
+}
+
+#[test]
+fn storage_region_templates_validate_resolved_urls_and_reject_unknown_tokens() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(local(root.path().join("{region}")));
+    for value in [
+        "{unknown}",
+        "{REGION}",
+        "{region",
+        "{{region}}",
+        "../{region}",
+    ] {
+        cfg.providers[0].prefix = value.into();
+        assert!(cfg.validate().is_err());
+        assert!(cfg.plan(Region::Jp).is_err());
+    }
+    cfg.providers[0].prefix = "assets".into();
+    for value in [
+        "https://{unknown}.example/",
+        "https://{region}:password@example/",
+        "http://cdn-{region}.example/",
+        "https://cdn.example/?region={region}",
+    ] {
+        cfg.providers[0].public_base_url = Some(value.into());
+        assert!(cfg.validate().is_err());
+    }
+    cfg.providers[0].public_base_url = Some("https://{region}.example/path/{server}/".into());
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.providers[0]
+            .resolved(Region::Kr)
+            .unwrap()
+            .public_base_url
+            .as_deref(),
+        Some("https://kr.example/path/kr/")
+    );
+}
+
+#[tokio::test]
+async fn storage_region_templates_do_not_expand_credentials_or_bypass_overlap_checks() {
+    let source = fixture();
+    let provider = local(source.path().join("{region}"));
+    let cfg = config(provider);
+    let (_tx, rx) = watch::channel(false);
+    assert!(cfg.publish(source.path(), Region::Jp, rx).await.is_err());
+    assert!(!source.path().join("jp").exists());
+    let mut server = server().await;
+    if let Backend::S3 { endpoint, .. } = &mut server.config.providers[0].backend {
+        *endpoint = "https://storage-{region}.example".into();
+    }
+    server.config.validate().unwrap();
+    if let Backend::S3 { endpoint, .. } =
+        &server.config.resolved(Region::En).unwrap().providers[0].backend
+    {
+        assert_eq!(endpoint, "https://storage-en.example");
+    }
+    if let Backend::S3 {
+        access_key_id_env, ..
+    } = &mut server.config.providers[0].backend
+    {
+        *access_key_id_env = "SIRIUS_{region}_STORAGE_KEY".into();
+    }
+    assert!(server.config.validate().is_err());
+    assert!(server.state.objects.lock().unwrap().is_empty());
+}

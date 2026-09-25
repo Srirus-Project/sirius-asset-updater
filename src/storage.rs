@@ -254,7 +254,26 @@ fn storage_error(error: opendal::Error) -> Error {
     }
 }
 impl Config {
+    /// Validate every operational Sirius region without performing storage I/O.
     pub fn validate(&self) -> Result<(), Error> {
+        for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+            self.resolved(region)?.validate_resolved()?;
+        }
+        Ok(())
+    }
+    fn resolved(&self, region: Region) -> Result<Self, Error> {
+        if region == Region::Cn {
+            return Err(Error::ReservedRegion);
+        }
+        let mut resolved = self.clone();
+        resolved.providers = self
+            .providers
+            .iter()
+            .map(|p| p.resolved(region))
+            .collect::<Result<_, _>>()?;
+        Ok(resolved)
+    }
+    fn validate_resolved(&self) -> Result<(), Error> {
         if self.providers.is_empty()
             || self.providers.len() > 16
             || !(1..=32).contains(&self.concurrency)
@@ -339,9 +358,10 @@ impl Config {
         if region == Region::Cn {
             return Err(Error::ReservedRegion);
         }
-        self.validate()?;
+        let resolved = self.resolved(region)?;
+        resolved.validate_resolved()?;
         let id = uuid::Uuid::new_v4().to_string();
-        let providers = self
+        let providers = resolved
             .providers
             .iter()
             .map(|p| p.target(region, &id))
@@ -380,7 +400,8 @@ impl Config {
         if region == Region::Cn {
             return Err(Error::ReservedRegion);
         }
-        self.validate()?;
+        let resolved = self.resolved(region)?;
+        resolved.validate_resolved()?;
         let verified = tokio::select! {
             result = export_verify::prepare(input, region) => result?,
             _ = crate::service::cancelled(&mut stop) => return Err(Error::Cancelled),
@@ -390,7 +411,7 @@ impl Config {
             .map_err(|_| Error::Io)?;
         let id = uuid::Uuid::new_v4().to_string();
         let mut operators = Vec::new();
-        for provider in &self.providers {
+        for provider in &resolved.providers {
             let op = provider.operator(&input)?;
             let policy = provider.public_read_policy()?;
             let public_op = if policy.all || !policy.include.is_empty() {
@@ -724,7 +745,42 @@ async fn check_remote(op: &Operator, key: &str, bytes: u64, hash: &str) -> Resul
     }
     Ok(())
 }
+fn region_template(value: &str, region: Region) -> Result<String, Error> {
+    if value.len() > 4096 {
+        return Err(Error::Config);
+    }
+    let resolved = value
+        .replace("{region}", region.name())
+        .replace("{server}", region.name());
+    if resolved.contains(['{', '}']) {
+        return Err(Error::Config);
+    }
+    Ok(resolved)
+}
 impl Provider {
+    fn resolved(&self, region: Region) -> Result<Self, Error> {
+        let mut value = self.clone();
+        value.prefix = region_template(&self.prefix, region)?;
+        value.public_base_url = self
+            .public_base_url
+            .as_ref()
+            .map(|s| region_template(s, region))
+            .transpose()?;
+        match &mut value.backend {
+            Backend::Local { directory } => {
+                if let Some(text) = directory.to_str() {
+                    *directory = region_template(text, region)?.into();
+                }
+            }
+            Backend::S3 {
+                bucket, endpoint, ..
+            } => {
+                *bucket = region_template(bucket, region)?;
+                *endpoint = region_template(endpoint, region)?;
+            }
+        }
+        Ok(value)
+    }
     fn public_base(&self) -> Result<Option<reqwest::Url>, Error> {
         let Some(value) = &self.public_base_url else {
             return Ok(None);

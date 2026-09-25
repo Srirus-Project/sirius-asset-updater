@@ -1,4 +1,6 @@
 # Profile storage_config points to this file. See docs/STORAGE.md.
+# {region} (alias {server}) expands to jp/tw/en/kr in prefix/public URL/local directory/S3 bucket/endpoint.
+# Example: directory: ./published/{region}; bucket: sirius-{region}. Credentials are never templated.
 providers:
   - name: local
     prefix: assets
