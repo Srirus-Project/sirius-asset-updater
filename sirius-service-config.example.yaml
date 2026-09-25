@@ -2,6 +2,8 @@
 # Relative paths are resolved from the process working directory.
 listen: 127.0.0.1:12345
 token_env: SIRIUS_ASSET_SERVICE_TOKEN
+# Optional case-sensitive client filter; Bearer authentication remains mandatory.
+# user_agent_prefix: "SiriusClient/"
 state_directory: ./service-state
 output_directory: ./service-output
 allow_cancel: true # controls authenticated user cancellation; shutdown/deadlines remain effective

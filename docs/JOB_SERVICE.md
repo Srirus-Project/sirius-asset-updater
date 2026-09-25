@@ -237,3 +237,16 @@ per-target pending counts, attempts, last attempt/acknowledgement times and sani
 plus the number of deliveries whose recipient is no longer configured. Pending events are durable;
 attempt counters/timestamps and retry timers reset on restart. Acknowledged events disappear from
 the outbox. Backlog can eventually reject new affected jobs under the capacity rule above.
+
+### Optional client identification filter
+
+Service `user_agent_prefix` optionally requires a case-sensitive prefix on one valid User-Agent
+header for every protected job/status/notification endpoint. Omit it for the previous behavior.
+The configured prefix must be nonblank printable ASCII and at most256bytes. Missing, malformed,
+duplicate or nonmatching User-Agent headers return401 before job mutation; duplicate Authorization
+headers also fail. A matching User-Agent never replaces the required Bearer token. Restart to apply.
+
+For API-owned jobs set `asset_dispatch.targets[].user_agent` in sirius-api-proxy to a value starting
+with this prefix, for example updater `SiriusClient/` and API target `SiriusClient/api-proxy`.
+Other clients must supply the same header on submissions and polling. The filter is client
+identification only; it is not a secret or a second authentication factor. Health routing is unchanged.

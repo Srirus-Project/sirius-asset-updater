@@ -15,7 +15,8 @@ is not an audit input. Release gates remain in [RESTORATION_1_2.md](RESTORATION_
 | `server.asset_http_version` | Download `network.asset_http_version: auto / http1`; production HTTP/2 support and actual TLS ALPN fixture verification |
 | `server.tls.enabled/cert_file/key_file` | Optional service `tls.certificate_file/private_key_file`, validated before bind; see [LISTENER_TLS.md](LISTENER_TLS.md) |
 | `server.auth.bearer_token` | Required service `token_env`; secret values are not embedded in YAML |
-| `server.auth.enabled`, `server.auth.user_agent_prefix` | No switch to disable job authentication and no User-Agent prefix filter currently. User-Agent is not authentication; configurable prefix filtering remains a genuine behavior difference, not a restored setting. |
+| `server.auth.user_agent_prefix` | Optional service `user_agent_prefix`; case-sensitive header filter in addition to Bearer authentication. API dispatch targets can set `user_agent` for submissions/polls. |
+| `server.auth.enabled` | Job Bearer authentication remains required; disabling it or accepting User-Agent alone is not implemented. This is an explicit behavior difference. |
 
 The original runner maps `server.asset_http_version` into its asset pipeline client in
 `src/core/asset_execution/runner.rs`. Sirius's `src/proxy.rs::cdn_builder` applies the choice

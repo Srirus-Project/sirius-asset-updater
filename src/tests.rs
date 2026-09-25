@@ -1510,6 +1510,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
     let env = format!("SERVICE_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&env, "service-only-token");
     let service = Service::open(ServiceConfig {
+        user_agent_prefix: None,
         allow_cancel: true,
         completion_notifications: vec![],
         logging: None,
@@ -2161,6 +2162,7 @@ async fn check_job_service_media_backend(ffi: bool) {
     let storage = directory.path().join("storage.yaml");
     let destination = directory.path().join("published");
     let config = || ServiceConfig {
+        user_agent_prefix: None,
         allow_cancel: true,
         completion_notifications: vec![],
         logging: None,

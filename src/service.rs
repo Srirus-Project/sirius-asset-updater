@@ -44,6 +44,8 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
     pub token_env: String,
+    #[serde(default)]
+    pub user_agent_prefix: Option<String>,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
     #[serde(default = "workers")]
@@ -127,6 +129,11 @@ impl Service {
         }
         if let Some(tls) = &config.tls {
             tls.validate().map_err(|_| Error::Config)?;
+        }
+        if config.user_agent_prefix.as_ref().is_some_and(|p| {
+            p.trim().is_empty() || p.len() > 256 || !p.bytes().all(|b| (32..=126).contains(&b))
+        }) {
+            return Err(Error::Config);
         }
         if config.profiles.is_empty()
             || config.max_concurrent_jobs == 0
@@ -741,11 +748,29 @@ async fn authorize(
     let expected = format!("Bearer {}", service.inner.token);
     if request
         .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        != Some(expected.as_str())
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .count()
+        != 1
+        || request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            != Some(expected.as_str())
     {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(prefix) = &service.inner.config.user_agent_prefix {
+        let values = request.headers().get_all(header::USER_AGENT);
+        if values.iter().count() != 1
+            || !values
+                .iter()
+                .next()
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|v| v.starts_with(prefix))
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     next.run(request).await
 }
@@ -985,6 +1010,7 @@ mod lifecycle_tests {
             access_log: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             token_env: env,
+            user_agent_prefix: None,
             state_directory: root.path().join("ledger"),
             output_directory: root.path().join("outputs"),
             max_concurrent_jobs: 2,
@@ -1151,6 +1177,122 @@ mod lifecycle_tests {
         assert_eq!(cancelled.status, Status::Cancelled);
         assert!(cancelled.failure.is_none());
         stop(shutdown, worker).await;
+    }
+
+    #[tokio::test]
+    async fn user_agent_filter_requires_bearer_and_never_mutates_jobs_on_rejection() {
+        use tower::ServiceExt;
+        let (_fixture, original) = fixture(30).await;
+        let mut config = original.inner.config.clone();
+        config.user_agent_prefix = Some("SiriusClient/".into());
+        drop(original);
+        let service = Service::open(config.clone()).unwrap();
+        for (token, agents, expected) in [
+            (
+                Some("Bearer synthetic-service-token"),
+                vec!["SiriusClient/1.2"],
+                StatusCode::OK,
+            ),
+            (
+                Some("Bearer synthetic-service-token"),
+                vec!["SiriusClient/"],
+                StatusCode::OK,
+            ),
+            (None, vec!["SiriusClient/1.2"], StatusCode::UNAUTHORIZED),
+            (
+                Some("Bearer wrong"),
+                vec!["SiriusClient/1.2"],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some("Bearer synthetic-service-token"),
+                vec![],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some("Bearer synthetic-service-token"),
+                vec!["siriusclient/1.2"],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some("Bearer synthetic-service-token"),
+                vec!["Other/SiriusClient/"],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some("Bearer synthetic-service-token"),
+                vec!["SiriusClient/1", "SiriusClient/2"],
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder().uri("/api/v1/jobs");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, token);
+            }
+            for agent in agents {
+                request = request.header(header::USER_AGENT, agent);
+            }
+            let response = service
+                .router()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        for duplicate_auth in [false, true] {
+            let mut request = axum::http::Request::builder()
+                .uri("/api/v1/jobs")
+                .header(header::AUTHORIZATION, "Bearer synthetic-service-token");
+            if duplicate_auth {
+                request = request
+                    .header(header::AUTHORIZATION, "Bearer synthetic-service-token")
+                    .header(header::USER_AGENT, "SiriusClient/1");
+            } else {
+                request = request.header(
+                    header::USER_AGENT,
+                    axum::http::HeaderValue::from_bytes(b"SiriusClient/\xff").unwrap(),
+                );
+            }
+            assert_eq!(
+                service
+                    .router()
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/jobs")
+            .header(header::AUTHORIZATION, "Bearer synthetic-service-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"profile":"download","region":"jp","operation":"download"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            service.router().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(service.inner.store.lock().await.list().is_empty());
+        drop(service);
+        for prefix in ["", "  ", "bad\r\nheader", "客户", &"x".repeat(257)] {
+            config.user_agent_prefix = Some(prefix.into());
+            assert!(matches!(Service::open(config.clone()), Err(Error::Config)));
+        }
+        config.user_agent_prefix = None;
+        let service = Service::open(config).unwrap();
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/jobs")
+            .header(header::AUTHORIZATION, "Bearer synthetic-service-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            service.router().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
