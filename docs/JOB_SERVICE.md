@@ -153,3 +153,14 @@ FFmpeg allocations or filesystem cache, so this is **not a hard RSS ceiling**. C
 container/systemd limits for total memory. Zero preserves prior behavior; no arbitrary default
 memory budget is inferred from the host. Budget settings do not change exported content or cache
 identity. Remaining CPU/stage tuning and final production resource acceptance are still required.
+
+## Retained-export verification progress
+
+During `verify_export`, job progress reports the number and bytes of payload files whose hashes
+have been checked, with the expected output-file total from the completed export summary.
+The verifier updates an in-memory snapshot every 256 files and at resource boundaries; the
+service persists the latest counters at most once per second. No filenames or credentials are
+included. The two receipt/index files are not counted as payload files. Reaching the expected
+file count is not completion: journal totals, exact-tree checks and inventory persistence must
+still succeed before the job can become completed. Corruption remains a failed job, and failed
+progress persistence or cancellation stops verification without acknowledging success.

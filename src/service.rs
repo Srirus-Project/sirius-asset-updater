@@ -458,9 +458,26 @@ impl Service {
                 });
                 if summary.retained {
                     self.phase(&job.id, "verify_export").await?;
-                    let report = tokio::select! {
-                        result = crate::export_verify::verify(&output, profile.region) => result?,
-                        _ = cancelled(&mut stop) => return Err(Error::Cancelled),
+                    let (progress_tx, progress_rx) =
+                        watch::channel(crate::export_verify::VerificationProgress::default());
+                    let work = crate::export_verify::verify_with_progress(
+                        &output,
+                        profile.region,
+                        progress_tx,
+                    );
+                    tokio::pin!(work);
+                    let report = loop {
+                        tokio::select! {
+                            result = &mut work => break result?,
+                            _ = cancelled(&mut stop) => return Err(Error::Cancelled),
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                let current = progress_rx.borrow().clone();
+                                self.inner.store.lock().await.progress(&job.id, Progress {
+                                    phase: "verify_export".into(), completed: current.files as u64,
+                                    failed: 0, total: Some(summary.output_files as u64), bytes: current.bytes,
+                                }).map_err(|_| Error::Io)?;
+                            }
+                        }
                     };
                     tokio::fs::write(
                         root.join("export-verification.json"),

@@ -152,7 +152,28 @@ pub async fn verify(directory: &Path, region: Region) -> Result<Report, Error> {
     Ok(prepare(directory, region).await?.report)
 }
 
+#[derive(Clone, Default)]
+pub struct VerificationProgress {
+    pub files: usize,
+    pub bytes: u64,
+}
+pub async fn verify_with_progress(
+    directory: &Path,
+    region: Region,
+    progress: tokio::sync::watch::Sender<VerificationProgress>,
+) -> Result<Report, Error> {
+    Ok(prepare_with_progress(directory, region, Some(progress))
+        .await?
+        .report)
+}
 pub async fn prepare(directory: &Path, region: Region) -> Result<VerifiedExport, Error> {
+    prepare_with_progress(directory, region, None).await
+}
+async fn prepare_with_progress(
+    directory: &Path,
+    region: Region,
+    progress: Option<tokio::sync::watch::Sender<VerificationProgress>>,
+) -> Result<VerifiedExport, Error> {
     if region == Region::Cn {
         return Err(Error::ReservedRegion);
     }
@@ -262,6 +283,11 @@ pub async fn prepare(directory: &Path, region: Region) -> Result<VerifiedExport,
             if files > summary.output_files || bytes > summary.output_bytes {
                 return Err(Error::Verification);
             }
+            if files.is_multiple_of(256) {
+                if let Some(progress) = &progress {
+                    progress.send_replace(VerificationProgress { files, bytes });
+                }
+            }
             *kinds.entry(item.kind).or_default() += 1;
             append(
                 &mut target,
@@ -283,6 +309,9 @@ pub async fn prepare(directory: &Path, region: Region) -> Result<VerifiedExport,
             .checked_add(resource.skipped_objects)
             .ok_or(Error::Verification)?;
         hits += usize::from(resource.cache_hit);
+        if let Some(progress) = &progress {
+            progress.send_replace(VerificationProgress { files, bytes });
+        }
     }
     if directories.len() != summary.succeeded
         || files != summary.output_files
@@ -396,6 +425,23 @@ pub(crate) mod tests {
         )
         .unwrap();
         root
+    }
+    #[tokio::test]
+    async fn verification_progress_counts_only_verified_payloads_and_never_masks_failure() {
+        let root = fixture();
+        let (tx, rx) = tokio::sync::watch::channel(VerificationProgress::default());
+        let report = verify_with_progress(root.path(), Region::Jp, tx)
+            .await
+            .unwrap();
+        assert_eq!(rx.borrow().files, report.files_verified);
+        assert_eq!(rx.borrow().bytes, report.bytes_verified);
+        std::fs::write(root.path().join("00000/payload.bin"), b"corrupted export").unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(VerificationProgress::default());
+        assert!(verify_with_progress(root.path(), Region::Jp, tx)
+            .await
+            .is_err());
+        assert_eq!(rx.borrow().files, 0);
+        assert_eq!(rx.borrow().bytes, 0);
     }
     #[tokio::test]
     async fn complete_inventory_and_scope_are_verified() {
