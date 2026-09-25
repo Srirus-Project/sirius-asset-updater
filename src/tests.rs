@@ -2192,8 +2192,8 @@ async fn check_job_service_media_backend(ffi: bool) {
         std::fs::write(
             &export,
             format!(
-                "{yaml}cpu: {{auto_tune: {}, limit_stages: true, budget_ratio: 0.5, reserved: 1}}\nstage_limits: {{acb: 1, usm: 1, hca: 1, image: 1, audio_encode: 1, video_encode: 1}}\n",
-                round == 1
+                "{yaml}cpu: {{auto_tune: {}, limit_stages: true, budget_ratio: 0.5, reserved: 1, throttle: {{enabled: {}, sample_ms: 50}}}}\nstage_limits: {{acb: 1, usm: 1, hca: 1, image: 1, audio_encode: 1, video_encode: 1}}\n",
+                round == 1, cfg!(unix)
             ),
         )
         .unwrap();

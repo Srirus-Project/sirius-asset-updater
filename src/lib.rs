@@ -627,3 +627,5 @@ mod resource_budget;
 pub mod cpu_policy;
 
 pub mod stage_limits;
+
+pub mod cpu_throttle;

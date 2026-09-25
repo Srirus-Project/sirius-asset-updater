@@ -131,5 +131,40 @@ The job service can additionally set `max_cpu_stages: 8` (1..256, omitted/null d
 to share one pool across all exports, including profiles without a local CPU pool. Both
 limits apply when enabled. These bound admitted stages, not OS thread counts or total CPU
 percent: codecs may use internal threads, and filesystem/cache hashing and runtime overhead
-are outside this pool. CPU-use sampling/throttling remains separate work. OS quotas remain
+are outside this pool. Optional sampled CPU throttling is described below. OS quotas remain
 necessary for strict process-tree CPU isolation.
+
+### Sampled CPU throttling
+
+```yaml
+cpu:
+  budget_ratio: 0.75
+  reserved: 1
+  throttle:
+    enabled: true
+    sample_ms: 250
+```
+
+Throttling defaults off; `sample_ms` accepts 50..60000, default 250. Before starting an
+instrumented CPU stage, the exporter waits while its process-tree usage is at least
+`100 * effective CPU budget` percent (one fully busy core is 100%). It shares the existing
+native admission or media deadline and checks cancellation at most every 20 ms while waiting.
+Sampling is cached process-wide and concurrent samplers are serialized with cancellable lock
+waits. Enabled static local/service CPU slots still apply; this does not silently disable them.
+The process tree includes other export jobs in the same service, so their CPU load can delay a
+profile's work. Different profiles keep their own budget threshold.
+
+Linux reads `/proc` counters for the process and current descendants, matching PID/start-time
+identities between samples. Exited children cannot subtract CPU consumed by surviving processes;
+PID reuse starts a new counter. The initial sample establishes a baseline and admits work.
+Short-lived descendants that exit between samples may be missed. Other Unix systems use bounded
+`/bin/ps` output (`pid`, `ppid`, `%cpu` only); this may be an OS-averaged usage estimate. The
+sampling child has a two-second maximum lifetime within the caller deadline and is always reaped.
+Sampler failures stop the affected operation rather than reporting zero CPU. Windows currently
+rejects enabled throttling at configuration validation; default-disabled operation remains supported.
+
+This is approximate feedback on admission, with possible short bursts. It does not preempt an
+already-running native decoder, change codec thread counts, or enforce a strict CPU percentage.
+Keep OS process-tree quotas for hard isolation. CPU configuration affects scheduling only, not
+export identities or cache keys. Production Linux load-response and final corpus acceptance are
+required before treating a tuning value as measured for Sirius.

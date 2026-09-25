@@ -7,6 +7,7 @@ use serde::Deserialize;
 pub struct Config {
     pub auto_tune: bool,
     pub limit_stages: bool,
+    pub throttle: crate::cpu_throttle::Config,
     pub budget_auto: bool,
     pub budget_ratio: f64,
     pub reserved: usize,
@@ -16,6 +17,7 @@ impl Default for Config {
         Self {
             auto_tune: false,
             limit_stages: false,
+            throttle: Default::default(),
             budget_auto: true,
             budget_ratio: 1.0,
             reserved: 0,
@@ -24,6 +26,7 @@ impl Default for Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Error> {
+        self.throttle.validate()?;
         if !self.budget_ratio.is_finite() || self.budget_ratio <= 0.0 || self.budget_ratio > 1.0 {
             return Err(Error::Config);
         }

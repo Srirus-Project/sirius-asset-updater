@@ -147,7 +147,7 @@ is opt-in through [CPU worker sizing](EXPORT.md#cpu-worker-sizing). Each worker 
 `max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
 assets. Media admission remains separately bounded by `media_concurrency` and the service's
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
-can multiply resource workers across regions. CPU load throttling and automatic sizing of individual stages remain restoration work.
+can multiply resource workers across regions. Sampled CPU throttling is described in [CPU policy](EXPORT.md#sampled-cpu-throttling); automatic sizing of individual stages remains restoration work.
 
 ## Independent decoder stages
 

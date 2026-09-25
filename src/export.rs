@@ -1460,10 +1460,18 @@ impl ExportConfig {
                 .as_ref()
                 .map(|(gate, limit)| gate.acquire(*limit, &self.cancel, deadline))
                 .transpose()?;
+            crate::cpu_throttle::wait(
+                &self.cpu.throttle,
+                self.cpu.budget_for_cpus(self.detected_cpus)?,
+                &self.cancel,
+                deadline,
+            )?;
             Ok((local, shared))
         })();
         result.map_err(|error| match error {
-            Error::Export(_) => Error::Export("CPU stage admission timed out".into()),
+            Error::Export(message) if message == "media process timed out" => {
+                Error::Export("CPU stage admission timed out".into())
+            }
             other => other,
         })
     }

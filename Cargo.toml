@@ -15,10 +15,10 @@ path = "src/main.rs"
 
 [features]
 default = []
-media-ffi = ["dep:rsmpeg", "dep:libc"]
+media-ffi = ["dep:rsmpeg"]
 
 [dependencies]
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 rsmpeg = { version = "=0.18.0", default-features = false, features = ["ffmpeg7_1", "link_system_ffmpeg"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
