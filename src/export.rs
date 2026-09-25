@@ -591,8 +591,24 @@ impl ExportConfig {
         };
         let own_files: std::collections::BTreeSet<_> =
             studio.files().map(|f| f.path().to_string()).collect();
-        // Atlas references are on logical catalog locations, not bundle nodes.
-        if self.selection.class(213) && studio.objects().any(|o| o.class_id() == 213) {
+        // Cross-bundle atlas and streamed media references use catalog dependency closure.
+        if studio.objects().any(|object| {
+            matches!(
+                object.class_id(),
+                213 | unity_rs_core::simple_assets::AUDIO_CLIP_CLASS_ID
+                    | unity_rs_core::simple_assets::VIDEO_CLIP_CLASS_ID
+            ) && self.selection.class(object.class_id())
+                && self
+                    .read_kinds
+                    .for_class(object.class_id())
+                    .is_ok_and(|kind| {
+                        !matches!(
+                            kind,
+                            crate::read_policy::Kind::ObjectRaw
+                                | crate::read_policy::Kind::TypetreeJson
+                        )
+                    })
+        }) {
             if let Some(dependencies) = dependencies.filter(|d| !d.is_empty()) {
                 let mut regions = vec![(
                     path.to_string_lossy().into_owned(),
@@ -689,6 +705,53 @@ impl ExportConfig {
                             self.record(output, &target, "typetree_binary_source", report)?;
                         }
                     }
+                    return Ok(());
+                }
+                use unity_rs_core::simple_assets::{
+                    SimpleAssetReadLimits, AUDIO_CLIP_CLASS_ID, MOVIE_TEXTURE_CLASS_ID,
+                    VIDEO_CLIP_CLASS_ID,
+                };
+                if matches!(
+                    object.class_id(),
+                    AUDIO_CLIP_CLASS_ID | VIDEO_CLIP_CLASS_ID | MOVIE_TEXTURE_CLASS_ID
+                ) {
+                    let cpu = self.acquire_cpu(self.cpu_deadline())?;
+                    let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
+                    let limits = SimpleAssetReadLimits {
+                        maximum_payload_bytes: limit,
+                        ..Default::default()
+                    };
+                    let (payload, extension, kind) = if object.class_id() == AUDIO_CLIP_CLASS_ID {
+                        let asset = object.read_audio_clip(limits).map_err(err)?;
+                        (asset.payload, asset.raw_extension, "audio_raw")
+                    } else {
+                        let asset = if object.class_id() == VIDEO_CLIP_CLASS_ID {
+                            object.read_video_clip(limits).map_err(err)?
+                        } else {
+                            object.read_movie_texture(limits).map_err(err)?
+                        };
+                        (asset.payload, asset.suggested_extension, asset.payload_kind)
+                    };
+                    let suffix = extension
+                        .strip_prefix('.')
+                        .filter(|suffix| {
+                            !suffix.is_empty()
+                                && suffix.len() <= 16
+                                && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+                        })
+                        .ok_or(Error::AssetPath)?;
+                    let bytes = payload.read_to_vec(limit).map_err(err)?;
+                    drop(cpu);
+                    let prior: u64 = report.outputs.iter().map(|o| o.bytes).sum();
+                    if prior.saturating_add(bytes.len() as u64) > self.max_resource_output_bytes {
+                        return Err(Error::Size);
+                    }
+                    if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(Error::Cancelled);
+                    }
+                    let target = output.join(format!("{stem}.{suffix}"));
+                    fs::write(&target, bytes).map_err(err)?;
+                    self.record(output, &target, kind, report)?;
                     return Ok(());
                 }
                 let image_stage = if matches!(object.class_id(), 28 | 213) {
@@ -2733,6 +2796,236 @@ pub(crate) mod tests {
         bytes.extend(body);
         (bytes, pixels)
     }
+    // Synthetic named-object records; payloads are opaque markers, not playable media.
+    fn synthetic_unity_media(
+        class: i32,
+        external: bool,
+        hostile: bool,
+        modern_movie: bool,
+    ) -> (Vec<u8>, Vec<u8>) {
+        fn int(out: &mut Vec<u8>, n: i32) {
+            out.extend(n.to_le_bytes());
+        }
+        fn string(out: &mut Vec<u8>, s: &str) {
+            int(out, s.len() as i32);
+            out.extend(s.as_bytes());
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+        }
+        let payload = b"synthetic-encoded-media-payload".to_vec();
+        let mut body = Vec::new();
+        string(&mut body, "../../unsafe-name");
+        let version = if class == 152 && !modern_movie {
+            "2018.4.0f1"
+        } else {
+            "2022.3.62f1"
+        };
+        if class == 152 {
+            body.extend([0; 8]); // texture fallback block, aligned
+            body.extend([1, 0, 0, 0]);
+            body.extend([0; 12]); // loop, null AudioClip PPtr
+            int(&mut body, payload.len() as i32);
+            body.extend(&payload);
+        } else {
+            if class == 83 {
+                for n in [1, 1, 48000, 16, 0, 0, 0] {
+                    int(&mut body, n);
+                }
+                body.extend([1, 0, 1, 0]);
+            } else {
+                string(
+                    &mut body,
+                    if hostile {
+                        "../../source.bad;name"
+                    } else {
+                        "../../source.mp4"
+                    },
+                );
+                for n in [0, 0, 16, 16, 1, 1] {
+                    int(&mut body, n);
+                }
+                body.extend(30_f64.to_le_bytes());
+                body.extend(1_u64.to_le_bytes());
+                for _ in 0..5 {
+                    int(&mut body, 0);
+                } // format and four empty arrays
+            }
+            string(&mut body, if external { "media.resS" } else { "" });
+            body.extend((if external { 2_u64 } else { 0 }).to_le_bytes());
+            body.extend((payload.len() as u64).to_le_bytes());
+            if class == 83 {
+                int(&mut body, 1);
+            } else {
+                body.extend([0, 1]);
+            }
+            if !external {
+                body.extend(&payload);
+            }
+        }
+        let mut metadata = version.as_bytes().to_vec();
+        metadata.push(0);
+        int(&mut metadata, 13);
+        metadata.push(0);
+        int(&mut metadata, 1);
+        int(&mut metadata, class);
+        metadata.push(0);
+        metadata.extend((-1_i16).to_le_bytes());
+        metadata.extend([0; 16]);
+        int(&mut metadata, 1);
+        while !(metadata.len() + 48).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend(29_i64.to_le_bytes());
+        metadata.extend(0_i64.to_le_bytes());
+        for n in [body.len() as i32, 0, 0, 0, 0] {
+            int(&mut metadata, n);
+        }
+        metadata.push(0);
+        let offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut file = vec![0; 48];
+        file[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        file[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        file[24..32].copy_from_slice(&((offset + body.len()) as u64).to_be_bytes());
+        file[32..40].copy_from_slice(&(offset as u64).to_be_bytes());
+        file.extend(metadata);
+        file.resize(offset, 0);
+        file.extend(body);
+        (file, payload)
+    }
+    #[test]
+    fn unity_media_extracts_inline_and_dependency_payloads_with_safe_object_names() {
+        for (class, extension, kind, mode) in [
+            (83, "fsb", "audio_raw", "audio"),
+            (329, "mp4", "video_raw", "video"),
+            (152, "ogv", "movie_ogv", "video"),
+        ] {
+            for external in [false, true]
+                .into_iter()
+                .filter(|external| class != 152 || !external)
+            {
+                let root = tempfile::tempdir().unwrap();
+                let input = root.path().join("input");
+                fs::create_dir_all(input.join("assets")).unwrap();
+                let (file, payload) = synthetic_unity_media(class, external, false, false);
+                fs::write(input.join("assets/media.assets"), &file).unwrap();
+                let asset = crate::update::AssetReceipt {
+                    relative_path: "media.assets".into(),
+                    provider: Provider::UnityBundle,
+                    bytes: file.len() as u64,
+                    downloaded_sha256: hex::encode(Sha256::digest(&file)),
+                    stored_sha256: hex::encode(Sha256::digest(&file)),
+                    decrypted: false,
+                };
+                let mut cfg = config(root.path());
+                cfg.retain_outputs = true;
+                if external {
+                    let missing = root.path().join("missing");
+                    fs::create_dir(&missing).unwrap();
+                    let report = cfg
+                        .process_resource(&input, &missing, &asset, 0, 0, None)
+                        .unwrap();
+                    assert!(!report.errors.is_empty());
+                    assert!(report.outputs.is_empty());
+                    assert_eq!(fs::read_dir(&missing).unwrap().count(), 0);
+                    // Raw object mode does not require its referenced media stream.
+                    cfg.read_kinds.default = crate::read_policy::Kind::ObjectRaw;
+                    let raw = root.path().join("raw");
+                    fs::create_dir(&raw).unwrap();
+                    let report = cfg
+                        .process_resource(&input, &raw, &asset, 0, 0, None)
+                        .unwrap();
+                    assert!(report.errors.is_empty());
+                    assert_eq!(report.outputs[0].kind, "raw_object");
+                    cfg.read_kinds = Default::default();
+                    fs::write(
+                        input.join("assets/media.resS"),
+                        [vec![0xaa, 0xbb], payload.clone()].concat(),
+                    )
+                    .unwrap();
+                }
+                let dependencies = std::collections::BTreeSet::from(["media.resS".into()]);
+                for policy in ["auto", mode] {
+                    cfg.read_kinds =
+                        yaml_serde::from_str(&format!("classes: {{{class}: {policy}}}")).unwrap();
+                    cfg.read_kinds.validate().unwrap();
+                    let out = root.path().join(policy);
+                    fs::create_dir(&out).unwrap();
+                    let report = cfg
+                        .process_resource(
+                            &input,
+                            &out,
+                            &asset,
+                            0,
+                            0,
+                            external.then_some(&dependencies),
+                        )
+                        .unwrap();
+                    assert!(
+                        report.errors.is_empty(),
+                        "{class} external={external}: {:?}",
+                        report.errors
+                    );
+                    assert_eq!(report.outputs.len(), 1);
+                    let record = &report.outputs[0];
+                    assert_eq!(record.kind, kind);
+                    assert_eq!(record.path, format!("0_29.{extension}"));
+                    assert_eq!(record.object.as_ref().unwrap().class_id, class);
+                    assert_eq!(record.sha256, hex::encode(Sha256::digest(&payload)));
+                    assert_eq!(
+                        fs::read(out.join("00000").join(&record.path)).unwrap(),
+                        payload
+                    );
+                }
+                cfg.max_resource_output_bytes = payload.len() as u64 - 1;
+                let out = root.path().join("limited");
+                fs::create_dir(&out).unwrap();
+                let report = cfg
+                    .process_resource(
+                        &input,
+                        &out,
+                        &asset,
+                        0,
+                        0,
+                        external.then_some(&dependencies),
+                    )
+                    .unwrap();
+                assert!(!report.errors.is_empty());
+                assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+                if external {
+                    cfg.max_resource_output_bytes = 1024 * 1024;
+                    fs::write(input.join("assets/media.resS"), [0xaa, 0xbb]).unwrap();
+                    let truncated = root.path().join("truncated");
+                    fs::create_dir(&truncated).unwrap();
+                    let report = cfg
+                        .process_resource(&input, &truncated, &asset, 0, 0, Some(&dependencies))
+                        .unwrap();
+                    assert!(!report.errors.is_empty());
+                    assert!(report.outputs.is_empty());
+                    assert_eq!(fs::read_dir(truncated).unwrap().count(), 0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn unity_media_rejects_unsafe_extensions_and_unsupported_modern_movie_layout() {
+        for (class, hostile, modern) in [(329, true, false), (152, false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (file, _) = synthetic_unity_media(class, false, hostile, modern);
+            let input = root.path().join("media.assets");
+            fs::write(&input, file).unwrap();
+            let out = root.path().join("outputs");
+            fs::create_dir(&out).unwrap();
+            let cfg = config(root.path());
+            let mut report = ResourceReport::default();
+            cfg.unity(&input, &out, 0, &mut report, None, root.path())
+                .unwrap();
+            assert!(!report.errors.is_empty());
+            assert!(report.outputs.is_empty());
+            assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn raw_representation_exports_exact_object_bytes_and_explicit_json_never_falls_back() {
         let root = tempfile::tempdir().unwrap();

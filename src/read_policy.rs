@@ -11,6 +11,8 @@ pub enum Kind {
     ObjectRaw,
     TypetreeJson,
     Image,
+    Audio,
+    Video,
     TextBytes,
     Font,
     Shader,
@@ -21,6 +23,12 @@ impl Kind {
         match self {
             Self::Auto | Self::ObjectRaw | Self::TypetreeJson => class > 0,
             Self::Image => matches!(class, 28 | 213),
+            Self::Audio => class == unity_rs_core::simple_assets::AUDIO_CLIP_CLASS_ID,
+            Self::Video => matches!(
+                class,
+                unity_rs_core::simple_assets::VIDEO_CLIP_CLASS_ID
+                    | unity_rs_core::simple_assets::MOVIE_TEXTURE_CLASS_ID
+            ),
             Self::TextBytes => class == 49,
             Self::Font => class == 128,
             Self::Shader => class == 48,

@@ -54,6 +54,8 @@ validation. An incompatible default for an encountered object fails that resourc
 | `object_raw` | All positive IDs | Exact serialized object bytes as `.object.bin` |
 | `typetree_json` | All positive IDs with readable type trees | Explicit JSON; opaque TypelessData also retains backing object bytes |
 | `image` | 28 Texture2D, 213 Sprite | Configured image rendition(s) |
+| `audio` | 83 AudioClip | Original encoded audio payload |
+| `video` | 329 VideoClip, 152 legacy MovieTexture | Original encoded video payload |
 | `text_bytes` | 49 TextAsset | TextAsset byte payload |
 | `font` | 128 Font | Native font payload |
 | `shader` | 48 Shader | Shader text; unsupported text extraction fails |
@@ -73,10 +75,31 @@ policy or a non-auto policy claiming full native export. Legacy summaries withou
 the default auto policy. Every output still carries object identity and participates in hashes,
 resource limits, staging and publication verification.
 
-This restores general representation control and the native modes listed above. Generic Unity
-AudioClip, VideoClip/MovieTexture, Texture2DArray/archive, animator and other original dispatch
-modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
+This restores general representation control and the native modes listed above. Texture2DArray/
+archive, animator and other original dispatch modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
 accepted as an unimplemented placeholder.
+
+## Unity media payloads
+
+`auto` and the explicit `audio`/`video` modes extract AudioClip, VideoClip and legacy MovieTexture
+payloads through the native Unity reader. Inline payloads and catalog-scoped streamed dependencies
+are supported. Missing or truncated external resources fail the resource; there is no HTTP lookup
+or arbitrary source-path fetch. `object_raw` still exports the serialized object and does not
+resolve its media stream. Type-tree mode remains separate.
+
+Payload bytes are preserved exactly. The Unity `audio_raw`, `video_raw` and `movie_ogv` journal
+kinds describe extraction, not transcoding or a successful codec decode. The configured CRI audio
+and USM video conversion formats do not apply to these Unity payloads. Audio extensions come from
+Unity codec metadata; VideoClip extensions come from the original filename's suffix. Only a
+single leading dot plus 1–16 ASCII alphanumeric characters is accepted. Output stems always use
+file/object IDs, never the source name/path. File counts, hashes, object identity and aggregate
+resource limits apply normally; failed extraction cannot publish a partial resource.
+
+MovieTexture extraction is limited to pre-2019.3 layouts carrying `m_MovieData`; modern layouts
+without that payload fail explicitly. Synthetic tests verify serialized layouts and exact opaque
+payload bytes, dependency resolution, bounds and publication safety. They do not establish playable
+codec coverage for every Unity AudioClip/VideoClip format; final game-corpus acceptance remains
+required.
 
 ## Image output
 

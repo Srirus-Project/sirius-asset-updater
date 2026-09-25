@@ -18,3 +18,10 @@ publication; optional independent decoding uses a separately installed FFmpeg.
 two-node type tree, synthetic class ID12345 and one integer value42. It tests explicit JSON
 representation without depending on a game class or a built-in object layout. Raw-mode tests
 compare exact serialized object bytes from the generated Texture2D fixture against export output.
+
+`synthetic_unity_media()` builds v22 serialized AudioClip (Unity2022.3), VideoClip (Unity2022.3)
+and legacy MovieTexture (Unity2018.4) objects. Payloads are deterministic opaque markers, not
+playable or game-derived media. External fixtures use a generated `media.resS` with a two-byte
+prefix and a known bounded region. Tests prove byte-preserving extraction and dependency/path/
+size behavior, not codec support. A modern MovieTexture layout and hostile filename suffix are
+negative inputs. Field ordering is cross-checked with unity-rs-core0.5.1's native readers.

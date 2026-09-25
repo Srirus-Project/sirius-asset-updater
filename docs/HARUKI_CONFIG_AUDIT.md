@@ -76,8 +76,11 @@ not dismissed as Sekai-specific merely because the current implementation is sma
   modes and existing image/TextAsset/font/shader/OBJ adapters are connected and tested; summaries,
   cache identities and full-export claims account for representation changes. Original raw's
   class-specific media/font payload semantics are not mislabeled as full object bytes. Remaining
-  AudioClip, VideoClip/MovieTexture, Texture2DArray/archive and animator dispatch still need
-  individual source/fixture applicability review; configuration rejects unimplemented modes.
+  Texture2DArray/archive and animator dispatch still need individual source/fixture applicability
+  review; configuration rejects unimplemented modes. AudioClip/VideoClip/legacy MovieTexture
+  now preserve native encoded payloads, including catalog dependencies, with actual serialized
+  fixture tests for inline/external data, safe naming, missing/truncated references and bounds.
+  This is payload extraction, not universal codec decoding/transcoding.
 - `regions.*.export.raw_bundles`: independently audit filtered raw-bundle publication and paths;
   retaining downloaded inputs alone does not prove equivalent export/publication behavior.
 - Complete field-by-field logging, environment override, region-path, export-stage and upload
