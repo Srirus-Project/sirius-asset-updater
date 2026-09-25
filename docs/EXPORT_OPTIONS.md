@@ -147,7 +147,7 @@ is opt-in through [CPU worker sizing](EXPORT.md#cpu-worker-sizing). Each worker 
 `max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
 assets. Media admission remains separately bounded by `media_concurrency` and the service's
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
-can multiply resource workers across regions. CPU load throttling and separate audio/video encoder widths remain restoration work.
+can multiply resource workers across regions. CPU load throttling and automatic sizing of individual stages remain restoration work.
 
 ## Independent decoder stages
 
@@ -159,6 +159,8 @@ stage_limits:
   usm: 1
   hca: 4
   image: 4
+  audio_encode: 2
+  video_encode: 1
   wait_timeout_seconds: 3600
 ```
 
@@ -176,3 +178,12 @@ itself. Waiting still occupies a resource worker, so these controls do not guara
 ordering. They do not impose a memory ceiling or widen automatically with CPU tuning. Decode-cache
 hits bypass these stages; scheduling controls do not change cache identity. Limits are per export,
 with existing shared service media and byte budgets still applying across jobs.
+
+`audio_encode` limits FLAC/MP3 conversions and `video_encode` limits MP4 conversions.
+Both apply to CLI, FFI and Auto; Auto holds its encoding slot across FFI failure and CLI
+fallback. Encoding slots are acquired before the existing local/shared media slots, and
+all waits and attempts share the original `media_timeout_seconds` deadline. The stage wait
+limit may shorten admission but never extends the media deadline. Stream-copy remuxing,
+ADX decoding and independent output verification remain under the general media gate; they
+do not acquire an encoding slot. These are per-export caps, with no change to default output
+formats or decoded-cache identity.

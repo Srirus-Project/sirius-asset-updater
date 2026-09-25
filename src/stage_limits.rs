@@ -15,6 +15,8 @@ pub struct Config {
     pub usm: Option<usize>,
     pub hca: Option<usize>,
     pub image: Option<usize>,
+    pub audio_encode: Option<usize>,
+    pub video_encode: Option<usize>,
     pub wait_timeout_seconds: u64,
 }
 impl Default for Config {
@@ -24,16 +26,25 @@ impl Default for Config {
             usm: None,
             hca: None,
             image: None,
+            audio_encode: None,
+            video_encode: None,
             wait_timeout_seconds: 3600,
         }
     }
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Error> {
-        if [self.acb, self.usm, self.hca, self.image]
-            .into_iter()
-            .flatten()
-            .any(|n| !(1..=64).contains(&n))
+        if [
+            self.acb,
+            self.usm,
+            self.hca,
+            self.image,
+            self.audio_encode,
+            self.video_encode,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|n| !(1..=64).contains(&n))
             || !(1..=3600).contains(&self.wait_timeout_seconds)
         {
             return Err(Error::Config);
@@ -47,6 +58,8 @@ pub(crate) enum Stage {
     Usm,
     Hca,
     Image,
+    AudioEncode,
+    VideoEncode,
 }
 #[derive(Default)]
 pub(crate) struct Gates {
@@ -54,6 +67,8 @@ pub(crate) struct Gates {
     usm: Gate,
     hca: Gate,
     image: Gate,
+    audio_encode: Gate,
+    video_encode: Gate,
 }
 impl Gates {
     pub(crate) fn acquire(
@@ -61,6 +76,20 @@ impl Gates {
         config: &Config,
         stage: Stage,
         cancel: &AtomicBool,
+    ) -> Result<Option<Permit<'_>>, Error> {
+        self.acquire_until(
+            config,
+            stage,
+            cancel,
+            Instant::now() + Duration::from_secs(config.wait_timeout_seconds),
+        )
+    }
+    pub(crate) fn acquire_until(
+        &self,
+        config: &Config,
+        stage: Stage,
+        cancel: &AtomicBool,
+        deadline: Instant,
     ) -> Result<Option<Permit<'_>>, Error> {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
@@ -70,13 +99,15 @@ impl Gates {
             Stage::Usm => (&self.usm, config.usm),
             Stage::Hca => (&self.hca, config.hca),
             Stage::Image => (&self.image, config.image),
+            Stage::AudioEncode => (&self.audio_encode, config.audio_encode),
+            Stage::VideoEncode => (&self.video_encode, config.video_encode),
         };
         limit
             .map(|limit| {
                 gate.acquire(
                     limit,
                     cancel,
-                    Instant::now() + Duration::from_secs(config.wait_timeout_seconds),
+                    deadline.min(Instant::now() + Duration::from_secs(config.wait_timeout_seconds)),
                 )
                 .map_err(|error| match error {
                     Error::Export(_) => Error::Export("decoder stage admission timed out".into()),
@@ -107,7 +138,7 @@ mod tests {
         ));
         drop(held);
         assert!(gates.acquire(&cfg, Stage::Image, &cancel).is_ok());
-        for field in ["acb", "usm", "hca", "image"] {
+        for field in ["acb", "usm", "hca", "image", "audio_encode", "video_encode"] {
             for value in [0, 65] {
                 let cfg: Config = yaml_serde::from_str(&format!("{field}: {value}")).unwrap();
                 assert!(cfg.validate().is_err());

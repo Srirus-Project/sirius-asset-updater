@@ -1333,6 +1333,16 @@ impl ExportConfig {
         if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        let stage = match encoding {
+            crate::media_backend::Encoding::Flac | crate::media_backend::Encoding::Mp3 => {
+                crate::stage_limits::Stage::AudioEncode
+            }
+            crate::media_backend::Encoding::Mp4 => crate::stage_limits::Stage::VideoEncode,
+        };
+        // Keep this slot across an Auto fallback; all admission and attempts share one deadline.
+        let _encoding =
+            self.stage_gates
+                .acquire_until(&self.stage_limits, stage, &self.cancel, deadline)?;
         if self.media_backend == Backend::Cli {
             return self.ffmpeg_deadline(cli_args, deadline);
         }
@@ -1950,6 +1960,7 @@ pub(crate) mod tests {
         use crate::export_options::VideoExport;
         let directory = tempfile::tempdir().unwrap();
         let mut cfg = config(directory.path());
+        cfg.stage_limits.video_encode = Some(1);
         cfg.media_backend = backend;
         cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
         let source = directory.path().join("source.mkv");
@@ -2951,6 +2962,80 @@ pub(crate) mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn encoder_stage_deadlines_prevent_spawn_and_recover_without_cross_stage_blocking() {
+        use crate::{media_backend::Encoding, stage_limits::Stage};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.stage_limits.audio_encode = Some(1);
+        cfg.stage_limits.video_encode = Some(1);
+        cfg.media_timeout_seconds = 1;
+        cfg.ffmpeg = root.path().join("encoder");
+        fs::write(
+            &cfg.ffmpeg,
+            "#!/bin/sh\nfor target do :; done\nprintf started > \"$target\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cfg.ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.path().join("started");
+        let input = root.path().join("input");
+        let output = root.path().join("output");
+        for (encoding, stage) in [
+            (Encoding::Flac, Stage::AudioEncode),
+            (Encoding::Mp3, Stage::AudioEncode),
+            (Encoding::Mp4, Stage::VideoEncode),
+        ] {
+            cfg.media_timeout_seconds = 1;
+            let permit = cfg
+                .stage_gates
+                .acquire(&cfg.stage_limits, stage, &cfg.cancel)
+                .unwrap();
+            let started = std::time::Instant::now();
+            assert!(cfg
+                .encode_media(
+                    encoding,
+                    &input,
+                    &output,
+                    &[marker.clone().into_os_string()]
+                )
+                .is_err());
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            assert!(!marker.exists());
+            cfg.media_timeout_seconds = 5;
+            let other = if matches!(stage, Stage::AudioEncode) {
+                Encoding::Mp4
+            } else {
+                Encoding::Flac
+            };
+            cfg.encode_media(other, &input, &output, &[marker.clone().into_os_string()])
+                .unwrap();
+            fs::remove_file(&marker).unwrap();
+            cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(matches!(
+                cfg.encode_media(
+                    encoding,
+                    &input,
+                    &output,
+                    &[marker.clone().into_os_string()]
+                ),
+                Err(Error::Cancelled)
+            ));
+            assert!(!marker.exists());
+            cfg.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            drop(permit);
+            cfg.encode_media(
+                encoding,
+                &input,
+                &output,
+                &[marker.clone().into_os_string()],
+            )
+            .unwrap();
+            fs::remove_file(&marker).unwrap();
+        }
+    }
     #[test]
     fn acb_and_hca_stage_waits_cancel_before_output_and_release_nested_permits() {
         for stage in [
