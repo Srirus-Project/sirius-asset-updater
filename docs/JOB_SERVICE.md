@@ -96,3 +96,18 @@ All destinations must pass upload/read-back before optional local export cleanup
 This is an implementation milestone, not the complete 1.2.0 platform restoration. Additional publication,
 stage tuning, version-trigger integration and remaining acceptance requirements
 are tracked separately in RESTORATION_1_2.md. Do not publish 1.2.0 from this milestone alone.
+
+## Shared media budget
+
+`max_media_processes` bounds active media work across every job of this service (default 4,
+range 1..16). Each export also retains its own `media_concurrency` limit. Both limits must be
+acquired before starting FFmpeg or an FFI conversion. This includes media decode, mux, encoding
+and independent media verification calls routed through the exporter. Waiting for either slot
+consumes the same operation deadline and checks cancellation; failed admission releases any
+already-held local slot. Auto backend fallback releases the FFI slot before reacquiring for CLI.
+Standalone CLI exports retain their existing per-export limit without a service-level cap.
+
+This controls simultaneous operations, not FFmpeg's internal thread count or total process RSS.
+Apply deployment CPU/memory limits separately. Shared download/upload/memory admission and the
+remaining original resource tuning controls are separate restoration work. The service budget
+does not change cache identity or output formats.

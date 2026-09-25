@@ -5,6 +5,8 @@ token_env: SIRIUS_ASSET_SERVICE_TOKEN
 state_directory: ./service-state
 output_directory: ./service-output
 max_concurrent_jobs: 4
+# Shared across every export job; CLI children and FFI conversions use the same slots.
+max_media_processes: 4 # range: 1..16; each export also keeps its media_concurrency limit
 max_queued_jobs: 64
 retain_terminal_jobs: 256
 timeout_seconds: 3600

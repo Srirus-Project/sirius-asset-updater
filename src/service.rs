@@ -44,6 +44,8 @@ pub struct ServiceConfig {
     pub output_directory: PathBuf,
     #[serde(default = "workers")]
     pub max_concurrent_jobs: usize,
+    #[serde(default = "workers")]
+    pub max_media_processes: usize,
     #[serde(default = "queued")]
     pub max_queued_jobs: usize,
     #[serde(default = "retained")]
@@ -94,6 +96,7 @@ struct Inner {
     store: Mutex<JobStore>,
     wake: Notify,
     accepting: AtomicBool,
+    media_gate: Arc<crate::media_gate::Gate>,
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
@@ -106,6 +109,7 @@ impl Service {
         if config.profiles.is_empty()
             || config.max_concurrent_jobs == 0
             || config.max_concurrent_jobs > 64
+            || !(1..=16).contains(&config.max_media_processes)
             || config.max_queued_jobs == 0
             || config.timeout_seconds == 0
         {
@@ -174,6 +178,7 @@ impl Service {
                 store: Mutex::new(store),
                 wake: Notify::new(),
                 accepting: AtomicBool::new(true),
+                media_gate: Arc::default(),
             }),
         })
     }
@@ -381,6 +386,10 @@ impl Service {
                 {
                     return Err(Error::Config);
                 }
+                export.set_service_media_gate(
+                    self.inner.media_gate.clone(),
+                    self.inner.config.max_media_processes,
+                );
                 export.input = input;
                 export.output = root.join("exports");
                 let output = export.output.clone();
@@ -750,6 +759,7 @@ mod lifecycle_tests {
             state_directory: root.path().join("ledger"),
             output_directory: root.path().join("outputs"),
             max_concurrent_jobs: 2,
+            max_media_processes: 4,
             max_queued_jobs: 8,
             retain_terminal_jobs: 20,
             timeout_seconds,

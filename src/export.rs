@@ -51,6 +51,8 @@ pub struct ExportConfig {
     pub media_concurrency: usize,
     #[serde(skip)]
     media_gate: std::sync::Arc<crate::media_gate::Gate>,
+    #[serde(skip)]
+    service_media_gate: Option<(std::sync::Arc<crate::media_gate::Gate>, usize)>,
     #[serde(default = "media_timeout")]
     pub media_timeout_seconds: u64,
     #[serde(skip)]
@@ -1266,9 +1268,7 @@ impl ExportConfig {
         #[cfg(feature = "media-ffi")]
         {
             let result = {
-                let _permit =
-                    self.media_gate
-                        .acquire(self.media_concurrency, &self.cancel, deadline)?;
+                let _permit = self.acquire_media(deadline)?;
                 crate::media_ffi::controlled(self.cancel.clone(), deadline, || match encoding {
                     crate::media_backend::Encoding::Flac => {
                         crate::media_ffi::convert_wav_to_flac(input, output)
@@ -1316,6 +1316,33 @@ impl ExportConfig {
         );
         self.ffmpeg_deadline(cli_args, deadline)
     }
+    pub(crate) fn set_service_media_gate(
+        &mut self,
+        gate: std::sync::Arc<crate::media_gate::Gate>,
+        limit: usize,
+    ) {
+        self.service_media_gate = Some((gate, limit));
+    }
+    fn acquire_media(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<
+        (
+            crate::media_gate::Permit<'_>,
+            Option<crate::media_gate::Permit<'_>>,
+        ),
+        Error,
+    > {
+        let local = self
+            .media_gate
+            .acquire(self.media_concurrency, &self.cancel, deadline)?;
+        let shared = self
+            .service_media_gate
+            .as_ref()
+            .map(|(gate, limit)| gate.acquire(*limit, &self.cancel, deadline))
+            .transpose()?;
+        Ok((local, shared))
+    }
     fn ffmpeg(&self, args: &[std::ffi::OsString]) -> Result<(), Error> {
         self.ffmpeg_deadline(
             args,
@@ -1327,9 +1354,7 @@ impl ExportConfig {
         args: &[std::ffi::OsString],
         deadline: std::time::Instant,
     ) -> Result<(), Error> {
-        let _permit = self
-            .media_gate
-            .acquire(self.media_concurrency, &self.cancel, deadline)?;
+        let _permit = self.acquire_media(deadline)?;
         let stderr = tempfile::tempfile().map_err(err)?;
         let mut child = Command::new(&self.ffmpeg)
             .env_remove(&self.cri_key_env)
@@ -1662,6 +1687,7 @@ pub(crate) mod tests {
             concurrency: 1,
             media_concurrency: 2,
             media_gate: Default::default(),
+            service_media_gate: None,
             media_timeout_seconds: 120,
             cancel: Default::default(),
             ffmpeg: "unused".into(),
@@ -2162,6 +2188,83 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn service_media_gate_bounds_independent_exports_and_releases_cancelled_waiters() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{atomic::Ordering, Arc};
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("shared-media-fixture");
+        let log = directory.path().join("shared-events");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho start >> '{}'\nsleep 0.05\necho end >> '{}'\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = Arc::new(crate::media_gate::Gate::default());
+        let configs: Vec<_> = (0..2)
+            .map(|_| {
+                let mut cfg = config(directory.path());
+                cfg.ffmpeg = script.clone();
+                cfg.media_concurrency = 4;
+                cfg.set_service_media_gate(shared.clone(), 1);
+                Arc::new(cfg)
+            })
+            .collect();
+        assert!(!Arc::ptr_eq(&configs[0].media_gate, &configs[1].media_gate));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let cfg = configs[index % 2].clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cfg.ffmpeg(&[])
+                })
+            })
+            .collect();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let events = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            ["start", "end"].repeat(8)
+        );
+        fs::remove_file(&log).unwrap();
+        let hold = shared
+            .acquire(
+                1,
+                &configs[0].cancel,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let cfg = configs[1].clone();
+        let waiter = std::thread::spawn(move || cfg.ffmpeg(&[]));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        configs[1].cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(waiter.join().unwrap(), Err(Error::Cancelled)));
+        assert!(!log.exists());
+        // Deadline while waiting for the service gate also releases the local slot.
+        configs[1].cancel.store(false, Ordering::Relaxed);
+        assert!(configs[1]
+            .ffmpeg_deadline(
+                &[],
+                std::time::Instant::now() + std::time::Duration::from_millis(30)
+            )
+            .is_err());
+        assert!(!log.exists());
+        drop(hold);
+        configs[1].ffmpeg(&[]).unwrap();
+        assert_eq!(fs::read_to_string(log).unwrap(), "start\nend\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn media_process_gate_bounds_children_and_cancels_or_times_out_before_spawn() {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::Ordering;
@@ -2463,19 +2566,27 @@ pub(crate) mod tests {
             .unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             cfg.ffmpeg = executable;
-            cfg.media_timeout_seconds = 1;
+            // Parallel suites may delay shell startup past one second. Leave room
+            // for its PID marker, while remaining far below the 60-second child.
+            cfg.media_timeout_seconds = 5;
             let cancel = cfg.cancel.clone();
             let started = Instant::now();
             let worker = std::thread::spawn(move || cfg.ffmpeg(&[]));
             while !pid_file.exists() {
-                assert!(started.elapsed() < Duration::from_secs(3));
+                if worker.is_finished() {
+                    panic!(
+                        "media child returned before readiness marker: {:?}",
+                        worker.join().unwrap()
+                    );
+                }
+                assert!(started.elapsed() < Duration::from_secs(10));
                 std::thread::sleep(Duration::from_millis(5));
             }
             if cancel_requested {
                 cancel.store(true, Ordering::Relaxed);
             }
             assert!(worker.join().unwrap().is_err());
-            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(started.elapsed() < Duration::from_secs(10));
             let pid = fs::read_to_string(pid_file).unwrap();
             assert!(!Command::new("/bin/kill")
                 .args(["-0", pid.trim()])
