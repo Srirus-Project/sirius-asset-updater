@@ -81,7 +81,7 @@ impl PngCompression {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageExport {
     Png {
@@ -150,6 +150,69 @@ impl ImageExport {
         Ok(bytes)
     }
 }
+/// Canonical, nonempty rendition set; single objects preserve the legacy format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageFormats(Vec<ImageExport>);
+impl Default for ImageFormats {
+    fn default() -> Self {
+        ImageExport::default().into()
+    }
+}
+impl From<ImageExport> for ImageFormats {
+    fn from(value: ImageExport) -> Self {
+        Self(vec![value])
+    }
+}
+impl ImageFormats {
+    pub fn iter(&self) -> impl Iterator<Item = &ImageExport> {
+        self.0.iter()
+    }
+    pub fn validate(&self) -> Result<(), Error> {
+        for format in &self.0 {
+            format.validate()?;
+        }
+        Ok(())
+    }
+}
+impl Serialize for ImageFormats {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.len() == 1 {
+            self.0[0].serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ImageFormats {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            One(ImageExport),
+            Many(Vec<ImageExport>),
+        }
+        let mut values = match Input::deserialize(deserializer)? {
+            Input::One(value) => vec![value],
+            Input::Many(values) => values,
+        };
+        if values.is_empty() || values.len() > 5 {
+            return Err(serde::de::Error::custom("select one to five image formats"));
+        }
+        values.sort_by_key(|format| format.native().extension());
+        if values
+            .windows(2)
+            .any(|pair| pair[0].native() == pair[1].native())
+        {
+            return Err(serde::de::Error::custom("duplicate image format"));
+        }
+        let formats = Self(values);
+        formats
+            .validate()
+            .map_err(|_| serde::de::Error::custom("invalid image format options"))?;
+        Ok(formats)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioExport {
@@ -226,6 +289,26 @@ impl<'de> Deserialize<'de> for AudioFormats {
 mod png_tests {
     use super::*;
     use unity_rs_core::{image_export::ImageRowOrder, texture::RgbaImage};
+    #[test]
+    fn image_sets_are_canonical_bounded_and_reject_colliding_extensions() {
+        let single: ImageFormats = yaml_serde::from_str("{format: png}").unwrap();
+        let list: ImageFormats =
+            yaml_serde::from_str("[{format: png, compression: fast}]").unwrap();
+        assert_eq!(single, list);
+        assert_eq!(sonic_rs::to_string(&single).unwrap(), r#"{"format":"png"}"#);
+        let a: ImageFormats = yaml_serde::from_str("[{format: webp}, {format: png}]").unwrap();
+        let b: ImageFormats = yaml_serde::from_str("[{format: png}, {format: webp}]").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            sonic_rs::to_string(&a).unwrap(),
+            sonic_rs::to_string(&b).unwrap()
+        );
+        for invalid in ["[]", "[{format: png}, {format: png, compression: best}]",
+            "[{format: jpeg, quality: 90, background: [0,0,0]}, {format: jpeg, quality: 100, background: [255,255,255]}]",
+            "[{format: jpeg, quality: 0, background: [0,0,0]}]", "[{format: webp, compression: best}]", "[null]"] {
+            assert!(yaml_serde::from_str::<ImageFormats>(invalid).is_err(),"accepted {invalid}");
+        }
+    }
     #[test]
     fn compression_changes_encoding_preserves_rgba_and_legacy_config() {
         let legacy: ImageExport = yaml_serde::from_str("format: png").unwrap();

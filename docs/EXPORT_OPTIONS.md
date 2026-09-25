@@ -56,7 +56,38 @@ options are rejected rather than silently ignored.
 
 The original Haruki `webp_lossless` flag is not reproduced: at the audited baseline its dynamic
 and native RGBA export paths always use `WebPEncoder::new_lossless`, regardless of that flag.
-Sirius likewise exports lossless WebP. Multiple image renditions remain a separate restoration item.
+Sirius likewise exports lossless WebP. Multiple image renditions use the list form below.
+
+### Multiple image renditions
+
+`image` accepts the existing single object or a nonempty list of format objects:
+
+```yaml
+image:
+  - {format: png, compression: best}
+  - {format: webp}
+  - {format: jpeg, quality: 90, background: [255, 255, 255]}
+```
+
+Select any combination of PNG, WebP, BMP, TGA and JPEG (one of each, up to five).
+Duplicate formats are rejected even if their compression, quality or background differs,
+preventing output-path collisions. Invalid options and empty lists fail configuration loading.
+Lists are canonicalized by format extension; order does not change cache identity. A singleton
+list serializes as the legacy object, including omitted/explicit-fast PNG equivalence.
+
+Texture2D and Sprite objects are decoded once. Each rendition is then encoded, written and
+verified sequentially under the existing image-stage admission and cancellation controls.
+CPU permits are released between encoding and file/decoder I/O. Each file keeps the object's
+stable stem with its own extension, carries the same source object identity in the journal,
+and contributes its bytes/hash to verification and storage publication. The resource byte
+budget applies to the sum of all renditions and other outputs, not separately to each format.
+A later encoding/verification/size failure prevents publication of the entire staged resource;
+partial results cannot populate a successful decoded-cache entry.
+
+`summary.image` is an object for one rendition and a canonical array for multiple renditions.
+Readers that only understand the old object shape must be upgraded before using this setting.
+Format membership and per-format options participate in cache identity. The full-export flag
+still describes object/provider selection; additional renditions do not broaden that scope.
 
 ## Audio output
 

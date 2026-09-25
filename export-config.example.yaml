@@ -25,6 +25,8 @@ selection:
 # JPEG requires both quality (1..100) and an explicit RGB background.
 # image: {format: jpeg, quality: 90, background: [255, 255, 255]}
 image: {format: png} # optional compression: fast (default), default, best
+# Or select multiple renditions; duplicate formats are rejected:
+# image: [{format: png}, {format: webp}, {format: jpeg, quality: 90, background: [255,255,255]}]
 # FLAC is validated by an exact PCM roundtrip. USM keeps Matroska video.
 audio: wav # Or a list: [wav, flac, mp3]. MP3 always retains WAV or verified FLAC.
 

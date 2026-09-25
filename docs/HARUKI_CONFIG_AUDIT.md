@@ -51,10 +51,12 @@ not dismissed as Sekai-specific merely because the current implementation is sma
 
 - `execution.allow_cancel`: Sirius exposes cancellation but currently has no operator disable
   switch. Decide and document the service policy or restore the toggle.
-- Region `export.images.formats`: current `ImageExport` still chooses one image rendition.
-  Original multiple image renditions remain a genuine gap; audio's multiple renditions do not
-  cover it. PNG effort has now been restored as `image.compression: fast/default/best`, with
-  exact RGBA/row-order and cache-identity verification. JPEG already has explicit quality/background.
+- Region `export.images.formats` is restored as `image: [{format: ...}, ...]`, preserving the
+  legacy object form. Actual synthetic Texture2D resource exports cover all 31 nonempty sets of
+  five supported formats, independent FFmpeg decoding, journal hashes/object identity, aggregate
+  output limits and failed-stage nonpublication. PNG effort maps to per-format `compression`,
+  JPEG quality/background are explicit. List order and singleton syntax share cache identities.
+  Final real-game corpus and deployed storage acceptance still apply.
 - `backends.image.webp_lossless` was a nonfunctional option at this baseline: source forwards
   it into pipeline options, but `crates/sekai-asset-pipeline/src/export/images.rs` always calls
   `WebPEncoder::new_lossless` in `encode_dynamic_image` and `encode_native_rgba_ir`; the file

@@ -29,7 +29,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub selection: crate::export_options::Selection,
     #[serde(default)]
-    pub image: crate::export_options::ImageExport,
+    pub image: crate::export_options::ImageFormats,
     #[serde(default)]
     pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
@@ -112,7 +112,7 @@ pub struct ExportSummary {
     #[serde(default)]
     pub selection: crate::export_options::Selection,
     #[serde(default)]
-    pub image: crate::export_options::ImageExport,
+    pub image: crate::export_options::ImageFormats,
     #[serde(default)]
     pub audio: crate::export_options::AudioFormats,
     #[serde(default)]
@@ -649,35 +649,33 @@ impl ExportConfig {
                 };
                 let cpu = self.acquire_cpu(self.cpu_deadline())?;
                 let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
-                let (data, extension, kind) = match object.class_id() {
-                    28 | 213 => {
-                        let image = if object.class_id() == 28 {
-                            object
-                                .decode_texture_mip(0, TextureReadLimits::default())
-                                .map_err(err)?
+                if matches!(object.class_id(), 28 | 213) {
+                    let image = if object.class_id() == 28 {
+                        object
+                            .decode_texture_mip(0, TextureReadLimits::default())
+                            .map_err(err)?
+                    } else {
+                        object
+                            .decode_sprite(
+                                SpriteReadLimits::default(),
+                                TextureReadLimits::default(),
+                            )
+                            .map_err(err)?
+                    };
+                    drop(cpu);
+                    return self.image_outputs(
+                        &image,
+                        if object.class_id() == 28 {
+                            ImageRowOrder::UnityDecoded
                         } else {
-                            object
-                                .decode_sprite(
-                                    SpriteReadLimits::default(),
-                                    TextureReadLimits::default(),
-                                )
-                                .map_err(err)?
-                        };
-                        let data = self.image.encode(
-                            &image,
-                            if object.class_id() == 28 {
-                                ImageRowOrder::UnityDecoded
-                            } else {
-                                ImageRowOrder::Display
-                            },
-                            limit,
-                        )?;
-                        (
-                            data,
-                            self.image.native().extension().trim_start_matches('.'),
-                            self.image.native().payload_kind(),
-                        )
-                    }
+                            ImageRowOrder::Display
+                        },
+                        output,
+                        &stem,
+                        report,
+                    );
+                }
+                let (data, extension, kind) = match object.class_id() {
                     114 if is_moc_object(&studio, object)? => {
                         let file =
                             &studio.collection().serialized_files()[object.file_index()].file;
@@ -899,6 +897,44 @@ impl ExportConfig {
                     object.class_id()
                 ));
             }
+        }
+        Ok(())
+    }
+    /// Decode once in the caller, then encode/write/verify one rendition at a time.
+    fn image_outputs(
+        &self,
+        image: &unity_rs_core::texture::RgbaImage,
+        order: unity_rs_core::image_export::ImageRowOrder,
+        output: &Path,
+        stem: &str,
+        report: &mut ResourceReport,
+    ) -> Result<(), Error> {
+        for format in self.image.iter() {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let prior: u64 = report.outputs.iter().map(|o| o.bytes).sum();
+            let remaining = self.max_resource_output_bytes.saturating_sub(prior);
+            if remaining == 0 {
+                return Err(Error::Size);
+            }
+            let cpu = self.acquire_cpu(self.cpu_deadline())?;
+            let data = format.encode(
+                image,
+                order,
+                self.max_resource_output_bytes.min(512 * 1024 * 1024),
+            )?;
+            drop(cpu);
+            if data.len() as u64 > remaining {
+                return Err(Error::Size);
+            }
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let target = output.join(format!("{stem}{}", format.native().extension()));
+            fs::write(&target, &data).map_err(err)?;
+            drop(data);
+            self.record(output, &target, format.native().payload_kind(), report)?;
         }
         Ok(())
     }
@@ -2596,6 +2632,223 @@ pub(crate) mod tests {
         cfg.image.validate().unwrap();
     }
 
+    // Synthetic v22 serialized Texture2D: Unity 2022.3, inline RGBA32, one mip.
+    // Field ordering cross-checked against unity-rs-core 0.5.1's public parser/oracle fixtures.
+    // No game data; fixed 16x32 two-color/alpha pixels make vertical orientation observable.
+    fn synthetic_texture() -> (Vec<u8>, Vec<u8>) {
+        fn ints(out: &mut Vec<u8>, values: &[i32]) {
+            for value in values {
+                out.extend(value.to_le_bytes());
+            }
+        }
+        let pixels = [[255, 0, 0, 128].repeat(256), [0, 0, 255, 64].repeat(256)].concat();
+        let mut body = Vec::new();
+        ints(&mut body, &[4]);
+        body.extend(b"test"); // aligned name
+        ints(&mut body, &[0, 0, 16, 32, pixels.len() as i32, 0, 4, 1]);
+        body.extend([1, 0, 0, 0]); // readable/preprocessed/mip-limit and padding
+        ints(&mut body, &[0, 0, 0, 1, 2]); // mip-limit group, streaming flag+priority, image count, dimension
+        body.extend([0; 24]); // GL settings
+        ints(&mut body, &[0, 0, 0, pixels.len() as i32]); // lightmap/color space/platform blob/data length
+        body.extend(&pixels);
+        body.extend([0; 16]); // empty streaming offset/size/path
+        let mut metadata = b"2022.3.62f1\0".to_vec();
+        ints(&mut metadata, &[13]);
+        metadata.push(0); // player target, no type tree
+        ints(&mut metadata, &[1, 28]);
+        metadata.push(0); // one Texture2D type
+        metadata.extend((-1_i16).to_le_bytes());
+        metadata.extend([0; 16]);
+        ints(&mut metadata, &[1]); // one object
+        while !(metadata.len() + 48).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend(7_i64.to_le_bytes());
+        metadata.extend(0_i64.to_le_bytes());
+        ints(&mut metadata, &[body.len() as i32, 0, 0, 0, 0]);
+        metadata.push(0);
+        let offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut bytes = vec![0; 48];
+        bytes[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        bytes[24..32].copy_from_slice(&((offset + body.len()) as u64).to_be_bytes());
+        bytes[32..40].copy_from_slice(&(offset as u64).to_be_bytes());
+        bytes.extend(metadata);
+        bytes.resize(offset, 0);
+        bytes.extend(body);
+        (bytes, pixels)
+    }
+    #[test]
+    fn actual_texture_rendition_preserves_identity_and_rejects_aggregate_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let (texture, pixels) = synthetic_texture();
+        let input = root.path().join("texture.assets");
+        fs::write(&input, texture).unwrap();
+        let mut cfg = config(root.path());
+        cfg.detected_cpus = 1;
+        cfg.cpu.limit_stages = true;
+        cfg.stage_limits.image = Some(1);
+        cfg.stage_limits.wait_timeout_seconds = 1;
+        cfg.set_service_cpu_gate(std::sync::Arc::default(), Some(1));
+        cfg.image = yaml_serde::from_str("[{format: png, compression: best}]").unwrap();
+        let mut report = ResourceReport::default();
+        cfg.unity(&input, root.path(), 0, &mut report, None, root.path())
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.outputs.len(), 1);
+        let record = &report.outputs[0];
+        let object = record.object.as_ref().unwrap();
+        assert_eq!((object.path_id, object.class_id), (7, 28));
+        let bytes = fs::read(root.path().join(&record.path)).unwrap();
+        assert_eq!(record.sha256, hex::encode(Sha256::digest(&bytes)));
+        let mut decoder = png::Decoder::new(Cursor::new(bytes)).read_info().unwrap();
+        let mut decoded = vec![0; decoder.output_buffer_size().unwrap()];
+        let info = decoder.next_frame(&mut decoded).unwrap();
+        let expected: Vec<u8> = pixels
+            .chunks_exact(16 * 4)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(&decoded[..info.buffer_size()], expected);
+        // Another object's output shares this same resource budget.
+        cfg.max_resource_output_bytes = record.bytes;
+        let out = root.path().join("overflow");
+        fs::create_dir(&out).unwrap();
+        let mut failed = report.clone();
+        cfg.unity(&input, &out, 0, &mut failed, None, root.path())
+            .unwrap();
+        assert!(!failed.errors.is_empty());
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for actual multi-rendition Texture2D verification"]
+    fn all_image_rendition_sets_export_and_decode_with_independent_ffmpeg() {
+        let root = tempfile::tempdir().unwrap();
+        let (texture, pixels) = synthetic_texture();
+        let input = root.path().join("texture.assets");
+        fs::write(&input, &texture).unwrap();
+        fs::create_dir(root.path().join("assets")).unwrap();
+        fs::write(root.path().join("assets/texture.assets"), &texture).unwrap();
+        let asset = crate::update::AssetReceipt {
+            relative_path: "texture.assets".into(),
+            provider: Provider::UnityBundle,
+            bytes: texture.len() as u64,
+            downloaded_sha256: hex::encode(Sha256::digest(&texture)),
+            stored_sha256: hex::encode(Sha256::digest(&texture)),
+            decrypted: false,
+        };
+        let mut cfg = config(root.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        cfg.retain_outputs = true;
+        let formats = [
+            "{format: png, compression: best}",
+            "{format: webp}",
+            "{format: bmp}",
+            "{format: tga}",
+            "{format: jpeg, quality: 100, background: [255,255,255]}",
+        ];
+        let flipped: Vec<u8> = pixels
+            .chunks_exact(16 * 4)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        for mask in 1u32..32 {
+            let choices: Vec<_> = formats
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, value)| *value)
+                .collect();
+            cfg.image = yaml_serde::from_str(&format!("[{}]", choices.join(","))).unwrap();
+            let out = root.path().join(mask.to_string());
+            fs::create_dir(&out).unwrap();
+            let report = cfg
+                .process_resource(root.path(), &out, &asset, 0, 0, None)
+                .unwrap();
+            let out = out.join("00000");
+            assert!(report.errors.is_empty(), "mask {mask}: {:?}", report.errors);
+            assert_eq!(report.outputs.len(), mask.count_ones() as usize);
+            assert_eq!(report.selected_objects, 1);
+            let mut names = std::collections::HashSet::new();
+            for record in &report.outputs {
+                assert!(names.insert(&record.path));
+                assert_eq!(record.object.as_ref().unwrap().path_id, 7);
+                let encoded = fs::read(out.join(&record.path)).unwrap();
+                assert_eq!(record.bytes, encoded.len() as u64);
+                assert_eq!(record.sha256, hex::encode(Sha256::digest(encoded)));
+                let raw = root
+                    .path()
+                    .join(format!("decoded-{mask}-{}.rgba", record.path));
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    out.join(&record.path).into_os_string(),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    "-pix_fmt".into(),
+                    "rgba".into(),
+                    raw.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                let actual = fs::read(raw).unwrap();
+                assert_eq!(actual.len(), flipped.len());
+                if record.kind == "image_jpeg" {
+                    for (pixel, source) in actual.chunks_exact(4).zip(flipped.chunks_exact(4)) {
+                        assert_eq!(pixel[3], 255);
+                        for c in 0..3 {
+                            let expected = ((source[c] as u32 * source[3] as u32
+                                + 255 * (255 - source[3] as u32)
+                                + 127)
+                                / 255) as u8;
+                            assert!(pixel[c].abs_diff(expected) <= 4);
+                        }
+                    }
+                } else {
+                    assert_eq!(actual, flipped, "mask {mask}, {}", record.path);
+                }
+            }
+            assert_eq!(fs::read_dir(out).unwrap().count(), choices.len());
+        }
+        // First rendition can succeed, but later overflow cannot become successful publication.
+        cfg.image = yaml_serde::from_str("[{format: png}, {format: webp}]").unwrap();
+        let image = unity_rs_core::texture::RgbaImage {
+            width: 16,
+            height: 32,
+            pixels,
+        };
+        let first = crate::export_options::ImageExport::default()
+            .encode(
+                &image,
+                unity_rs_core::image_export::ImageRowOrder::UnityDecoded,
+                1024 * 1024,
+            )
+            .unwrap();
+        cfg.max_resource_output_bytes = first.len() as u64;
+        let out = root.path().join("partial");
+        fs::create_dir(&out).unwrap();
+        let report = cfg
+            .process_resource(root.path(), &out, &asset, 0, 0, None)
+            .unwrap();
+        assert!(!report.errors.is_empty());
+        assert_eq!(report.outputs.len(), 1);
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+        cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut cancelled = ResourceReport::default();
+        assert!(matches!(
+            cfg.image_outputs(
+                &image,
+                unity_rs_core::image_export::ImageRowOrder::Display,
+                &out,
+                "cancelled",
+                &mut cancelled
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(cancelled.outputs.is_empty());
+    }
+
     #[test]
     #[ignore = "requires SIRIUS_TEST_FFMPEG for independent image/audio roundtrip verification"]
     fn configurable_images_preserve_rgba_orientation_and_flac_preserves_pcm() {
@@ -3047,8 +3300,16 @@ pub(crate) mod tests {
                 yaml_serde::from_str(&format!("format: png\ncompression: {compression}")).unwrap();
             assert!(compression_keys.insert(id(&cfg, &snapshot, &asset, &deps, 1)));
         }
-        cfg.image = crate::export_options::ImageExport::Webp {};
+        cfg.image = crate::export_options::ImageExport::Webp {}.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.image = yaml_serde::from_str("[{format: png}]").unwrap();
+        assert_eq!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.image = yaml_serde::from_str("[{format: png}, {format: webp}]").unwrap();
+        let multiple = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(base, multiple);
+        cfg.image =
+            yaml_serde::from_str("[{format: webp}, {format: png, compression: fast}]").unwrap();
+        assert_eq!(multiple, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
         cfg.audio = crate::export_options::AudioExport::Flac.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
