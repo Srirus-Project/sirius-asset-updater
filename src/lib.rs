@@ -635,3 +635,5 @@ pub mod storage_sts;
 pub mod storage_credentials;
 
 pub mod completion_notify;
+
+pub mod read_policy;

@@ -71,12 +71,13 @@ not dismissed as Sekai-specific merely because the current implementation is sma
   admission or a retained payload batch. Sirius likewise processes objects sequentially within
   each resource, with explicit image/CPU gates. Do not map this historical grouping field to
   resource concurrency or claim a missing parallel decoder from the field alone.
-- `backends.asset_studio.read_kinds` remains a real content-selection gap. The original
-  `native_read_kind_for_asset` applies a matching type override, then `all`, then a class default.
-  Validation accepts raw/type-tree/image/archive/audio/video/font/shader/text/mesh and related
-  modes; dispatch behavior must be checked individually, including generic Unity classes beyond
-  Texture2D/Sprite. Current Sirius exact class selection chooses objects, not their representation.
-  Preserve this distinction when adapting reader policy; no fabricated Sekai type mapping.
+- `backends.asset_studio.read_kinds` now has a Sirius representation policy, `read_kinds.default`
+  plus exact `classes` overrides, separate from object selection. General auto/object_raw/type-tree
+  modes and existing image/TextAsset/font/shader/OBJ adapters are connected and tested; summaries,
+  cache identities and full-export claims account for representation changes. Original raw's
+  class-specific media/font payload semantics are not mislabeled as full object bytes. Remaining
+  AudioClip, VideoClip/MovieTexture, Texture2DArray/archive and animator dispatch still need
+  individual source/fixture applicability review; configuration rejects unimplemented modes.
 - `regions.*.export.raw_bundles`: independently audit filtered raw-bundle publication and paths;
   retaining downloaded inputs alone does not prove equivalent export/publication behavior.
 - Complete field-by-field logging, environment override, region-path, export-stage and upload

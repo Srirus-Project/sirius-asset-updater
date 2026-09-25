@@ -29,6 +29,8 @@ pub struct ExportConfig {
     #[serde(default)]
     pub selection: crate::export_options::Selection,
     #[serde(default)]
+    pub read_kinds: crate::read_policy::Policy,
+    #[serde(default)]
     pub image: crate::export_options::ImageFormats,
     #[serde(default)]
     pub audio: crate::export_options::AudioFormats,
@@ -112,6 +114,8 @@ pub struct ExportSummary {
     #[serde(default)]
     pub selection: crate::export_options::Selection,
     #[serde(default)]
+    pub read_kinds: crate::read_policy::Policy,
+    #[serde(default)]
     pub image: crate::export_options::ImageFormats,
     #[serde(default)]
     pub audio: crate::export_options::AudioFormats,
@@ -187,6 +191,7 @@ impl ExportConfig {
         self.cpu.validate()?;
         self.stage_limits.validate()?;
         self.selection.validate()?;
+        self.read_kinds.validate()?;
         self.media_backend.validate()?;
         self.image.validate()?;
         if self.cache_directory.is_some() && !self.retain_outputs
@@ -363,8 +368,10 @@ impl ExportConfig {
         let mut summary = ExportSummary {
             full_export: complete_selection
                 && assets.len() == catalog_files
-                && self.selection.full(),
+                && self.selection.full()
+                && self.read_kinds.is_native(),
             selection: self.selection.clone(),
+            read_kinds: self.read_kinds.clone(),
             image: self.image.clone(),
             audio: self.audio.clone(),
             video: self.video,
@@ -638,6 +645,52 @@ impl ExportConfig {
             let stem = format!("{}_{}", object.file_index(), object.path_id());
             let output_start = report.outputs.len();
             let result = (|| -> Result<(), Error> {
+                use crate::read_policy::Kind;
+                let read_kind = self.read_kinds.for_class(object.class_id())?;
+                if matches!(read_kind, Kind::ObjectRaw | Kind::TypetreeJson) {
+                    let cpu = self.acquire_cpu(self.cpu_deadline())?;
+                    let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
+                    let (bytes, extension, kind) = if read_kind == Kind::ObjectRaw {
+                        (
+                            object.read_raw(limit).map_err(err)?,
+                            "object.bin",
+                            "raw_object",
+                        )
+                    } else {
+                        (
+                            object
+                                .read_type_tree_json(false, limit as usize)
+                                .map_err(err)?,
+                            "json",
+                            "typetree_json",
+                        )
+                    };
+                    drop(cpu);
+                    if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(Error::Cancelled);
+                    }
+                    let target = output.join(format!("{stem}.{extension}"));
+                    fs::write(&target, bytes).map_err(err)?;
+                    self.record(output, &target, kind, report)?;
+                    if read_kind == Kind::TypetreeJson {
+                        let file =
+                            &studio.collection().serialized_files()[object.file_index()].file;
+                        let tree = file.object_type_tree(object.object_index()).map_err(err)?;
+                        if tree
+                            .nodes
+                            .iter()
+                            .any(|node| node.type_name == "TypelessData")
+                        {
+                            let cpu = self.acquire_cpu(self.cpu_deadline())?;
+                            let bytes = object.read_raw(limit).map_err(err)?;
+                            drop(cpu);
+                            let target = output.join(format!("{stem}.object.bin"));
+                            fs::write(&target, bytes).map_err(err)?;
+                            self.record(output, &target, "typetree_binary_source", report)?;
+                        }
+                    }
+                    return Ok(());
+                }
                 let image_stage = if matches!(object.class_id(), 28 | 213) {
                     self.stage_gates.acquire(
                         &self.effective_stage_limits()?,
@@ -722,7 +775,8 @@ impl ExportConfig {
                         match object.read_mesh_obj(unity_rs_core::mesh::MeshReadLimits::default()) {
                             Ok(bytes) => (bytes, "obj", "mesh_obj"),
                             Err(unity_rs_core::Error::Unsupported(reason))
-                                if reason.contains("Mesh has no vertices") =>
+                                if read_kind == Kind::Auto
+                                    && reason.contains("Mesh has no vertices") =>
                             {
                                 let bytes = object
                                     .read_type_tree_json(false, limit as usize)
@@ -739,7 +793,7 @@ impl ExportConfig {
                     }
                     48 => match object.read_shader_text(limit) {
                         Ok(bytes) => (bytes, "shader", "shader_text"),
-                        Err(unity_rs_core::Error::Unsupported(_)) => (
+                        Err(unity_rs_core::Error::Unsupported(_)) if read_kind == Kind::Auto => (
                             object
                                 .read_type_tree_json(false, limit as usize)
                                 .map_err(err)?,
@@ -1892,6 +1946,7 @@ pub(crate) mod tests {
             input: root.into(),
             paths: Vec::new(),
             selection: Default::default(),
+            read_kinds: Default::default(),
             image: Default::default(),
             audio: Default::default(),
             video: Default::default(),
@@ -2679,12 +2734,114 @@ pub(crate) mod tests {
         (bytes, pixels)
     }
     #[test]
+    fn raw_representation_exports_exact_object_bytes_and_explicit_json_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (texture, _) = synthetic_texture();
+        let offset = u64::from_be_bytes(texture[32..40].try_into().unwrap()) as usize;
+        let input = root.path().join("texture.assets");
+        fs::write(&input, &texture).unwrap();
+        let mut cfg = config(root.path());
+        cfg.read_kinds = yaml_serde::from_str("default: image\nclasses: {28: object_raw}").unwrap();
+        let mut report = ResourceReport::default();
+        cfg.unity(&input, root.path(), 0, &mut report, None, root.path())
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.outputs.len(), 1);
+        assert_eq!(report.outputs[0].kind, "raw_object");
+        assert_eq!(report.outputs[0].object.as_ref().unwrap().class_id, 28);
+        assert_eq!(
+            fs::read(root.path().join(&report.outputs[0].path)).unwrap(),
+            texture[offset..]
+        );
+        for policy in ["default: typetree_json", "default: font"] {
+            let out = tempfile::tempdir().unwrap();
+            cfg.read_kinds = yaml_serde::from_str(policy).unwrap();
+            let mut report = ResourceReport::default();
+            cfg.unity(&input, out.path(), 0, &mut report, None, root.path())
+                .unwrap();
+            assert!(!report.errors.is_empty());
+            assert!(report.outputs.is_empty());
+            assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+        }
+    }
+    // Synthetic v22 file with an explicit two-node type tree and a single i32 value.
+    fn synthetic_typed_object() -> Vec<u8> {
+        fn i(out: &mut Vec<u8>, value: i32) {
+            out.extend(value.to_le_bytes());
+        }
+        let mut metadata = b"2022.3.62f1\0".to_vec();
+        i(&mut metadata, 13);
+        metadata.push(1); // player, enabled type tree
+        i(&mut metadata, 1);
+        i(&mut metadata, 12345); // synthetic class with no built-in decoder
+        metadata.push(0);
+        metadata.extend((-1_i16).to_le_bytes());
+        metadata.extend([0; 16]);
+        let strings = b"TestObject\0Base\0int\0value\0";
+        i(&mut metadata, 2);
+        i(&mut metadata, strings.len() as i32);
+        for (level, ty, name, index) in [(0u8, 0, 11, 0), (1, 16, 20, 1)] {
+            metadata.extend(1_u16.to_le_bytes());
+            metadata.extend([level, 0]);
+            for n in [ty, name, 4, index, 0] {
+                i(&mut metadata, n);
+            }
+            metadata.extend(0_u64.to_le_bytes());
+        }
+        metadata.extend(strings);
+        i(&mut metadata, 0); // no type dependencies
+        i(&mut metadata, 1);
+        while !(metadata.len() + 48).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend(19_i64.to_le_bytes());
+        metadata.extend(0_i64.to_le_bytes());
+        for n in [4, 0, 0, 0, 0] {
+            i(&mut metadata, n);
+        }
+        metadata.push(0);
+        let offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut file = vec![0; 48];
+        file[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        file[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        file[24..32].copy_from_slice(&((offset + 4) as u64).to_be_bytes());
+        file[32..40].copy_from_slice(&(offset as u64).to_be_bytes());
+        file.extend(metadata);
+        file.resize(offset, 0);
+        file.extend(42_i32.to_le_bytes());
+        file
+    }
+    #[test]
+    fn explicit_typetree_reads_real_serialized_metadata_and_preserves_object_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("typed.assets");
+        fs::write(&input, synthetic_typed_object()).unwrap();
+        let mut cfg = config(root.path());
+        cfg.read_kinds =
+            yaml_serde::from_str("default: object_raw\nclasses: {12345: typetree_json}").unwrap();
+        let mut report = ResourceReport::default();
+        cfg.unity(&input, root.path(), 0, &mut report, None, root.path())
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.outputs.len(), 1);
+        let record = &report.outputs[0];
+        assert_eq!(record.kind, "typetree_json");
+        assert_eq!(record.object.as_ref().unwrap().path_id, 19);
+        let value: sonic_rs::Value =
+            sonic_rs::from_slice(&fs::read(root.path().join(&record.path)).unwrap()).unwrap();
+        use sonic_rs::JsonValueTrait;
+        assert_eq!(value.get("value").and_then(|v| v.as_i64()), Some(42));
+    }
+    #[test]
     fn actual_texture_rendition_preserves_identity_and_rejects_aggregate_overflow() {
         let root = tempfile::tempdir().unwrap();
         let (texture, pixels) = synthetic_texture();
         let input = root.path().join("texture.assets");
         fs::write(&input, texture).unwrap();
         let mut cfg = config(root.path());
+        cfg.read_kinds
+            .classes
+            .insert(28, crate::read_policy::Kind::Image);
         cfg.detected_cpus = 1;
         cfg.cpu.limit_stages = true;
         cfg.stage_limits.image = Some(1);
@@ -3302,6 +3459,17 @@ pub(crate) mod tests {
         }
         cfg.image = crate::export_options::ImageExport::Webp {}.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.image = Default::default();
+        cfg.read_kinds = yaml_serde::from_str("default: object_raw").unwrap();
+        let raw = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(base, raw);
+        cfg.read_kinds = yaml_serde::from_str("classes: {28: image, 114: typetree_json}").unwrap();
+        let custom = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(raw, custom);
+        assert_ne!(base, custom);
+        cfg.read_kinds = yaml_serde::from_str("classes: {114: typetree_json, 28: image}").unwrap();
+        assert_eq!(custom, id(&cfg, &snapshot, &asset, &deps, 1));
+        cfg.read_kinds = Default::default();
         cfg.image = yaml_serde::from_str("[{format: png}]").unwrap();
         assert_eq!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = yaml_serde::from_str("[{format: png}, {format: webp}]").unwrap();

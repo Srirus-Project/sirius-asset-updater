@@ -203,8 +203,9 @@ async fn prepare_with_progress(
         || summary.input_files > MAX_RESOURCES
         || summary.input_files > summary.catalog_files
         || summary.output_files == 0
+        || summary.read_kinds.validate().is_err()
         || !valid_digest(&summary.catalog_sha256)
-        || (summary.full_export && !summary.full_catalog)
+        || (summary.full_export && (!summary.full_catalog || !summary.read_kinds.is_native()))
         || (summary.full_catalog && summary.input_files != summary.catalog_files)
     {
         return Err(Error::Verification);
@@ -463,6 +464,25 @@ pub(crate) mod tests {
         std::fs::write(path, sonic_rs::to_vec(&summary).unwrap()).unwrap();
         let report = verify(root.path(), Region::Jp).await.unwrap();
         assert!(!report.full_catalog && !report.full_export);
+    }
+    #[tokio::test]
+    async fn representation_override_cannot_claim_full_native_export() {
+        let root = fixture();
+        let path = root.path().join("summary.json");
+        let mut summary: ExportSummary =
+            sonic_rs::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        summary.read_kinds = yaml_serde::from_str("default: object_raw").unwrap();
+        std::fs::write(&path, sonic_rs::to_vec(&summary).unwrap()).unwrap();
+        assert!(verify(root.path(), Region::Jp).await.is_err());
+        summary.full_export = false;
+        std::fs::write(&path, sonic_rs::to_vec(&summary).unwrap()).unwrap();
+        assert!(!verify(root.path(), Region::Jp).await.unwrap().full_export);
+        summary
+            .read_kinds
+            .classes
+            .insert(28, crate::read_policy::Kind::Font);
+        std::fs::write(&path, sonic_rs::to_vec(&summary).unwrap()).unwrap();
+        assert!(verify(root.path(), Region::Jp).await.is_err());
     }
     #[tokio::test]
     async fn corruption_missing_extra_files_and_incomplete_receipts_are_rejected() {

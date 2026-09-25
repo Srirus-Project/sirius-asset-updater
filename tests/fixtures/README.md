@@ -13,3 +13,8 @@ file with one Unity 2022.3 Texture2D, inline RGBA32 pixels, one mip and no exter
 was cross-checked against unity-rs-core 0.5.1's parser and public oracle fixtures. It contains
 no game assets. It tests actual multi-rendition export, orientation, object identity and staged
 publication; optional independent decoding uses a separately installed FFmpeg.
+
+`synthetic_typed_object()` builds an independent v22 serialized file containing an embedded
+two-node type tree, synthetic class ID12345 and one integer value42. It tests explicit JSON
+representation without depending on a game class or a built-in object layout. Raw-mode tests
+compare exact serialized object bytes from the generated Texture2D fixture against export output.

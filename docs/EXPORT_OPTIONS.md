@@ -30,6 +30,54 @@ object metadata/backing bytes. It does not suppress standalone CRI resources; us
 provider selection for those. Selecting only TextAsset does not imply reconstructing
 its owning SplitAcb MonoBehaviour. Unsupported or malformed selected data still fails.
 
+## Unity object representation
+
+`selection.unity_class_ids` selects which objects are exported. `read_kinds` independently
+chooses their representation using exact positive Unity class IDs:
+
+```yaml
+read_kinds:
+  default: auto
+  classes:
+    28: image
+    114: typetree_json
+    49: object_raw
+```
+
+A class override wins over `default`. Omitted policy preserves Sirius's existing native dispatch.
+At most 256 class overrides are accepted; incompatible explicit class/mode pairs fail config
+validation. An incompatible default for an encountered object fails that resource at runtime.
+
+| Mode | Supported classes | Result |
+| --- | --- | --- |
+| `auto` | All positive IDs | Existing Sirius class-specific native export |
+| `object_raw` | All positive IDs | Exact serialized object bytes as `.object.bin` |
+| `typetree_json` | All positive IDs with readable type trees | Explicit JSON; opaque TypelessData also retains backing object bytes |
+| `image` | 28 Texture2D, 213 Sprite | Configured image rendition(s) |
+| `text_bytes` | 49 TextAsset | TextAsset byte payload |
+| `font` | 128 Font | Native font payload |
+| `shader` | 48 Shader | Shader text; unsupported text extraction fails |
+| `obj` | 43 Mesh | OBJ geometry; unsupported/empty geometry fails |
+
+Explicit type-tree extraction never falls back to raw bytes. Explicit `shader`/`obj` do not
+fall back to the JSON representations available under `auto`. `object_raw` and `typetree_json`
+bypass class-specific decoding, including embedded SplitAcb/Cubism processing; these are
+representation choices, not a claim to have produced audio/images/models. `object_raw` names
+the entire serialized object deliberately: Haruki's `raw` handled some audio/video/font classes
+as their extracted payload instead. Do not translate that old spelling without checking intent.
+
+The policy is recorded in `summary.read_kinds` and contributes to cache identity. Any non-auto
+policy conservatively sets `full_export=false`, even if all catalog resources were selected;
+`full_catalog` continues to describe download selection. Offline verification rejects an invalid
+policy or a non-auto policy claiming full native export. Legacy summaries without the field use
+the default auto policy. Every output still carries object identity and participates in hashes,
+resource limits, staging and publication verification.
+
+This restores general representation control and the native modes listed above. Generic Unity
+AudioClip, VideoClip/MovieTexture, Texture2DArray/archive, animator and other original dispatch
+modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
+accepted as an unimplemented placeholder.
+
 ## Image output
 
 PNG remains the default. PNG, lossless WebP, BMP and TGA use the native Rust encoder
