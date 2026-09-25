@@ -49,8 +49,10 @@ candidate; this architectural mapping is not a performance result.
 The following remain open after reading the original schema against current types. They are
 not dismissed as Sekai-specific merely because the current implementation is smaller:
 
-- `execution.allow_cancel`: Sirius exposes cancellation but currently has no operator disable
-  switch. Decide and document the service policy or restore the toggle.
+- `execution.allow_cancel` maps to service `allow_cancel` (default true). Authenticated user
+  cancellations return 409 without mutation when disabled; shutdown/deadline cancellation stays
+  active. Actual blocked-download tests cover queued/running requests, authentication, restart
+  re-enablement, shutdown drain and timeout failure.
 - Region `export.images.formats` is restored as `image: [{format: ...}, ...]`, preserving the
   legacy object form. Actual synthetic Texture2D resource exports cover all 31 nonempty sets of
   five supported formats, independent FFmpeg decoding, journal hashes/object identity, aggregate
@@ -62,8 +64,19 @@ not dismissed as Sekai-specific merely because the current implementation is sma
   `WebPEncoder::new_lossless` in `encode_dynamic_image` and `encode_native_rgba_ir`; the file
   writer delegates to the same encoder. Sirius lossless WebP preserves that actual behavior.
   Do not copy the ignored boolean or claim original lossy WebP support.
-- `backends.asset_studio.read_batch_size/read_kinds`: compare the actual native reader execution
-  behavior before mapping to concurrency or class selection. Those are different controls.
+- `backends.asset_studio.read_batch_size`: the original native implementation in
+  `crates/sekai-asset-pipeline/src/export/unity.rs` tunes a chunk length (image-heavy groups at
+  least64, MonoBehaviour-heavy groups at most32), then reads/writes each object sequentially
+  inside each chunk. The boundary updates batch-count/timing statistics, not concurrent read
+  admission or a retained payload batch. Sirius likewise processes objects sequentially within
+  each resource, with explicit image/CPU gates. Do not map this historical grouping field to
+  resource concurrency or claim a missing parallel decoder from the field alone.
+- `backends.asset_studio.read_kinds` remains a real content-selection gap. The original
+  `native_read_kind_for_asset` applies a matching type override, then `all`, then a class default.
+  Validation accepts raw/type-tree/image/archive/audio/video/font/shader/text/mesh and related
+  modes; dispatch behavior must be checked individually, including generic Unity classes beyond
+  Texture2D/Sprite. Current Sirius exact class selection chooses objects, not their representation.
+  Preserve this distinction when adapting reader policy; no fabricated Sekai type mapping.
 - `regions.*.export.raw_bundles`: independently audit filtered raw-bundle publication and paths;
   retaining downloaded inputs alone does not prove equivalent export/publication behavior.
 - Complete field-by-field logging, environment override, region-path, export-stage and upload

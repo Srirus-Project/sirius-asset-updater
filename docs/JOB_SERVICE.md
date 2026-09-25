@@ -82,6 +82,14 @@ full-catalog scope remains in verification.json. A job deadline reports `failed`
 signal and wait for workers to exit before releasing the region slot. A progress-storage failure
 also signals cancellation and drains the exporter.
 
+`allow_cancel` defaults to `true`, preserving existing behavior and the original Haruki policy.
+Set it to `false` to reject authenticated `POST /api/v1/jobs/{id}/cancel` calls with HTTP 409
+before any ledger mutation. Authentication still runs first (unauthenticated calls return 401).
+The option applies to both queued and running user cancellations and is loaded on service startup.
+Restart with `true` to permit cancellation again, including previously queued work. It does not
+turn off job deadlines, service shutdown, pipeline/storage-failure cleanup or interrupted-worker
+recovery. Failed/cancelled jobs remain eligible for the existing explicit retry operation.
+
 SIGINT/SIGTERM stop admission and cancel/drain running workers. Queued jobs survive restart;
 interrupted running jobs become failed and can be retried explicitly. Completed publications
 are retained. The ledger directory has exclusive process ownership, so two services cannot

@@ -32,6 +32,8 @@ use tokio::sync::{watch, Mutex, Notify};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    #[serde(default = "allow_cancel")]
+    pub allow_cancel: bool,
     #[serde(default)]
     pub completion_notifications: Vec<crate::completion_notify::Config>,
     #[serde(default)]
@@ -63,6 +65,9 @@ pub struct ServiceConfig {
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
     pub profiles: BTreeMap<String, Profile>,
+}
+fn allow_cancel() -> bool {
+    true
 }
 fn workers() -> usize {
     4
@@ -796,6 +801,12 @@ async fn submit(
     }
 }
 async fn cancel(State(service): State<Service>, HttpPath(id): HttpPath<String>) -> Response {
+    if !service.inner.config.allow_cancel {
+        return json(
+            StatusCode::CONFLICT,
+            &BTreeMap::from([("error", "job cancellation is disabled by configuration")]),
+        );
+    }
     match service.inner.store.lock().await.cancel(&id) {
         Ok(job) => {
             service.inner.wake.notify_one();
@@ -967,6 +978,7 @@ mod lifecycle_tests {
         });
         std::fs::write(&download, sonic_rs::to_vec(&contents).unwrap()).unwrap();
         let config = ServiceConfig {
+            allow_cancel: true,
             completion_notifications: vec![],
             logging: None,
             tls: None,
@@ -1139,6 +1151,92 @@ mod lifecycle_tests {
         assert_eq!(cancelled.status, Status::Cancelled);
         assert!(cancelled.failure.is_none());
         stop(shutdown, worker).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_policy_blocks_http_mutation_but_keeps_shutdown_and_deadlines() {
+        use tower::ServiceExt;
+        async fn cancel_http(service: &Service, id: &str, authenticated: bool) -> StatusCode {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/jobs/{id}/cancel"));
+            if authenticated {
+                request = request.header(header::AUTHORIZATION, "Bearer synthetic-service-token");
+            }
+            service
+                .router()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+        let defaults: ServiceConfig = sonic_rs::from_str(r#"{"listen":"127.0.0.1:0","token_env":"unused","state_directory":"state","output_directory":"output","profiles":{}}"#).unwrap();
+        assert!(defaults.allow_cancel);
+        let (mut fixture, service) = fixture(30).await;
+        drop(service);
+        fixture.config.allow_cancel = false;
+        let service = Service::open(fixture.config.clone()).unwrap();
+        let first = submit(&service).await;
+        let ledger = fixture.config.state_directory.join("jobs.json");
+        let before = std::fs::read(&ledger).unwrap();
+        assert_eq!(
+            cancel_http(&service, &first.id, false).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            cancel_http(&service, &first.id, true).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        assert_eq!(status(&service, &first.id).await.status, Status::Queued);
+        let (shutdown, worker) = workers(&service);
+        hits(&fixture, 1).await;
+        let running = sonic_rs::to_vec(&status(&service, &first.id).await).unwrap();
+        assert_eq!(
+            cancel_http(&service, &first.id, true).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            sonic_rs::to_vec(&status(&service, &first.id).await).unwrap(),
+            running
+        );
+        let queued = submit(&service).await;
+        stop(shutdown, worker).await;
+        assert_eq!(status(&service, &first.id).await.status, Status::Failed);
+        assert_eq!(
+            status(&service, &first.id).await.failure.as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(status(&service, &queued.id).await.status, Status::Queued);
+        drop(service);
+        // Re-enable through a restart, including cancellation of pre-existing queued work.
+        fixture.config.allow_cancel = true;
+        let service = Service::open(fixture.config.clone()).unwrap();
+        assert_eq!(
+            cancel_http(&service, &queued.id, true).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(status(&service, &queued.id).await.status, Status::Cancelled);
+        drop(service);
+        fixture.config.allow_cancel = false;
+        fixture.config.timeout_seconds = 1;
+        let service = Service::open(fixture.config.clone()).unwrap();
+        let timed = submit(&service).await;
+        let (shutdown, worker) = workers(&service);
+        hits(&fixture, 2).await;
+        let failed = terminal(&service, &timed.id).await;
+        assert_eq!(failed.status, Status::Failed);
+        assert_eq!(failed.failure.as_deref(), Some("job_timeout"));
+        stop(shutdown, worker).await;
+        for job in [&first, &timed] {
+            let output = fixture
+                .config
+                .output_directory
+                .join("jp")
+                .join(&job.id)
+                .join("downloads");
+            assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]
