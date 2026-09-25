@@ -25,3 +25,10 @@ playable or game-derived media. External fixtures use a generated `media.resS` w
 prefix and a known bounded region. Tests prove byte-preserving extraction and dependency/path/
 size behavior, not codec support. A modern MovieTexture layout and hostile filename suffix are
 negative inputs. Field ordering is cross-checked with unity-rs-core0.5.1's native readers.
+
+`synthetic_texture_array()` builds a v22 class187 Texture2DArray with two 2x2 RGBA layers
+and two mips per layer. Distinct generated pixels and dummy mip1 bytes verify layer stride,
+orientation and alpha. Inline and streamed payloads (offset3 with prefix/trailer) test bounded
+resolution. Unknown graphics format and stripped mip0 are negative fixtures. Layouts follow
+unity-rs-core0.5.1 readers (Unity2022.3 and2023.2); no game data is included. Optional FFmpeg
+checks independently decode both PNG/WebP renditions of both layers.

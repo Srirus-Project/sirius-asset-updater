@@ -597,6 +597,7 @@ impl ExportConfig {
                 object.class_id(),
                 213 | unity_rs_core::simple_assets::AUDIO_CLIP_CLASS_ID
                     | unity_rs_core::simple_assets::VIDEO_CLIP_CLASS_ID
+                    | unity_rs_core::texture_array::TEXTURE_2D_ARRAY_CLASS_ID
             ) && self.selection.class(object.class_id())
                 && self
                     .read_kinds
@@ -754,7 +755,10 @@ impl ExportConfig {
                     self.record(output, &target, kind, report)?;
                     return Ok(());
                 }
-                let image_stage = if matches!(object.class_id(), 28 | 213) {
+                let image_stage = if matches!(
+                    object.class_id(),
+                    28 | 213 | unity_rs_core::texture_array::TEXTURE_2D_ARRAY_CLASS_ID
+                ) {
                     self.stage_gates.acquire(
                         &self.effective_stage_limits()?,
                         crate::stage_limits::Stage::Image,
@@ -765,6 +769,45 @@ impl ExportConfig {
                 };
                 let cpu = self.acquire_cpu(self.cpu_deadline())?;
                 let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
+                if object.class_id() == unity_rs_core::texture_array::TEXTURE_2D_ARRAY_CLASS_ID {
+                    use unity_rs_core::texture_array::{
+                        read_texture2d_array, TextureArrayReadLimits,
+                    };
+                    let limits = TextureArrayReadLimits::default();
+                    let file = &studio.collection().serialized_files()[object.file_index()].file;
+                    let array = read_texture2d_array(
+                        studio.collection(),
+                        file,
+                        object.object_index(),
+                        limits,
+                    )
+                    .map_err(err)?;
+                    let decoded_bytes = u64::from(array.width)
+                        .checked_mul(u64::from(array.height))
+                        .and_then(|n| n.checked_mul(4))
+                        .and_then(|n| n.checked_mul(u64::from(array.layer_count())))
+                        .ok_or(Error::Size)?;
+                    if decoded_bytes > limits.maximum_output_bytes {
+                        return Err(Error::Size);
+                    }
+                    drop(cpu);
+                    for layer in 0..array.layer_count() {
+                        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(Error::Cancelled);
+                        }
+                        let cpu = self.acquire_cpu(self.cpu_deadline())?;
+                        let image = array.decode_layer_mip0_rgba8(layer, limits).map_err(err)?;
+                        drop(cpu);
+                        self.image_outputs(
+                            &image,
+                            ImageRowOrder::UnityDecoded,
+                            output,
+                            &format!("{stem}_layer_{layer:04}"),
+                            report,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if matches!(object.class_id(), 28 | 213) {
                     let image = if object.class_id() == 28 {
                         object
@@ -2796,6 +2839,269 @@ pub(crate) mod tests {
         bytes.extend(body);
         (bytes, pixels)
     }
+    fn synthetic_texture_array(
+        streamed: bool,
+        stripped: bool,
+        graphics_format: i32,
+    ) -> (Vec<u8>, [Vec<u8>; 2], Vec<u8>) {
+        fn int(out: &mut Vec<u8>, n: i32) {
+            out.extend(n.to_le_bytes());
+        }
+        fn string(out: &mut Vec<u8>, text: &str) {
+            int(out, text.len() as i32);
+            out.extend(text.as_bytes());
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+        }
+        let layers = [
+            vec![255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 64, 9, 8, 7, 6],
+            vec![
+                1, 2, 3, 4, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+            ],
+        ];
+        // Each layer contains mip0 followed by its own mip1; the latter must not become a layer.
+        let payload = [
+            layers[0].clone(),
+            vec![7, 7, 7, 255],
+            layers[1].clone(),
+            vec![8, 8, 8, 255],
+        ]
+        .concat();
+        let version = if stripped {
+            "2023.2.0f1"
+        } else {
+            "2022.3.62f1"
+        };
+        let mut body = Vec::new();
+        string(&mut body, "../../array");
+        body.extend(vec![0; if stripped { 4 } else { 8 }]); // versioned Texture base, aligned
+        for n in [1, graphics_format, 2, 2, 2, 2] {
+            int(&mut body, n);
+        }
+        if stripped {
+            int(&mut body, 1);
+        }
+        int(&mut body, payload.len() as i32);
+        body.extend([0; 24]);
+        int(&mut body, 0);
+        body.extend([1, 0, 0, 0]);
+        if streamed {
+            int(&mut body, 0);
+            body.extend(3_i64.to_le_bytes());
+            int(&mut body, payload.len() as i32);
+            string(&mut body, "array.resS");
+        } else {
+            int(&mut body, payload.len() as i32);
+            body.extend(&payload);
+        }
+        let mut metadata = version.as_bytes().to_vec();
+        metadata.push(0);
+        int(&mut metadata, 13);
+        metadata.push(0);
+        int(&mut metadata, 1);
+        int(&mut metadata, 187);
+        metadata.push(0);
+        metadata.extend((-1_i16).to_le_bytes());
+        metadata.extend([0; 16]);
+        int(&mut metadata, 1);
+        while !(metadata.len() + 48).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend(41_i64.to_le_bytes());
+        metadata.extend(0_i64.to_le_bytes());
+        for n in [body.len() as i32, 0, 0, 0, 0] {
+            int(&mut metadata, n);
+        }
+        metadata.push(0);
+        let offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut file = vec![0; 48];
+        file[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        file[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        file[24..32].copy_from_slice(&((offset + body.len()) as u64).to_be_bytes());
+        file[32..40].copy_from_slice(&(offset as u64).to_be_bytes());
+        file.extend(metadata);
+        file.resize(offset, 0);
+        file.extend(body);
+        (file, layers, payload)
+    }
+    #[test]
+    fn texture_arrays_export_every_mip_zero_layer_with_correct_stride_and_scope() {
+        for streamed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let input = root.path().join("input");
+            fs::create_dir_all(input.join("assets")).unwrap();
+            let (file, layers, payload) = synthetic_texture_array(streamed, false, 4);
+            fs::write(input.join("assets/array.assets"), &file).unwrap();
+            let asset = crate::update::AssetReceipt {
+                relative_path: "array.assets".into(),
+                provider: Provider::UnityBundle,
+                bytes: file.len() as u64,
+                downloaded_sha256: hex::encode(Sha256::digest(&file)),
+                stored_sha256: hex::encode(Sha256::digest(&file)),
+                decrypted: false,
+            };
+            let dependencies = std::collections::BTreeSet::from(["array.resS".into()]);
+            let mut cfg = config(root.path());
+            cfg.retain_outputs = true;
+            cfg.detected_cpus = 1;
+            cfg.cpu.limit_stages = true;
+            cfg.stage_limits.image = Some(1);
+            cfg.stage_limits.wait_timeout_seconds = 1;
+            cfg.set_service_cpu_gate(std::sync::Arc::default(), Some(1));
+            if streamed {
+                let out = root.path().join("missing");
+                fs::create_dir(&out).unwrap();
+                let report = cfg
+                    .process_resource(&input, &out, &asset, 0, 0, None)
+                    .unwrap();
+                assert!(!report.errors.is_empty());
+                assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+                fs::write(
+                    input.join("assets/array.resS"),
+                    [vec![1, 2, 3], payload, vec![0xff]].concat(),
+                )
+                .unwrap();
+            }
+            let mut first_bytes = 0;
+            for policy in ["auto", "image", "image_archive"] {
+                cfg.read_kinds =
+                    yaml_serde::from_str(&format!("classes: {{187: {policy}}}")).unwrap();
+                cfg.read_kinds.validate().unwrap();
+                let out = root.path().join(policy);
+                fs::create_dir(&out).unwrap();
+                let report = cfg
+                    .process_resource(
+                        &input,
+                        &out,
+                        &asset,
+                        0,
+                        0,
+                        streamed.then_some(&dependencies),
+                    )
+                    .unwrap();
+                assert!(
+                    report.errors.is_empty(),
+                    "streamed={streamed} policy={policy}: {:?}",
+                    report.errors
+                );
+                assert_eq!(report.outputs.len(), 2);
+                assert_eq!(report.selected_objects, 1);
+                first_bytes = report.outputs[0].bytes;
+                for (index, record) in report.outputs.iter().enumerate() {
+                    assert_eq!(record.path, format!("0_41_layer_{index:04}.png"));
+                    assert_eq!(record.object.as_ref().unwrap().class_id, 187);
+                    assert_eq!(record.object.as_ref().unwrap().path_id, 41);
+                    let bytes = fs::read(out.join("00000").join(&record.path)).unwrap();
+                    assert_eq!(record.sha256, hex::encode(Sha256::digest(&bytes)));
+                    let mut decoder = png::Decoder::new(Cursor::new(bytes)).read_info().unwrap();
+                    let mut decoded = vec![0; decoder.output_buffer_size().unwrap()];
+                    let info = decoder.next_frame(&mut decoded).unwrap();
+                    assert_eq!((info.width, info.height), (2, 2));
+                    let expected: Vec<u8> = layers[index]
+                        .chunks_exact(8)
+                        .rev()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    assert_eq!(&decoded[..info.buffer_size()], expected);
+                }
+                assert_eq!(fs::read_dir(out.join("00000")).unwrap().count(), 2);
+            }
+            cfg.max_resource_output_bytes = first_bytes;
+            let out = root.path().join("limited");
+            fs::create_dir(&out).unwrap();
+            let report = cfg
+                .process_resource(
+                    &input,
+                    &out,
+                    &asset,
+                    0,
+                    0,
+                    streamed.then_some(&dependencies),
+                )
+                .unwrap();
+            assert!(!report.errors.is_empty());
+            assert_eq!(report.outputs.len(), 1);
+            assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG for independent array rendition decoding"]
+    fn texture_arrays_preserve_each_layer_across_image_renditions() {
+        let root = tempfile::tempdir().unwrap();
+        let (file, layers, _) = synthetic_texture_array(false, false, 4);
+        fs::create_dir(root.path().join("assets")).unwrap();
+        fs::write(root.path().join("assets/array.assets"), &file).unwrap();
+        let asset = crate::update::AssetReceipt {
+            relative_path: "array.assets".into(),
+            provider: Provider::UnityBundle,
+            bytes: file.len() as u64,
+            downloaded_sha256: hex::encode(Sha256::digest(&file)),
+            stored_sha256: hex::encode(Sha256::digest(&file)),
+            decrypted: false,
+        };
+        let mut cfg = config(root.path());
+        cfg.ffmpeg = std::env::var("SIRIUS_TEST_FFMPEG").unwrap().into();
+        cfg.retain_outputs = true;
+        cfg.detected_cpus = 1;
+        cfg.cpu.limit_stages = true;
+        cfg.stage_limits.image = Some(1);
+        cfg.set_service_cpu_gate(std::sync::Arc::default(), Some(1));
+        cfg.image = yaml_serde::from_str("[{format: png}, {format: webp}]").unwrap();
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let report = cfg
+            .process_resource(root.path(), &out, &asset, 0, 0, None)
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.outputs.len(), 4);
+        for (layer, pixels) in layers.iter().enumerate() {
+            let expected: Vec<u8> = pixels.chunks_exact(8).rev().flatten().copied().collect();
+            for extension in ["png", "webp"] {
+                let name = format!("0_41_layer_{layer:04}.{extension}");
+                let record = report.outputs.iter().find(|r| r.path == name).unwrap();
+                assert_eq!(record.object.as_ref().unwrap().class_id, 187);
+                assert_eq!(record.object.as_ref().unwrap().path_id, 41);
+                let path = out.join("00000").join(&name);
+                assert_eq!(
+                    record.sha256,
+                    hex::encode(Sha256::digest(fs::read(&path).unwrap()))
+                );
+                let raw = root.path().join(format!("{name}.rgba"));
+                cfg.ffmpeg(&[
+                    "-i".into(),
+                    path.into_os_string(),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    "-pix_fmt".into(),
+                    "rgba".into(),
+                    raw.as_os_str().to_owned(),
+                ])
+                .unwrap();
+                assert_eq!(fs::read(raw).unwrap(), expected);
+            }
+        }
+    }
+    #[test]
+    fn texture_arrays_reject_unknown_formats_and_missing_mip_zero() {
+        for (stripped, format) in [(true, 4), (false, 999999)] {
+            let root = tempfile::tempdir().unwrap();
+            let (file, _, _) = synthetic_texture_array(false, stripped, format);
+            let input = root.path().join("array.assets");
+            fs::write(&input, file).unwrap();
+            let out = root.path().join("out");
+            fs::create_dir(&out).unwrap();
+            let cfg = config(root.path());
+            let mut report = ResourceReport::default();
+            cfg.unity(&input, &out, 0, &mut report, None, root.path())
+                .unwrap();
+            assert!(!report.errors.is_empty());
+            assert!(report.outputs.is_empty());
+            assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+        }
+    }
+
     // Synthetic named-object records; payloads are opaque markers, not playable media.
     fn synthetic_unity_media(
         class: i32,

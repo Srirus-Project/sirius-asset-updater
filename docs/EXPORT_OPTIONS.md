@@ -53,7 +53,8 @@ validation. An incompatible default for an encountered object fails that resourc
 | `auto` | All positive IDs | Existing Sirius class-specific native export |
 | `object_raw` | All positive IDs | Exact serialized object bytes as `.object.bin` |
 | `typetree_json` | All positive IDs with readable type trees | Explicit JSON; opaque TypelessData also retains backing object bytes |
-| `image` | 28 Texture2D, 213 Sprite | Configured image rendition(s) |
+| `image` | 28 Texture2D, 213 Sprite, 187 Texture2DArray | Configured image rendition(s) |
+| `image_archive` | 187 Texture2DArray | Each layer as configured image rendition(s) |
 | `audio` | 83 AudioClip | Original encoded audio payload |
 | `video` | 329 VideoClip, 152 legacy MovieTexture | Original encoded video payload |
 | `text_bytes` | 49 TextAsset | TextAsset byte payload |
@@ -75,9 +76,24 @@ policy or a non-auto policy claiming full native export. Legacy summaries withou
 the default auto policy. Every output still carries object identity and participates in hashes,
 resource limits, staging and publication verification.
 
-This restores general representation control and the native modes listed above. Texture2DArray/
-archive, animator and other original dispatch modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
+This restores general representation control and the native modes listed above. Animator
+and other original dispatch modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
 accepted as an unimplemented placeholder.
+
+## Texture arrays
+
+Texture2DArray (class 187) supports `auto`, `image` and `image_archive`. Each layer's mip0
+becomes `{file_index}_{path_id}_layer_{layer:04}.{extension}` for every configured rendition.
+This matches the original reader's layer scope: lower-resolution mips are not exported and
+`image_archive` does not produce a ZIP. Names embedded in the asset never become output paths.
+Inline data and catalog-scoped streamed dependencies are supported. Unknown formats, missing
+or truncated streams and stripped mip0 fail explicitly.
+
+Layers are decoded sequentially under CPU/image admission and cancellation controls. Native
+reader allocation limits and the aggregate resource output budget apply; hashes and parent
+object identity cover every image. A later layer/rendition failure prevents partial resource
+publication. Synthetic fixtures verify mip stride, orientation and alpha; real game-corpus
+acceptance remains a separate requirement.
 
 ## Unity media payloads
 

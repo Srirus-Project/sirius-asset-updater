@@ -11,6 +11,7 @@ pub enum Kind {
     ObjectRaw,
     TypetreeJson,
     Image,
+    ImageArchive,
     Audio,
     Video,
     TextBytes,
@@ -22,7 +23,11 @@ impl Kind {
     pub fn supports(self, class: i32) -> bool {
         match self {
             Self::Auto | Self::ObjectRaw | Self::TypetreeJson => class > 0,
-            Self::Image => matches!(class, 28 | 213),
+            Self::Image => matches!(
+                class,
+                28 | 213 | unity_rs_core::texture_array::TEXTURE_2D_ARRAY_CLASS_ID
+            ),
+            Self::ImageArchive => class == unity_rs_core::texture_array::TEXTURE_2D_ARRAY_CLASS_ID,
             Self::Audio => class == unity_rs_core::simple_assets::AUDIO_CLIP_CLASS_ID,
             Self::Video => matches!(
                 class,

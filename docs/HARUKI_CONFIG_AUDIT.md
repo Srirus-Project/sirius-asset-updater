@@ -75,9 +75,11 @@ not dismissed as Sekai-specific merely because the current implementation is sma
   plus exact `classes` overrides, separate from object selection. General auto/object_raw/type-tree
   modes and existing image/TextAsset/font/shader/OBJ adapters are connected and tested; summaries,
   cache identities and full-export claims account for representation changes. Original raw's
-  class-specific media/font payload semantics are not mislabeled as full object bytes. Remaining
-  Texture2DArray/archive and animator dispatch still need individual source/fixture applicability
-  review; configuration rejects unimplemented modes. AudioClip/VideoClip/legacy MovieTexture
+  class-specific media/font payload semantics are not mislabeled as full object bytes.
+  Texture2DArray/archive now exports each layer's mip0 through configured image renditions,
+  including bounded streamed data and per-layer identity/verification. Animator dispatch still
+  needs individual source/fixture applicability review; configuration rejects unimplemented modes.
+  AudioClip/VideoClip/legacy MovieTexture
   now preserve native encoded payloads, including catalog dependencies, with actual serialized
   fixture tests for inline/external data, safe naming, missing/truncated references and bounds.
   This is payload extraction, not universal codec decoding/transcoding.
