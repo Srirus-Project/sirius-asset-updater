@@ -9,6 +9,7 @@ max_concurrent_jobs: 4
 max_media_processes: 4 # range: 1..16; each export also keeps its media_concurrency limit
 max_uploads: 4 # range: 1..32; shared across job storage publications
 max_downloads: 4 # range: 1..64; shared catalog/resource CDN downloads
+max_in_flight_bundle_bytes: 0 # shared soft decode budget; 0 disables
 max_queued_jobs: 64
 retain_terminal_jobs: 256
 timeout_seconds: 3600

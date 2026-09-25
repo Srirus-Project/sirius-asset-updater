@@ -47,6 +47,12 @@ pub struct ExportConfig {
     pub split_acb_xor_env: Option<String>,
     #[serde(default = "default_workers")]
     pub concurrency: usize,
+    #[serde(default)]
+    pub max_in_flight_bundle_bytes: u64,
+    #[serde(skip)]
+    local_resource_budget: std::sync::OnceLock<crate::resource_budget::Budget>,
+    #[serde(skip)]
+    service_resource_budget: Option<std::sync::Arc<crate::resource_budget::Budget>>,
     #[serde(default = "default_media_concurrency")]
     pub media_concurrency: usize,
     #[serde(skip)]
@@ -464,6 +470,35 @@ impl ExportConfig {
         key: u64,
         dependencies: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<ResourceReport, Error> {
+        let mut weight = asset.bytes;
+        if let Some(dependencies) = dependencies.filter(|_| {
+            self.max_in_flight_bundle_bytes > 0 || self.service_resource_budget.is_some()
+        }) {
+            for dependency in dependencies {
+                let metadata =
+                    fs::symlink_metadata(input.join("assets").join(dependency)).map_err(err)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(Error::Verification);
+                }
+                weight = weight.checked_add(metadata.len()).ok_or(Error::Size)?;
+            }
+        }
+        let _local = if self.max_in_flight_bundle_bytes > 0 {
+            Some(
+                self.local_resource_budget
+                    .get_or_init(|| {
+                        crate::resource_budget::Budget::new(self.max_in_flight_bundle_bytes)
+                    })
+                    .acquire(weight, &self.cancel)?,
+            )
+        } else {
+            None
+        };
+        let _shared = self
+            .service_resource_budget
+            .as_ref()
+            .map(|budget| budget.acquire(weight, &self.cancel))
+            .transpose()?;
         let work = tempfile::Builder::new()
             .prefix(".export-")
             .tempdir_in(root)
@@ -1316,6 +1351,12 @@ impl ExportConfig {
         );
         self.ffmpeg_deadline(cli_args, deadline)
     }
+    pub(crate) fn set_service_resource_budget(
+        &mut self,
+        budget: Option<std::sync::Arc<crate::resource_budget::Budget>>,
+    ) {
+        self.service_resource_budget = budget;
+    }
     pub(crate) fn set_service_media_gate(
         &mut self,
         gate: std::sync::Arc<crate::media_gate::Gate>,
@@ -1685,6 +1726,9 @@ pub(crate) mod tests {
             cri_key_env: "UNUSED_TEST_KEY".into(),
             split_acb_xor_env: None,
             concurrency: 1,
+            max_in_flight_bundle_bytes: 0,
+            local_resource_budget: Default::default(),
+            service_resource_budget: None,
             media_concurrency: 2,
             media_gate: Default::default(),
             service_media_gate: None,
@@ -2634,6 +2678,48 @@ pub(crate) mod tests {
             source: "test".into(),
         }
     }
+    #[test]
+    fn resource_byte_budget_cancels_before_decode_and_releases_for_recovery() {
+        use std::sync::{atomic::Ordering, Arc};
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        fs::create_dir_all(cfg.input.join("assets")).unwrap();
+        fs::create_dir_all(&cfg.output).unwrap();
+        let bytes = synthetic_acb(0x12345678);
+        fs::write(cfg.input.join("assets/test.acb"), &bytes).unwrap();
+        let asset = crate::update::AssetReceipt {
+            relative_path: "test.acb".into(),
+            provider: Provider::Cri,
+            bytes: bytes.len() as u64,
+            downloaded_sha256: hex::encode(Sha256::digest(&bytes)),
+            stored_sha256: hex::encode(Sha256::digest(&bytes)),
+            decrypted: false,
+        };
+        cfg.max_in_flight_bundle_bytes = 10;
+        let budget = Arc::new(crate::resource_budget::Budget::new(10));
+        cfg.set_service_resource_budget(Some(budget.clone()));
+        let cfg = Arc::new(cfg);
+        let hold = budget.acquire(1, &cfg.cancel).unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                cfg.process_resource(&cfg.input, &cfg.output, &asset, 0, 0x12345678, None)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!worker.is_finished());
+            assert_eq!(fs::read_dir(&cfg.output).unwrap().count(), 0);
+            cfg.cancel.store(true, Ordering::Relaxed);
+            assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+        });
+        drop(hold);
+        cfg.cancel.store(false, Ordering::Relaxed);
+        let report = cfg
+            .process_resource(&cfg.input, &cfg.output, &asset, 0, 0x12345678, None)
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert!(!report.outputs.is_empty());
+        let _permit = budget.acquire(10, &cfg.cancel).unwrap();
+    }
+
     #[test]
     fn incremental_export_reuses_verified_audio_repairs_corruption_and_keeps_old_outputs() {
         let temp = tempfile::tempdir().unwrap();

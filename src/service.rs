@@ -50,6 +50,8 @@ pub struct ServiceConfig {
     pub max_uploads: usize,
     #[serde(default = "workers")]
     pub max_downloads: usize,
+    #[serde(default)]
+    pub max_in_flight_bundle_bytes: u64,
     #[serde(default = "queued")]
     pub max_queued_jobs: usize,
     #[serde(default = "retained")]
@@ -103,6 +105,7 @@ struct Inner {
     media_gate: Arc<crate::media_gate::Gate>,
     upload_gate: Arc<tokio::sync::Semaphore>,
     download_gate: Arc<tokio::sync::Semaphore>,
+    resource_budget: Option<Arc<crate::resource_budget::Budget>>,
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
@@ -183,6 +186,11 @@ impl Service {
                 access_log,
                 upload_gate: Arc::new(tokio::sync::Semaphore::new(config.max_uploads)),
                 download_gate: Arc::new(tokio::sync::Semaphore::new(config.max_downloads)),
+                resource_budget: (config.max_in_flight_bundle_bytes > 0).then(|| {
+                    Arc::new(crate::resource_budget::Budget::new(
+                        config.max_in_flight_bundle_bytes,
+                    ))
+                }),
                 config,
                 token,
                 store: Mutex::new(store),
@@ -397,6 +405,7 @@ impl Service {
                 {
                     return Err(Error::Config);
                 }
+                export.set_service_resource_budget(self.inner.resource_budget.clone());
                 export.set_service_media_gate(
                     self.inner.media_gate.clone(),
                     self.inner.config.max_media_processes,
@@ -774,6 +783,7 @@ mod lifecycle_tests {
             max_media_processes: 4,
             max_uploads: 4,
             max_downloads: 4,
+            max_in_flight_bundle_bytes: 0,
             max_queued_jobs: 8,
             retain_terminal_jobs: 20,
             timeout_seconds,

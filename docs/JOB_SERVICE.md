@@ -108,8 +108,7 @@ already-held local slot. Auto backend fallback releases the FFI slot before reac
 Standalone CLI exports retain their existing per-export limit without a service-level cap.
 
 This controls simultaneous operations, not FFmpeg's internal thread count or total process RSS.
-Apply deployment CPU/memory limits separately. Shared memory admission and the
-remaining original resource tuning controls are separate restoration work. The service budget
+Apply deployment CPU/memory limits separately. The remaining original CPU/stage tuning controls are separate restoration work. The service budget
 does not change cache identity or output formats.
 
 ## Shared upload budget
@@ -135,3 +134,22 @@ Snapshot/version control requests do not consume CDN slots. Verified download-ca
 network admission. Decryption and export run after download admission is released; this setting
 is not an in-flight decoded-memory limit. Standalone downloads use the same attempt deadline
 without a service-wide semaphore. Existing retry counts and whole-run/job deadlines still apply.
+
+## Soft resource byte budget
+
+`max_in_flight_bundle_bytes` is optional at both service and export configuration levels (default
+0, disabled). Enabled limits are acquired together before decoding a resource; the service
+budget is shared across all jobs, and the export budget applies to its own workers. Weight is
+the verified main-resource file size plus on-disk sizes of the distinct Unity dependencies.
+Permits remain held through decoding/output creation and release on success, failure, panic
+unwind or cancellation. Cache hits bypass decoding and do not consume this budget. A resource
+larger than a configured budget consumes that entire budget exclusively rather than deadlocking.
+Waiters check cancellation every 20 ms, allowing job shutdown/deadline cancellation to drain them.
+
+This adapts Haruki's estimated bundle-byte admission to Sirius's staged download/decode pipeline.
+Download streaming has its separate shared concurrency bound; source bytes are already on disk
+before export. Compressed input size does not predict decompressed textures/PCM, retained indexes,
+FFmpeg allocations or filesystem cache, so this is **not a hard RSS ceiling**. Continue using
+container/systemd limits for total memory. Zero preserves prior behavior; no arbitrary default
+memory budget is inferred from the host. Budget settings do not change exported content or cache
+identity. Remaining CPU/stage tuning and final production resource acceptance are still required.
