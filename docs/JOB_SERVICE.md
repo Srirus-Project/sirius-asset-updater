@@ -75,7 +75,13 @@ The ledger is persisted before submission is acknowledged. Queue overflow return
 job per region executes at once, with a configurable total execution limit. A running cancellation
 stays `cancelling` until its worker actually exits. Export cancellation waits for active resources
 and bounded media subprocesses; it is not an immediate process kill. Never remove a job's files
-while cancellation is pending. Export progress is read from its summary once per second; final counts are persisted even for
+while cancellation is pending. Download progress is sampled once per second after catalog selection:
+`total` counts selected remote resources, `completed` counts fully downloaded/cache-restored and
+validated batches, and `bytes` counts their input bytes (including cache hits). These are not
+wire-transfer bytes or partial-file percentages; the catalog itself is excluded. Before a valid
+plan exists, total remains unknown. Each attempt resets counters, and progress does not imply
+publication: final version validation and atomic publication must still succeed.
+Export progress is read from its summary once per second; final counts are persisted even for
 short jobs. Verify progress counts the catalog plus the downloaded assets actually verified;
 full-catalog scope remains in verification.json. A job deadline reports `failed` with
 `job_timeout`, distinct from an acknowledged user cancellation. Deadlines send a cancellation

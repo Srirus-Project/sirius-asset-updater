@@ -510,7 +510,25 @@ impl Service {
             config.output = root.join("downloads");
             let mut client = crate::CatalogClient::new(config)?;
             client.set_service_download_gate(self.inner.download_gate.clone());
-            tokio::select! {result=client.fetch()=>result?,_=cancelled(&mut stop)=>return Err(Error::Cancelled)}
+            let (progress_tx, progress_rx) = watch::channel(Progress::default());
+            client.set_download_progress(progress_tx);
+            let work = client.fetch();
+            tokio::pin!(work);
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    result = &mut work => break result?,
+                    _ = cancelled(&mut stop) => return Err(Error::Cancelled),
+                    _ = tick.tick() => {
+                        let progress = progress_rx.borrow().clone();
+                        if !progress.phase.is_empty() {
+                            self.inner.store.lock().await.progress(&job.id, progress)
+                                .map_err(|_| Error::Io)?;
+                        }
+                    }
+                }
+            }
         } else {
             profile.input.clone().ok_or(Error::Config)?
         };

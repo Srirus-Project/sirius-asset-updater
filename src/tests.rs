@@ -3394,3 +3394,69 @@ async fn raw_bundles_run_from_verified_download_with_filtered_scope_and_incremen
     let export: crate::export::ExportConfig = yaml_serde::from_str(&yaml).unwrap();
     assert!(matches!(export.run().await, Err(Error::Selection)));
 }
+
+#[tokio::test]
+async fn download_progress_reports_verified_batches_before_completion_and_resets_on_retry() {
+    let output = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = output.path().into();
+    enable_assets(&mut cfg, false);
+    cfg.assets.as_mut().unwrap().concurrency = 1;
+    let catalog = catalog_fixture(
+        &[
+            ("{Fwk.Resource.RemoteAssetDir}/a", CRI_PROVIDER),
+            ("{Fwk.Resource.RemoteAssetDir}/b", CRI_PROVIDER),
+        ],
+        false,
+    );
+    let (mut client, fixture, server) = serve(cfg, StatusCode::OK, catalog, Duration::ZERO).await;
+    for (name, data) in [("a", b"first".as_slice()), ("b", b"second".as_slice())] {
+        fixture
+            .assets
+            .lock()
+            .unwrap()
+            .insert(name.into(), (StatusCode::OK, data.to_vec()));
+    }
+    fixture.stalled_assets.lock().unwrap().insert("b".into());
+    let (tx, mut rx) = tokio::sync::watch::channel(jobs::Progress::default());
+    client.set_download_progress(tx);
+    {
+        let work = client.fetch();
+        tokio::pin!(work);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    result = &mut work => panic!("stalled download completed: {}", result.is_ok()),
+                    result = rx.changed() => {
+                        result.unwrap();
+                        let p = rx.borrow().clone();
+                        if p.completed == 1 {
+                            assert_eq!(p.phase, "download");
+                            assert_eq!(p.total, Some(2));
+                            assert_eq!(p.bytes, 5);
+                            assert_eq!(p.failed, 0);
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Dropping an incomplete fetch must not publish partial input.
+    }
+    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    fixture.stalled_assets.lock().unwrap().clear();
+    let path = client.fetch().await.unwrap();
+    assert_eq!(verify::verify(&path).await.unwrap().asset_files_verified, 2);
+    let p = rx.borrow().clone();
+    assert_eq!((p.completed, p.total, p.bytes), (2, Some(2), 11));
+    // Failure before a plan exists cannot retain counters from a previous run.
+    let token = std::env::var(&client.config.internal_token_env).unwrap();
+    std::env::remove_var(&client.config.internal_token_env);
+    assert!(matches!(client.fetch().await, Err(Error::Preflight)));
+    let p = rx.borrow().clone();
+    assert_eq!((p.completed, p.total, p.bytes), (0, None, 0));
+    std::env::set_var(&client.config.internal_token_env, token);
+    server.abort();
+}

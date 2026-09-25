@@ -339,6 +339,7 @@ pub struct CatalogClient {
     http: Client,
     cdn_http: Client,
     service_download_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    download_progress: Option<tokio::sync::watch::Sender<jobs::Progress>>,
 }
 impl CatalogClient {
     pub fn new(config: Config) -> Result<Self, Error> {
@@ -357,7 +358,26 @@ impl CatalogClient {
             http,
             cdn_http,
             service_download_gate: None,
+            download_progress: None,
         })
+    }
+
+    pub(crate) fn set_download_progress(
+        &mut self,
+        sender: tokio::sync::watch::Sender<jobs::Progress>,
+    ) {
+        self.download_progress = Some(sender);
+    }
+    fn report_download(&self, completed: usize, total: Option<usize>, bytes: u64) {
+        if let Some(sender) = &self.download_progress {
+            sender.send_replace(jobs::Progress {
+                phase: "download".into(),
+                completed: completed as u64,
+                failed: 0,
+                total: total.map(|n| n as u64),
+                bytes,
+            });
+        }
     }
 
     pub(crate) fn set_service_download_gate(
@@ -389,6 +409,7 @@ impl CatalogClient {
         .map_err(|_| Error::Transport)?
     }
     pub async fn fetch(&self) -> Result<PathBuf, Error> {
+        self.report_download(0, None, 0);
         if !self.config.check_secrets().ready {
             return Err(Error::Preflight);
         }

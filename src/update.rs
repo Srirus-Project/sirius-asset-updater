@@ -46,6 +46,7 @@ impl CatalogClient {
             .ok_or(Error::Snapshot)?;
         let mut plan = catalog.select(&config.selection)?.plan(remote_dir)?;
         config.selection.prioritize(&mut plan)?;
+        self.report_download(0, Some(plan.assets.len()), 0);
         let key = config
             .decrypt
             .as_ref()
@@ -211,6 +212,7 @@ impl CatalogClient {
                 receipt.assets.push(asset);
             }
             next = end;
+            self.report_download(next, Some(plan.assets.len()), receipt.total_bytes);
             tracing::info!(
                 stage = "asset",
                 completed = next,
