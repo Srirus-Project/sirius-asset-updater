@@ -96,10 +96,42 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_sha256: Option<String>,
 }
+/// Completion notices contain the persisted result, never source paths or credentials.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Completion {
+    pub schema_version: u8,
+    pub job_id: String,
+    pub request: Request,
+    pub outcome: Outcome,
+    pub completed_at: DateTime<Utc>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CompletionDelivery {
+    pub event: Completion,
+    pub pending_targets: Vec<String>,
+}
+#[derive(Clone)]
+pub struct CompletionTarget {
+    pub region: Region,
+    /// Stable hash of recipient identity; endpoint/credential material is not persisted here.
+    pub identity: String,
+}
+const MAX_COMPLETION_EVENTS: usize = 4096;
+fn bounded_completion(event: &Completion) -> bool {
+    sonic_rs::to_vec(event).is_ok_and(|bytes| bytes.len() <= 65536)
+}
+fn target_identity(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 #[derive(Clone, Deserialize, Serialize)]
 struct Ledger {
     schema_version: u8,
     jobs: Vec<Job>,
+    #[serde(default)]
+    completions: Vec<CompletionDelivery>,
 }
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -108,6 +140,7 @@ pub struct Limits {
     pub retain_terminal: usize,
 }
 pub struct JobStore {
+    completion_targets: Vec<CompletionTarget>,
     directory: PathBuf,
     _owner: File,
     ledger: Ledger,
@@ -131,13 +164,37 @@ impl JobStore {
         let mut ledger: Ledger = match fs::read(&path) {
             Ok(bytes) => sonic_rs::from_slice(&bytes).map_err(|_| JobError::Storage)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger {
-                schema_version: 1,
+                schema_version: 2,
                 jobs: vec![],
+                completions: vec![],
             },
             Err(_) => return Err(JobError::Storage),
         };
-        if ledger.schema_version != 1 {
+        if !matches!(ledger.schema_version, 1 | 2) {
             return Err(JobError::Storage);
+        }
+        if ledger.completions.len() > MAX_COMPLETION_EVENTS {
+            return Err(JobError::Storage);
+        }
+        let mut events = std::collections::HashSet::new();
+        for delivery in &ledger.completions {
+            let event = &delivery.event;
+            let mut targets = std::collections::HashSet::new();
+            if !bounded_completion(event)
+                || event.schema_version != 1
+                || uuid::Uuid::parse_str(&event.job_id).is_err()
+                || !events.insert(&event.job_id)
+                || !valid_request(&event.request)
+                || event.outcome.verification.region != event.request.region
+                || delivery.pending_targets.is_empty()
+                || delivery.pending_targets.len() > 16
+                || delivery
+                    .pending_targets
+                    .iter()
+                    .any(|id| !target_identity(id) || !targets.insert(id))
+            {
+                return Err(JobError::Storage);
+            }
         }
         let mut ids = std::collections::HashSet::new();
         let mut keys = std::collections::HashSet::new();
@@ -166,6 +223,7 @@ impl JobStore {
             }
         }
         let mut store = Self {
+            completion_targets: vec![],
             directory: directory.into(),
             _owner: owner,
             ledger,
@@ -173,6 +231,56 @@ impl JobStore {
         };
         store.commit(store.ledger.clone())?;
         Ok(store)
+    }
+    /// Configure recipients before claiming work. Existing deliveries keep their original identities.
+    pub fn configure_completions(
+        &mut self,
+        targets: Vec<CompletionTarget>,
+    ) -> Result<(), JobError> {
+        let mut identities = std::collections::HashSet::new();
+        if targets.len() > 16
+            || targets.iter().any(|t| {
+                t.region == Region::Cn
+                    || !target_identity(&t.identity)
+                    || !identities.insert(&t.identity)
+            })
+        {
+            return Err(JobError::Invalid);
+        }
+        let reserved = self
+            .ledger
+            .jobs
+            .iter()
+            .filter(|j| {
+                !j.status.terminal() && targets.iter().any(|t| t.region == j.request.region)
+            })
+            .count();
+        if reserved + self.ledger.completions.len() > MAX_COMPLETION_EVENTS {
+            return Err(JobError::Full);
+        }
+        self.completion_targets = targets;
+        Ok(())
+    }
+    pub fn completions(&self) -> &[CompletionDelivery] {
+        &self.ledger.completions
+    }
+    /// Persist acknowledgement only after receiver acceptance. Never changes/retries the source job.
+    pub fn acknowledge_completion(&mut self, job_id: &str, target: &str) -> Result<(), JobError> {
+        if !target_identity(target) || uuid::Uuid::parse_str(job_id).is_err() {
+            return Err(JobError::Invalid);
+        }
+        let mut ledger = self.ledger.clone();
+        let delivery = ledger
+            .completions
+            .iter_mut()
+            .find(|d| d.event.job_id == job_id)
+            .ok_or(JobError::NotFound)?;
+        if !delivery.pending_targets.iter().any(|id| id == target) {
+            return Err(JobError::NotFound);
+        }
+        delivery.pending_targets.retain(|id| id != target);
+        ledger.completions.retain(|d| !d.pending_targets.is_empty());
+        self.commit(ledger)
     }
     pub fn list(&self) -> &[Job] {
         &self.ledger.jobs
@@ -227,6 +335,27 @@ impl JobStore {
             >= self.limits.max_queued
         {
             return Err(JobError::Full);
+        }
+        if self
+            .completion_targets
+            .iter()
+            .any(|t| t.region == request.region)
+        {
+            let reserved = self
+                .ledger
+                .jobs
+                .iter()
+                .filter(|j| {
+                    !j.status.terminal()
+                        && self
+                            .completion_targets
+                            .iter()
+                            .any(|t| t.region == j.request.region)
+                })
+                .count();
+            if self.ledger.completions.len() + reserved >= MAX_COMPLETION_EVENTS {
+                return Err(JobError::Full);
+            }
         }
         let now = Utc::now();
         let job = Job {
@@ -372,6 +501,46 @@ impl JobStore {
         Ok(result)
     }
     fn commit(&mut self, mut ledger: Ledger) -> Result<(), JobError> {
+        ledger.schema_version = 2;
+        for job in &ledger.jobs {
+            if job.status != Status::Completed
+                || self
+                    .ledger
+                    .jobs
+                    .iter()
+                    .any(|old| old.id == job.id && old.status == Status::Completed)
+            {
+                continue;
+            }
+            if let Some(outcome) = &job.outcome {
+                let pending_targets: Vec<_> = self
+                    .completion_targets
+                    .iter()
+                    .filter(|t| t.region == job.request.region)
+                    .map(|t| t.identity.clone())
+                    .collect();
+                if !pending_targets.is_empty() {
+                    if ledger.completions.len() >= MAX_COMPLETION_EVENTS {
+                        return Err(JobError::Full);
+                    }
+                    let delivery = CompletionDelivery {
+                        event: Completion {
+                            schema_version: 1,
+                            job_id: job.id.clone(),
+                            request: job.request.clone(),
+                            outcome: outcome.clone(),
+                            completed_at: job.updated_at,
+                        },
+                        pending_targets,
+                    };
+                    if !bounded_completion(&delivery.event) {
+                        return Err(JobError::Invalid);
+                    }
+                    ledger.completions.push(delivery);
+                }
+            }
+        }
+
         if self.limits.retain_terminal > 0 {
             let mut terminal: Vec<_> = ledger
                 .jobs
@@ -706,5 +875,208 @@ mod tests {
             JobStore::open(d.path(), limits()),
             Err(JobError::Storage)
         ));
+    }
+    fn completion_outcome() -> Outcome {
+        Outcome {
+            verification: crate::verify::Verification {
+                full_catalog: false,
+                catalog_remote_files: 0,
+                catalog_verified: true,
+                region: Region::Jp,
+                platform: "iOS".into(),
+                environment: "production".into(),
+                resource_version: "catalog-1".into(),
+                platform_hash: "hash-1".into(),
+                catalog_sha256: "a".repeat(64),
+                asset_files_verified: 0,
+                asset_bytes_verified: 0,
+                planned_remote_files: 0,
+                embedded_locations: 0,
+                decrypted_bundles: 0,
+            },
+            export: None,
+            publication_id: None,
+        }
+    }
+    fn completion_targets() -> Vec<CompletionTarget> {
+        vec![
+            CompletionTarget {
+                region: Region::Jp,
+                identity: "a".repeat(64),
+            },
+            CompletionTarget {
+                region: Region::Jp,
+                identity: "b".repeat(64),
+            },
+        ]
+    }
+    #[test]
+    fn completion_outbox_is_atomic_independent_of_retention_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut l = limits();
+        l.retain_terminal = 1;
+        let mut store = JobStore::open(root.path(), l).unwrap();
+        store.configure_completions(completion_targets()).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let job = store.submit(request(Region::Jp)).unwrap();
+            store.claim().unwrap();
+            store
+                .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+                .unwrap();
+            ids.push(job.id);
+        }
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.completions().len(), 4);
+        assert!(store.get(&ids[0]).is_none());
+        drop(store);
+        let mut store = JobStore::open(root.path(), l).unwrap();
+        assert_eq!(store.completions().len(), 4);
+        store
+            .configure_completions(vec![CompletionTarget {
+                region: Region::Jp,
+                identity: "c".repeat(64),
+            }])
+            .unwrap();
+        assert_eq!(
+            store.completions()[0].pending_targets,
+            vec!["a".repeat(64), "b".repeat(64)]
+        );
+        store
+            .acknowledge_completion(&ids[0], &"a".repeat(64))
+            .unwrap();
+        drop(store);
+        let mut store = JobStore::open(root.path(), l).unwrap();
+        assert_eq!(store.completions()[0].pending_targets, vec!["b".repeat(64)]);
+        store
+            .acknowledge_completion(&ids[0], &"b".repeat(64))
+            .unwrap();
+        assert_eq!(store.completions().len(), 3);
+        assert_eq!(store.list().len(), 1);
+        assert!(store.claim().unwrap().is_none());
+        let job = store.submit(request(Region::En)).unwrap();
+        store.claim().unwrap();
+        store.finish(&job.id, Some("failure")).unwrap();
+        assert_eq!(store.completions().len(), 3);
+    }
+    #[test]
+    fn completion_and_ack_write_failures_preserve_prior_state() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = JobStore::open(root.path(), limits()).unwrap();
+        store.configure_completions(completion_targets()).unwrap();
+        let job = store.submit(request(Region::Jp)).unwrap();
+        store.claim().unwrap();
+        let file = root.path().join("jobs.json");
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert!(store
+            .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+            .is_err());
+        assert_eq!(store.get(&job.id).unwrap().status, Status::Running);
+        assert!(store.completions().is_empty());
+        fs::remove_dir(&file).unwrap();
+        store
+            .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+            .unwrap();
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert!(store
+            .acknowledge_completion(&job.id, &"a".repeat(64))
+            .is_err());
+        assert_eq!(store.completions()[0].pending_targets.len(), 2);
+        fs::remove_dir(&file).unwrap();
+        store
+            .acknowledge_completion(&job.id, &"a".repeat(64))
+            .unwrap();
+        drop(store);
+        let store = JobStore::open(root.path(), limits()).unwrap();
+        assert_eq!(store.get(&job.id).unwrap().status, Status::Completed);
+        assert_eq!(store.completions()[0].pending_targets.len(), 1);
+    }
+    #[test]
+    fn oversized_completion_preserves_running_job_and_persisted_state() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = JobStore::open(root.path(), limits()).unwrap();
+        store.configure_completions(completion_targets()).unwrap();
+        let job = store.submit(request(Region::Jp)).unwrap();
+        store.claim().unwrap();
+        let prior = fs::read(root.path().join("jobs.json")).unwrap();
+        let mut outcome = completion_outcome();
+        outcome.publication_id = Some("x".repeat(65536));
+        assert!(matches!(
+            store.finish_with_outcome(&job.id, None, Some(outcome)),
+            Err(JobError::Invalid)
+        ));
+        assert_eq!(store.get(&job.id).unwrap().status, Status::Running);
+        assert!(store.completions().is_empty());
+        assert_eq!(fs::read(root.path().join("jobs.json")).unwrap(), prior);
+        store
+            .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+            .unwrap();
+        assert_eq!(store.completions().len(), 1);
+    }
+    #[test]
+    fn completion_outbox_reserves_capacity_for_accepted_work() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = JobStore::open(root.path(), limits()).unwrap();
+        store.configure_completions(completion_targets()).unwrap();
+        let mut ledger = store.ledger.clone();
+        ledger.completions = (0..MAX_COMPLETION_EVENTS - 1)
+            .map(|_| CompletionDelivery {
+                event: Completion {
+                    schema_version: 1,
+                    job_id: uuid::Uuid::new_v4().to_string(),
+                    request: request(Region::Jp),
+                    outcome: completion_outcome(),
+                    completed_at: Utc::now(),
+                },
+                pending_targets: vec!["a".repeat(64)],
+            })
+            .collect();
+        store.commit(ledger).unwrap();
+        let job = store.submit(request(Region::Jp)).unwrap();
+        assert!(matches!(
+            store.submit(request(Region::Jp)),
+            Err(JobError::Full)
+        ));
+        store.claim().unwrap();
+        store
+            .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+            .unwrap();
+        assert_eq!(store.completions().len(), MAX_COMPLETION_EVENTS);
+        let first = store.completions()[0].event.job_id.clone();
+        store
+            .acknowledge_completion(&first, &"a".repeat(64))
+            .unwrap();
+        store.submit(request(Region::Jp)).unwrap();
+        assert_eq!(store.completions().len(), MAX_COMPLETION_EVENTS - 1);
+    }
+    #[test]
+    fn completion_ledger_migrates_legacy_and_rejects_corrupt_delivery_identities() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("jobs.json"),
+            br#"{"schema_version":1,"jobs":[]}"#,
+        )
+        .unwrap();
+        let mut store = JobStore::open(root.path(), limits()).unwrap();
+        assert_eq!(store.ledger.schema_version, 2);
+        assert!(store.completions().is_empty());
+        store.configure_completions(completion_targets()).unwrap();
+        let job = store.submit(request(Region::Jp)).unwrap();
+        store.claim().unwrap();
+        store
+            .finish_with_outcome(&job.id, None, Some(completion_outcome()))
+            .unwrap();
+        store.ledger.completions[0]
+            .pending_targets
+            .push("invalid".into());
+        fs::write(
+            root.path().join("jobs.json"),
+            sonic_rs::to_vec(&store.ledger).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        assert!(JobStore::open(root.path(), limits()).is_err());
     }
 }

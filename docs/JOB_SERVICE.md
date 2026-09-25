@@ -169,3 +169,24 @@ progress persistence or cancellation stops verification without acknowledging su
 all concurrent exports (1..256, default omitted/null). It composes with profile-local
 `cpu.limit_stages` and existing stage/media/byte budgets. See [CPU admission](EXPORT.md#aggregate-cpu-stage-admission)
 for acquisition order, timeouts and the distinction from an OS CPU quota.
+
+## Completion delivery ledger (internal foundation)
+
+The job ledger now writes schema version 2 and reads versions 1 and 2. Opening a legacy
+ledger migrates it; older binaries that only understand version 1 cannot reopen the migrated
+state. Back up stopped-service state before upgrading; do not downgrade a live ledger.
+
+When completion targets are configured internally, a successful job with an outcome records
+its completion event and pending recipient identities in the same atomic ledger write. Events
+survive terminal-job pruning and restart; acknowledging one recipient leaves other recipients
+pending. Changing configured recipients does not reroute existing events. Failed/cancelled jobs
+do not generate successful completion notices.
+
+The outbox holds at most 4,096 events, each bounded to 64 KiB, with at most 16 recipients.
+Admission reserves room for accepted queued/running work in configured regions. Full queues
+reject new affected work rather than losing completion notices. Persistence failure leaves
+the previous in-memory state intact. Recipient identities are opaque hashes, not credentials.
+
+This is internal persistence groundwork: service configuration, HTTP delivery, retry scheduling
+and delivery-status routes are not connected yet. Current deployments do not send completion
+notifications or configure targets through the public service configuration.
