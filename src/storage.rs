@@ -28,6 +28,8 @@ pub struct Config {
     pub providers: Vec<Provider>,
     #[serde(default = "concurrency")]
     pub concurrency: usize,
+    #[serde(skip)]
+    pub(crate) service_upload_gate: Option<Arc<tokio::sync::Semaphore>>,
     #[serde(default = "attempts")]
     pub attempts: usize,
     #[serde(default = "timeout")]
@@ -487,12 +489,19 @@ impl Config {
             let expected = hex::encode(Sha256::digest(&marker));
             for attempt in 0..self.attempts {
                 let task = async {
+                    let _permit = self.acquire_upload().await?;
                     op.write(&key, marker.clone())
                         .await
                         .map_err(storage_error)?;
                     check_remote(op, &key, marker.len() as u64, &expected).await
                 };
-                match controlled(task, &mut stop, self.object_timeout_seconds).await {
+                match controlled(
+                    task,
+                    &mut stop,
+                    tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds),
+                )
+                .await
+                {
                     Err(Error::Transport) if attempt + 1 < self.attempts => {
                         let delay = (self.retry_delay_ms * (1 << attempt)).min(30_000);
                         tokio::select! {
@@ -565,6 +574,17 @@ impl Config {
         }
         Err(Error::Storage)
     }
+    async fn acquire_upload(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Error> {
+        match &self.service_upload_gate {
+            Some(gate) => gate
+                .clone()
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|_| Error::Cancelled),
+            None => Ok(None),
+        }
+    }
     async fn upload_once(
         &self,
         op: &Operator,
@@ -573,11 +593,21 @@ impl Config {
         object: &Object,
         stop: &mut watch::Receiver<bool>,
     ) -> Result<(), Error> {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds);
+        let _permit = controlled(self.acquire_upload(), stop, deadline).await?;
         let key = format!("{prefix}/{}", object.path);
         let source = input.join(&object.path);
-        let meta = tokio::fs::symlink_metadata(&source)
-            .await
-            .map_err(|_| Error::Io)?;
+        let meta = controlled(
+            async {
+                tokio::fs::symlink_metadata(&source)
+                    .await
+                    .map_err(|_| Error::Io)
+            },
+            stop,
+            deadline,
+        )
+        .await?;
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != object.bytes {
             return Err(Error::Verification);
         }
@@ -590,7 +620,7 @@ impl Config {
                     .map_err(storage_error)
             },
             stop,
-            self.object_timeout_seconds,
+            deadline,
         )
         .await?;
         let operation = async {
@@ -619,7 +649,7 @@ impl Config {
             writer.close().await.map_err(storage_error)?;
             check_remote(op, &key, object.bytes, &object.sha256).await
         };
-        let result = controlled(operation, stop, self.object_timeout_seconds).await;
+        let result = controlled(operation, stop, deadline).await;
         if result.is_err() {
             // Best effort, bounded abort; interrupted remote uploads may need bucket lifecycle cleanup.
             let _ = tokio::time::timeout(Duration::from_secs(3), writer.abort()).await;
@@ -630,13 +660,13 @@ impl Config {
 async fn controlled<T>(
     task: impl std::future::Future<Output = Result<T, Error>>,
     stop: &mut watch::Receiver<bool>,
-    seconds: u64,
+    deadline: tokio::time::Instant,
 ) -> Result<T, Error> {
     if *stop.borrow() {
         return Err(Error::Cancelled);
     }
     tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(seconds), task) => result.map_err(|_| Error::Transport)?,
+        result = tokio::time::timeout_at(deadline, task) => result.map_err(|_| Error::Transport)?,
         _ = crate::service::cancelled(stop) => Err(Error::Cancelled),
     }
 }

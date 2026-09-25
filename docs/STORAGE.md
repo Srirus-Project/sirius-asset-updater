@@ -103,13 +103,17 @@ Do not delete prefixes merely because an active transfer has not written a marke
 ## Limits and failure behavior
 
 - `concurrency`: 1–32, default 4; upload buffering is approximately 8 MiB per in-flight writer,
-  plus one 1 MiB read-back chunk and transport overhead. Multiple jobs multiply this budget.
+  plus one 1 MiB read-back chunk and transport overhead. Service jobs additionally share
+  `max_uploads` (default 4, range 1–32), preventing per-job concurrency from multiplying the total.
 - `attempts`: 1–8, default 3, for each object/marker. Only temporary backend errors or timeouts
   retry. Permission failures, integrity failures and redirects fail without automatic retry.
 - `retry_delay_ms`: 1–10000, default 500; exponential backoff capped at 30 seconds.
-- `object_timeout_seconds`: 1–3600, default 300. Writer creation and upload-plus-read-back each
-  have this bound. S3 HTTP requests additionally have a 10-second connect and 60-second request
-  timeout. Retries receive a new attempt deadline; the service's overall job deadline still applies.
+- `object_timeout_seconds`: 1–3600, default 300. One absolute attempt deadline covers shared
+  admission, source metadata, writer creation, upload and read-back. Completion-marker admission,
+  write and read-back also share one deadline. S3 HTTP requests additionally have a 10-second
+  connect and 60-second request timeout. Retries receive a new attempt deadline; the service's
+  overall job deadline still applies. A bounded multipart abort may extend cancellation cleanup
+  by up to three seconds; the upload permit stays held through that cleanup.
 - Multipart uploads use 8 MiB chunks and one part request at a time per object. Cancellation
   drains active uploads and attempts a bounded three-second abort for each active writer.
 - Source verification, cancellation or any provider failure before cleanup preserves the local

@@ -108,6 +108,16 @@ already-held local slot. Auto backend fallback releases the FFI slot before reac
 Standalone CLI exports retain their existing per-export limit without a service-level cap.
 
 This controls simultaneous operations, not FFmpeg's internal thread count or total process RSS.
-Apply deployment CPU/memory limits separately. Shared download/upload/memory admission and the
+Apply deployment CPU/memory limits separately. Shared download/memory admission and the
 remaining original resource tuning controls are separate restoration work. The service budget
 does not change cache identity or output formats.
+
+## Shared upload budget
+
+`max_uploads` limits object upload attempts across every job's storage providers (default 4,
+range 1..32), in addition to per-publication `storage.concurrency`. It includes local and S3
+objects, read-back verification and completion markers. Jobs waiting for admission do not open
+source streams or create writers; their wait consumes the same per-attempt timeout. Permits are
+released before retry backoff and after any bounded multipart abort. Cancellation drains work
+and releases queued waiters, preserving the existing publication/cleanup contract. Standalone
+storage commands keep the configured per-publication limit.

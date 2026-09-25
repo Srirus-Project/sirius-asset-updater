@@ -46,6 +46,8 @@ pub struct ServiceConfig {
     pub max_concurrent_jobs: usize,
     #[serde(default = "workers")]
     pub max_media_processes: usize,
+    #[serde(default = "workers")]
+    pub max_uploads: usize,
     #[serde(default = "queued")]
     pub max_queued_jobs: usize,
     #[serde(default = "retained")]
@@ -97,6 +99,7 @@ struct Inner {
     wake: Notify,
     accepting: AtomicBool,
     media_gate: Arc<crate::media_gate::Gate>,
+    upload_gate: Arc<tokio::sync::Semaphore>,
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
@@ -110,6 +113,7 @@ impl Service {
             || config.max_concurrent_jobs == 0
             || config.max_concurrent_jobs > 64
             || !(1..=16).contains(&config.max_media_processes)
+            || !(1..=32).contains(&config.max_uploads)
             || config.max_queued_jobs == 0
             || config.timeout_seconds == 0
         {
@@ -173,6 +177,7 @@ impl Service {
         Ok(Self {
             inner: Arc::new(Inner {
                 access_log,
+                upload_gate: Arc::new(tokio::sync::Semaphore::new(config.max_uploads)),
                 config,
                 token,
                 store: Mutex::new(store),
@@ -457,7 +462,8 @@ impl Service {
                     };
                     if let Some(path) = &profile.storage_config {
                         self.phase(&job.id, "publish").await?;
-                        let storage: crate::storage::Config = read_yaml(path)?;
+                        let mut storage: crate::storage::Config = read_yaml(path)?;
+                        storage.service_upload_gate = Some(self.inner.upload_gate.clone());
                         let (progress_tx, progress_rx) =
                             watch::channel(crate::storage::UploadProgress::default());
                         let task = storage.publish_with_progress(
@@ -760,6 +766,7 @@ mod lifecycle_tests {
             output_directory: root.path().join("outputs"),
             max_concurrent_jobs: 2,
             max_media_processes: 4,
+            max_uploads: 4,
             max_queued_jobs: 8,
             retain_terminal_jobs: 20,
             timeout_seconds,

@@ -23,6 +23,7 @@ fn config(provider: Provider) -> Config {
     Config {
         providers: vec![provider],
         concurrency: 2,
+        service_upload_gate: None,
         attempts: 2,
         object_timeout_seconds: 5,
         retry_delay_ms: 1,
@@ -796,4 +797,66 @@ fn s3_write_options_reject_bad_policy_without_echoing_values() {
             .validate()
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn shared_upload_budget_bounds_publishers_and_releases_cancelled_waiters() {
+    let source = fixture();
+    let mut server = server().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    server.config.service_upload_gate = Some(gate.clone());
+    server.state.mode.store(4, Ordering::SeqCst);
+    let (tx, rx) = watch::channel(false);
+    let first = server.config.publish(source.path(), Region::Jp, rx.clone());
+    let second_config = server.config.clone();
+    let second = second_config.publish(source.path(), Region::Jp, rx);
+    let cancel = async {
+        while server.state.puts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.state.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.available_permits(), 0);
+        tx.send(true).unwrap();
+    };
+    let (first, second, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, second, cancel)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(first, Err(Error::Cancelled)));
+    assert!(matches!(second, Err(Error::Cancelled)));
+    assert_eq!(gate.available_permits(), 1);
+    assert!(source.path().exists());
+    server.state.mode.store(0, Ordering::SeqCst);
+    server.state.gate.notify_waiters();
+    let (_tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    assert_eq!(gate.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn shared_upload_admission_uses_attempt_deadline_before_any_write() {
+    let source = fixture();
+    let mut server = server().await;
+    server.config.object_timeout_seconds = 1;
+    server.config.attempts = 1;
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = gate.clone().acquire_owned().await.unwrap();
+    server.config.service_upload_gate = Some(gate.clone());
+    let (_tx, rx) = watch::channel(false);
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        server.config.publish(source.path(), Region::Jp, rx).await,
+        Err(Error::Transport)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(3));
+    assert_eq!(server.state.puts.load(Ordering::SeqCst), 0);
+    assert!(source.path().exists());
+    drop(held);
+    assert_eq!(gate.available_permits(), 1);
 }
