@@ -75,6 +75,8 @@ pub enum Backend {
     },
     S3 {
         #[serde(default)]
+        assume_role: Option<Box<crate::storage_sts::Config>>,
+        #[serde(default)]
         request_payer: bool,
         endpoint: String,
         #[serde(default)]
@@ -273,7 +275,7 @@ fn component(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
-fn secret(name: &str) -> Result<String, Error> {
+pub(crate) fn secret(name: &str) -> Result<String, Error> {
     if name.is_empty()
         || name.len() > 256
         || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -341,6 +343,7 @@ impl Config {
                     }
                 }
                 Backend::S3 {
+                    assume_role,
                     endpoint,
                     write_options,
                     path_style,
@@ -352,6 +355,9 @@ impl Config {
                     ..
                 } => {
                     write_options.validate()?;
+                    if let Some(role) = assume_role {
+                        role.validate()?;
+                    }
                     let url = reqwest::Url::parse(endpoint).map_err(|_| Error::Config)?;
                     let loopback = url.host_str().is_some_and(|h| {
                         h.trim_matches(['[', ']'])
@@ -921,6 +927,7 @@ impl Provider {
                 .map_err(storage_error)
             }
             Backend::S3 {
+                assume_role,
                 request_payer,
                 endpoint,
                 write_options,
@@ -960,6 +967,17 @@ impl Provider {
                 }
                 if let Some(name) = session_token_env {
                     builder = builder.session_token(&secret(name)?);
+                }
+                if let Some(role) = assume_role {
+                    let token = session_token_env
+                        .as_ref()
+                        .map(|name| secret(name))
+                        .transpose()?;
+                    builder = builder.credential_provider_chain(role.chain(
+                        &secret(access_key_id_env)?,
+                        &secret(secret_access_key_env)?,
+                        token.as_deref(),
+                    )?);
                 }
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())

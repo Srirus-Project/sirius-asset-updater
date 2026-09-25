@@ -80,6 +80,7 @@ struct Fake {
     multipart_puts: AtomicUsize,
     aborts: AtomicUsize,
     unsigned: AtomicBool,
+    role_credentials: AtomicBool,
     gate: tokio::sync::Notify,
 }
 async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
@@ -116,11 +117,23 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
         .map(|v| v.to_str().unwrap().to_owned());
     let key = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_string();
+    let expected_auth = if state.role_credentials.load(Ordering::SeqCst) {
+        if request
+            .headers()
+            .get("x-amz-security-token")
+            .is_none_or(|v| v != "synthetic-role-token")
+        {
+            state.unsigned.store(true, Ordering::SeqCst);
+        }
+        "AWS4-HMAC-SHA256 Credential=ASIAFIXTURE1234567/"
+    } else {
+        "AWS4-HMAC-SHA256 Credential=synthetic-access/"
+    };
     if !request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 Credential=synthetic-access/"))
+        .is_some_and(|v| v.starts_with(expected_auth))
     {
         state.unsigned.store(true, Ordering::SeqCst);
     }
@@ -303,6 +316,7 @@ async fn server() -> Server {
         prefix: "assets".into(),
         public_base_url: None,
         backend: Backend::S3 {
+            assume_role: None,
             request_payer: false,
             endpoint,
             write_options: Box::default(),
@@ -1355,4 +1369,59 @@ async fn s3_default_acl_rejects_unknown_values_and_preserves_source_on_backend_d
         .unwrap()
         .keys()
         .any(|k| k.ends_with("complete.json")));
+}
+
+#[tokio::test]
+async fn s3_assume_role_publishes_with_temporary_keys_and_bounds_stalled_acquisition() {
+    for stalled in [false, true] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({ let hits = hits.clone(); move |headers: axum::http::HeaderMap| { let hits = hits.clone(); async move {
+            assert!(headers["authorization"].to_str().unwrap().contains("Credential=synthetic-access/"));
+            hits.fetch_add(1, Ordering::SeqCst);
+            if stalled { tokio::time::sleep(Duration::from_secs(30)).await; }
+            let expiration = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+            format!("<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIAFIXTURE1234567</AccessKeyId><SecretAccessKey>synthetic-role-secret</SecretAccessKey><SessionToken>synthetic-role-token</SessionToken><Expiration>{expiration}</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>")
+        }}});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let sts_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let source = fixture();
+        let mut storage = server().await;
+        storage.state.role_credentials.store(true, Ordering::SeqCst);
+        storage.config.attempts = 1;
+        storage.config.object_timeout_seconds = if stalled { 1 } else { 5 };
+        storage.config.remove_local_after_upload = stalled;
+        if let Backend::S3 { assume_role, .. } = &mut storage.config.providers[0].backend {
+            *assume_role = Some(Box::new(crate::storage_sts::Config {
+                role_arn: "arn:aws:iam::123456789012:role/fixture".into(),
+                region: "us-east-1".into(),
+                session_name: "sirius-fixture".into(),
+                external_id_env: None,
+                duration_seconds: 3600,
+                test_endpoint: Some(origin),
+            }));
+        }
+        storage.config.plan(Region::Jp).unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            storage.config.publish(source.path(), Region::Jp, rx),
+        )
+        .await
+        .unwrap();
+        if stalled {
+            assert!(result.is_err());
+            assert!(storage.state.objects.lock().unwrap().is_empty());
+            assert!(source.path().join("summary.json").is_file());
+        } else {
+            let receipt = sonic_rs::to_string(&result.unwrap()).unwrap();
+            assert!(!receipt.contains("synthetic-role") && !receipt.contains("ASIAFIXTURE"));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert!(!storage.state.unsigned.load(Ordering::SeqCst));
+        }
+        sts_task.abort();
+    }
 }

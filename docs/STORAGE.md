@@ -240,7 +240,8 @@ implemented mappings from operations the immutable publication pipeline does not
 | checksum_algorithm / aws_checksum_algorithm | CRC32C; multipart-incompatible MD5 fails validation |
 | enable_request_payer | `request_payer` |
 | disable_config_load | Always enabled; storage identities come from explicit references |
-| profile / role_arn / external_id / role_session_name / assume_role_duration_seconds | Internal profile/STS credential acquisition remains unimplemented; explicit session tokens do not claim equivalent automatic refresh |
+| role_arn / external_id / role_session_name / assume_role_duration_seconds | `backend.assume_role`, with environment-referenced external ID and explicit STS region, documented below |
+| profile | Shared AWS profile/file credential acquisition remains unimplemented; explicit base credential references are required |
 | assume_role_session_tags | The original scalar-only option parser rejected nested maps; no tag-map migration is claimed |
 | enable_versioning | No version-list/get/delete API is used; server bucket versioning continues to operate independently |
 | batch_max_operations / delete_max_size | No remote deletion or batch-delete operation is performed; failed prefixes require bucket lifecycle/operator cleanup |
@@ -249,7 +250,7 @@ implemented mappings from operations the immutable publication pipeline does not
 | enable_write_with_append | No append operation: complete objects and multipart parts are written under fresh publication prefixes |
 | skip_signature / allow_anonymous | Not exposed: publication and read-back require configured authenticated storage; public-read ACLs do not disable signing |
 
-Profile/STS acquisition remains an explicit gap in broad scalar-option parity. Notifications/registry integration and production acceptance are also not completed by
+Shared-profile/file credential acquisition remains an explicit gap in broad scalar-option parity. Notifications/registry integration and production acceptance are also not completed by
 this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
 
 
@@ -279,3 +280,49 @@ successful upload. Destinations with ACLs disabled can reject any ACL header, in
 Backend denials preserve local exports and never trigger a retry with the ACL removed. Tests
 verify actual request headers and failure behavior; effective cloud permissions require deployed
 bucket acceptance.
+
+
+## Explicit STS AssumeRole
+
+An S3 backend may configure `assume_role` in addition to its required base credential references:
+
+```yaml
+assume_role:
+  role_arn: arn:aws:iam::123456789012:role/SiriusPublisher
+  region: ap-northeast-1
+  session_name: sirius-assets
+  duration_seconds: 3600
+  # external_id_env: SIRIUS_STORAGE_EXTERNAL_ID
+```
+
+The base access/secret key and optional session token authorize only the STS role assumption.
+S3 operations then use the returned temporary key and session token. There is no fallback to
+base credentials, anonymous requests, metadata credentials or ambient AWS profiles if STS fails.
+Role/session/external-ID/partition validation occurs before I/O; duration is 900–43200 seconds
+(default 3600), still subject to the role's server-side maximum and role-chaining limits.
+
+`assume_role.region` selects and signs the regional STS request independently of S3 signing
+region and Sirius game region. The supported AWS partitions are aws, aws-cn and aws-us-gov;
+role ARN and region must agree. Only the matching official regional HTTPS STS authority is
+allowed. No production endpoint override is provided. A test-only in-process fixture routes
+synthetic requests locally; that override is absent from production builds/configuration.
+
+The custom credential provider uses a dedicated verified-TLS, non-redirecting client with no
+ambient proxy. Connect timeout is ten seconds, total HTTP request/body timeout sixty seconds,
+and response body is capped at 64 KiB. The existing object attempt/job deadline and cancellation
+also cover credential acquisition, so shorter deadlines win. Raw STS responses, role/external
+IDs and credentials are not returned in errors or publication receipts. Plan/config validation
+does not fetch STS credentials or contact storage.
+
+Credentials are cached in each operator's signer, with serialized concurrent refresh before
+expiry (the locked credential implementation refreshes within two minutes). Public/private
+operators and separate jobs may have separate caches. Refresh failure fails signing; an expired
+credential or base identity is never silently substituted. Source credential values are captured
+when constructing the operator: this does not implement shared-profile loading or base-credential
+file refresh. Role credentials can refresh throughout that operator's lifetime. Restart/retry
+constructs new operators and reads the explicit environment references again.
+
+Local tests cover expiration-aware refresh, concurrent single acquisition, malformed/expired/
+oversized/redirect/denied responses, actual S3 temporary-identity publication and a stalled STS
+request bounded by a one-second object attempt. They do not prove deployed IAM trust policies
+or cloud permissions; those remain part of production storage acceptance.

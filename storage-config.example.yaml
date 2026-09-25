@@ -28,6 +28,12 @@ providers:
   #       # customer_key_base64_env: SIRIUS_STORAGE_CUSTOMER_KEY # Base64-encoded 32 bytes
   #     bucket: sirius-assets
   #     region: auto
+  #     # assume_role: # optional AWS STS transition; base credential refs below remain required
+  #     #   role_arn: arn:aws:iam::123456789012:role/SiriusPublisher
+  #     #   region: ap-northeast-1 # STS signing region, independent of game/S3 region
+  #     #   session_name: sirius-assets
+  #     #   duration_seconds: 3600
+  #     #   external_id_env: SIRIUS_STORAGE_EXTERNAL_ID
   #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID
   #     secret_access_key_env: SIRIUS_STORAGE_SECRET_ACCESS_KEY
   #     session_token_env: SIRIUS_STORAGE_SESSION_TOKEN # optional temporary credentials

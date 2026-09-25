@@ -18,6 +18,10 @@ default = []
 media-ffi = ["dep:rsmpeg"]
 
 [dependencies]
+bytes = "1"
+http = "1"
+reqsign-aws-v4 = "=3.3.0"
+reqsign-core = "=3.3.1"
 base64 = "0.22"
 libc = "0.2"
 rsmpeg = { version = "=0.18.0", default-features = false, features = ["ffmpeg7_1", "link_system_ffmpeg"], optional = true }

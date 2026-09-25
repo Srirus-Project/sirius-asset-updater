@@ -629,3 +629,5 @@ pub mod cpu_policy;
 pub mod stage_limits;
 
 pub mod cpu_throttle;
+
+pub mod storage_sts;
