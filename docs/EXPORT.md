@@ -168,3 +168,20 @@ already-running native decoder, change codec thread counts, or enforce a strict 
 Keep OS process-tree quotas for hard isolation. CPU configuration affects scheduling only, not
 export identities or cache keys. Production Linux load-response and final corpus acceptance are
 required before treating a tuning value as measured for Sirius.
+
+### Linux CPU feedback acceptance test
+
+An opt-in test uses a bounded child process with two busy threads to check the actual
+`/proc` sampler and admission policy, including deadline, cancellation and recovery:
+
+```sh
+cargo test --release --locked --lib cpu_throttle::tests::linux_real_child_load_blocks_cancels_and_recovers -- --exact --ignored --nocapture
+```
+
+Run this only in an isolated Linux execution budget with at least two CPU cores available.
+The child has a 15-second upper bound and is killed/reaped on parent test exit. The parent
+requires three consecutive samples above 120%, then verifies that a one-core admission
+budget times out under load, responds to cancellation and resumes after the child stops.
+Failure to create enough real CPU load fails the test rather than silently skipping it.
+This is a short functional check of feedback behavior, not a long-duration throughput or
+whole-pipeline performance benchmark.
