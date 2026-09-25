@@ -175,7 +175,7 @@ Admission checks cancellation at least every 20 ms. `wait_timeout_seconds` (1..3
 waiting for each stage, not the synchronous decoder's execution. RAII releases slots on success,
 error or unwind. Workers acquire container stages before HCA/media; no stage recursively acquires
 itself. Waiting still occupies a resource worker, so these controls do not guarantee fair task
-ordering. They do not impose a memory ceiling or widen automatically with CPU tuning. Decode-cache
+ordering. They do not impose a memory ceiling. Decode-cache
 hits bypass these stages; scheduling controls do not change cache identity. Limits are per export,
 with existing shared service media and byte budgets still applying across jobs.
 
@@ -187,3 +187,35 @@ limit may shorten admission but never extends the media deadline. Stream-copy re
 ADX decoding and independent output verification remain under the general media gate; they
 do not acquire an encoding slot. These are per-export caps, with no change to default output
 formats or decoded-cache identity.
+
+### Automatic stage widths
+
+`stage_limits.auto_tune` defaults to false, preserving the optional explicit caps above.
+When enabled, omitted stages receive a CPU-budget-derived cap. Existing explicit stage
+values remain upper bounds; automatic sizing never widens them. The budget uses the
+profile's `cpu.budget_auto`, `budget_ratio` and `reserved` with the CPU count captured when
+loading the export profile. ACB, USM, HCA, image and audio encoding use the budget clamped
+to 1–64. MP4 encoding uses half the budget, rounded down and clamped to 1–64, because both
+current CLI and FFI video encoders use two encoder threads. A budget below two still
+allows one video conversion. These are admission estimates, not benchmark-optimal widths
+or a guarantee about total decoder/codec threads or measured CPU utilization.
+
+```yaml
+cpu:
+  auto_tune: true
+  budget_ratio: 0.75
+  reserved: 1
+stage_limits:
+  auto_tune: true
+  usm: 2
+  video_encode: 1
+```
+
+Worker sizing (`cpu.auto_tune`), aggregate CPU admission (`cpu.limit_stages`), sampled
+throttling and stage sizing are independent switches. All configured worker/media/service
+and byte-budget gates still apply; automatic stage sizing does not increase
+`media_concurrency` or a service's shared media/CPU limits. Effective stage values are
+logged alongside the actual worker width. Scheduling configuration remains outside the
+content-cache identity, so changing it alone does not invalidate verified export results.
+This policy intentionally does not import corpus-specific Sekai performance ratios;
+Sirius production throughput still requires measurement on the final candidate.

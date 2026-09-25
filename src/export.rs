@@ -177,6 +177,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
 impl ExportConfig {
+    fn effective_stage_limits(&self) -> Result<crate::stage_limits::Config, Error> {
+        self.stage_limits.effective(&self.cpu, self.detected_cpus)
+    }
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(log) = &self.logging {
             log.validate().map_err(|_| Error::Config)?;
@@ -378,9 +381,16 @@ impl ExportConfig {
         };
         let mut journal = fs::File::create(root.join("resources.jsonl")).map_err(err)?;
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let workers = self.cpu.workers(self.concurrency)?.min(assets.len());
+        let workers = self
+            .cpu
+            .workers_for_cpus(self.concurrency, self.detected_cpus)?
+            .min(assets.len());
+        let stages = self.effective_stage_limits()?;
         tracing::info!(
             workers,
+            stage_auto_tune = stages.auto_tune,
+            acb = ?stages.acb, usm = ?stages.usm, hca = ?stages.hca, image = ?stages.image,
+            audio_encode = ?stages.audio_encode, video_encode = ?stages.video_encode,
             configured_workers = self.concurrency,
             auto_tune = self.cpu.auto_tune,
             "export resource worker pool"
@@ -630,7 +640,7 @@ impl ExportConfig {
             let result = (|| -> Result<(), Error> {
                 let image_stage = if matches!(object.class_id(), 28 | 213) {
                     self.stage_gates.acquire(
-                        &self.stage_limits,
+                        &self.effective_stage_limits()?,
                         crate::stage_limits::Stage::Image,
                         &self.cancel,
                     )?
@@ -901,7 +911,7 @@ impl ExportConfig {
         root: &Path,
     ) -> Result<(), Error> {
         let _stage = self.stage_gates.acquire(
-            &self.stage_limits,
+            &self.effective_stage_limits()?,
             crate::stage_limits::Stage::Acb,
             &self.cancel,
         )?;
@@ -934,7 +944,7 @@ impl ExportConfig {
                 return Err(Error::Cancelled);
             }
             let hca_stage = self.stage_gates.acquire(
-                &self.stage_limits,
+                &self.effective_stage_limits()?,
                 crate::stage_limits::Stage::Hca,
                 &self.cancel,
             )?;
@@ -1008,7 +1018,7 @@ impl ExportConfig {
         report_root: &Path,
     ) -> Result<(), Error> {
         let _stage = self.stage_gates.acquire(
-            &self.stage_limits,
+            &self.effective_stage_limits()?,
             crate::stage_limits::Stage::Usm,
             &self.cancel,
         )?;
@@ -1136,7 +1146,7 @@ impl ExportConfig {
                     }
                     let target = output.join(format!("{i:05}.wav"));
                     let hca_stage = self.stage_gates.acquire(
-                        &self.stage_limits,
+                        &self.effective_stage_limits()?,
                         crate::stage_limits::Stage::Hca,
                         &self.cancel,
                     )?;
@@ -1376,9 +1386,12 @@ impl ExportConfig {
             crate::media_backend::Encoding::Mp4 => crate::stage_limits::Stage::VideoEncode,
         };
         // Keep this slot across an Auto fallback; all admission and attempts share one deadline.
-        let _encoding =
-            self.stage_gates
-                .acquire_until(&self.stage_limits, stage, &self.cancel, deadline)?;
+        let _encoding = self.stage_gates.acquire_until(
+            &self.effective_stage_limits()?,
+            stage,
+            &self.cancel,
+            deadline,
+        )?;
         if self.media_backend == Backend::Cli {
             return self.ffmpeg_deadline(cli_args, deadline);
         }
@@ -3109,8 +3122,11 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let mut cfg = config(root.path());
-        cfg.stage_limits.audio_encode = Some(1);
-        cfg.stage_limits.video_encode = Some(1);
+        cfg.stage_limits.auto_tune = true;
+        cfg.detected_cpus = 2;
+        cfg.cpu.budget_ratio = 0.5;
+        cfg.stage_limits.audio_encode = Some(64);
+        cfg.stage_limits.video_encode = Some(64);
         cfg.media_timeout_seconds = 1;
         cfg.ffmpeg = root.path().join("encoder");
         fs::write(
@@ -3130,7 +3146,7 @@ pub(crate) mod tests {
             cfg.media_timeout_seconds = 1;
             let permit = cfg
                 .stage_gates
-                .acquire(&cfg.stage_limits, stage, &cfg.cancel)
+                .acquire(&cfg.effective_stage_limits().unwrap(), stage, &cfg.cancel)
                 .unwrap();
             let started = std::time::Instant::now();
             assert!(cfg
@@ -3178,17 +3194,23 @@ pub(crate) mod tests {
     }
     #[test]
     fn acb_and_hca_stage_waits_cancel_before_output_and_release_nested_permits() {
-        for stage in [
+        for (stage, automatic) in [
             crate::stage_limits::Stage::Acb,
             crate::stage_limits::Stage::Hca,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|stage| [(stage, false), (stage, true)])
+        {
             let root = tempfile::tempdir().unwrap();
             let mut cfg = config(root.path());
-            cfg.stage_limits.acb = Some(1);
-            cfg.stage_limits.hca = Some(1);
+            cfg.stage_limits.auto_tune = automatic;
+            cfg.detected_cpus = 2;
+            cfg.cpu.budget_ratio = 0.5;
+            cfg.stage_limits.acb = Some(if automatic { 64 } else { 1 });
+            cfg.stage_limits.hca = Some(if automatic { 64 } else { 1 });
             let permit = cfg
                 .stage_gates
-                .acquire(&cfg.stage_limits, stage, &cfg.cancel)
+                .acquire(&cfg.effective_stage_limits().unwrap(), stage, &cfg.cancel)
                 .unwrap();
             let mut report = ResourceReport::default();
             std::thread::scope(|scope| {

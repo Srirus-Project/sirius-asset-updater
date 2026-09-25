@@ -54,3 +54,7 @@ regional_routes: false
 #   format: json
 #   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
 #   queue_capacity: 4096
+
+# Export profile scheduling is configured in its separate export YAML.
+# See docs/EXPORT_OPTIONS.md: stage_limits.auto_tune derives omitted stage caps
+# from the CPU budget while preserving explicit stage values as upper bounds.
