@@ -1519,6 +1519,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
         output_directory: directory.path().join("jobs"),
         max_concurrent_jobs: 1,
         max_media_processes: 4,
+        max_cpu_stages: Some(1),
         max_uploads: 4,
         max_downloads: 4,
         max_in_flight_bundle_bytes: 0,
@@ -2167,6 +2168,7 @@ async fn check_job_service_media_backend(ffi: bool) {
         output_directory: directory.path().join("jobs"),
         max_concurrent_jobs: 1,
         max_media_processes: 4,
+        max_cpu_stages: Some(1),
         max_uploads: 4,
         max_downloads: 4,
         max_in_flight_bundle_bytes: 0,
@@ -2190,7 +2192,7 @@ async fn check_job_service_media_backend(ffi: bool) {
         std::fs::write(
             &export,
             format!(
-                "{yaml}cpu: {{auto_tune: {}, budget_ratio: 0.5, reserved: 1}}\nstage_limits: {{acb: 1, usm: 1, hca: 1, image: 1, audio_encode: 1, video_encode: 1}}\n",
+                "{yaml}cpu: {{auto_tune: {}, limit_stages: true, budget_ratio: 0.5, reserved: 1}}\nstage_limits: {{acb: 1, usm: 1, hca: 1, image: 1, audio_encode: 1, video_encode: 1}}\n",
                 round == 1
             ),
         )

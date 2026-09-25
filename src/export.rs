@@ -13,6 +13,11 @@ use std::{
     process::{Command, Stdio},
 };
 
+type CpuPermits<'a> = (
+    Option<crate::media_gate::Permit<'a>>,
+    Option<crate::media_gate::Permit<'a>>,
+);
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
@@ -49,6 +54,12 @@ pub struct ExportConfig {
     pub concurrency: usize,
     #[serde(default)]
     pub cpu: crate::cpu_policy::Config,
+    #[serde(skip, default = "crate::cpu_policy::available_cpus")]
+    detected_cpus: usize,
+    #[serde(skip)]
+    cpu_gate: crate::media_gate::Gate,
+    #[serde(skip)]
+    service_cpu_gate: Option<(std::sync::Arc<crate::media_gate::Gate>, usize)>,
     #[serde(default)]
     pub stage_limits: crate::stage_limits::Config,
     #[serde(skip)]
@@ -557,7 +568,10 @@ impl ExportConfig {
             image_export::ImageRowOrder, sprite::SpriteReadLimits, studio::Studio,
             texture::TextureReadLimits,
         };
-        let mut studio = Studio::open(path).map_err(err)?;
+        let mut studio = {
+            let _cpu = self.acquire_cpu(self.cpu_deadline())?;
+            Studio::open(path).map_err(err)?
+        };
         let own_files: std::collections::BTreeSet<_> =
             studio.files().map(|f| f.path().to_string()).collect();
         // Atlas references are on logical catalog locations, not bundle nodes.
@@ -582,7 +596,10 @@ impl ExportConfig {
                         unity_rs_core::source::Region::from_file(p).map_err(err)?,
                     ));
                 }
-                studio = Studio::open_regions(regions).map_err(err)?;
+                studio = {
+                    let _cpu = self.acquire_cpu(self.cpu_deadline())?;
+                    Studio::open_regions(regions).map_err(err)?
+                };
             }
         }
         for diagnostic in studio.load_diagnostics() {
@@ -611,14 +628,19 @@ impl ExportConfig {
             let stem = format!("{}_{}", object.file_index(), object.path_id());
             let output_start = report.outputs.len();
             let result = (|| -> Result<(), Error> {
+                let image_stage = if matches!(object.class_id(), 28 | 213) {
+                    self.stage_gates.acquire(
+                        &self.stage_limits,
+                        crate::stage_limits::Stage::Image,
+                        &self.cancel,
+                    )?
+                } else {
+                    None
+                };
+                let cpu = self.acquire_cpu(self.cpu_deadline())?;
                 let limit = self.max_resource_output_bytes.min(512 * 1024 * 1024);
                 let (data, extension, kind) = match object.class_id() {
                     28 | 213 => {
-                        let _stage = self.stage_gates.acquire(
-                            &self.stage_limits,
-                            crate::stage_limits::Stage::Image,
-                            &self.cancel,
-                        )?;
                         let image = if object.class_id() == 28 {
                             object
                                 .decode_texture_mip(0, TextureReadLimits::default())
@@ -752,6 +774,8 @@ impl ExportConfig {
                         self.record(output, &target, "typetree_binary_source", report)?;
                     }
                 }
+                drop(cpu);
+                drop(image_stage);
                 if self.selection.embedded_audio
                     && object.class_id() == 114
                     && kind == "typetree_json"
@@ -882,6 +906,7 @@ impl ExportConfig {
             &self.cancel,
         )?;
         use cridecoder::acb::{AfsArchive, TrackList, UtfTable};
+        let cpu = self.acquire_cpu(self.cpu_deadline())?;
         let utf = UtfTable::new(Cursor::new(bytes)).map_err(err)?;
         let tracks = TrackList::new(&utf).map_err(err)?;
         if tracks.tracks.iter().any(|t| t.is_stream) {
@@ -903,6 +928,7 @@ impl ExportConfig {
                 return Err(err("cue references absent waveform"));
             }
         }
+        drop(cpu);
         for (i, entry) in entries.into_iter().enumerate() {
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Error::Cancelled);
@@ -912,6 +938,7 @@ impl ExportConfig {
                 crate::stage_limits::Stage::Hca,
                 &self.cancel,
             )?;
+            let cpu = self.acquire_cpu(self.cpu_deadline())?;
             let hca = awb.file_data(entry).map_err(err)?;
             let mut decoder = cridecoder::HcaDecoder::from_reader(Cursor::new(hca)).map_err(err)?;
             decoder.set_encryption_key(key, awb.subkey as u64);
@@ -928,6 +955,7 @@ impl ExportConfig {
             decoder
                 .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                 .map_err(err)?;
+            drop(cpu);
             drop(hca_stage);
             self.media_check(&target)?;
             self.record_audio(root, &target, "hca", report)?;
@@ -957,7 +985,11 @@ impl ExportConfig {
         if !bytes.starts_with(b"CRID") {
             return Err(err("unknown CRI container"));
         }
-        if let Some((color, alpha)) = split_alpha_usm(&bytes)? {
+        let split = {
+            let _cpu = self.acquire_cpu(self.cpu_deadline())?;
+            split_alpha_usm(&bytes)?
+        };
+        if let Some((color, alpha)) = split {
             for (name, data) in [("color", color), ("alpha", alpha)] {
                 let directory = output.join(name);
                 fs::create_dir(&directory).map_err(err)?;
@@ -1031,6 +1063,7 @@ impl ExportConfig {
         report: &mut ResourceReport,
         report_root: &Path,
     ) -> Result<(), Error> {
+        let cpu = self.acquire_cpu(self.cpu_deadline())?;
         let metadata = cridecoder::usm::read_metadata(Cursor::new(bytes), b"movie").map_err(err)?;
         let metadata_json = sonic_rs::to_vec(&metadata).map_err(err)?;
         let value: sonic_rs::Value = sonic_rs::from_slice(&metadata_json).map_err(err)?;
@@ -1063,6 +1096,7 @@ impl ExportConfig {
             true,
         )
         .map_err(err)?;
+        drop(cpu);
         let mut video = None;
         let mut audio = None;
         for (i, stream) in streams.into_iter().enumerate() {
@@ -1106,12 +1140,14 @@ impl ExportConfig {
                         crate::stage_limits::Stage::Hca,
                         &self.cancel,
                     )?;
+                    let cpu = self.acquire_cpu(self.cpu_deadline())?;
                     let mut decoder = cridecoder::HcaDecoder::from_reader(Cursor::new(stream.data))
                         .map_err(err)?;
                     decoder.set_encryption_key(crypto.value, 0);
                     decoder
                         .decode_to_wav(&mut fs::File::create(&target).map_err(err)?)
                         .map_err(err)?;
+                    drop(cpu);
                     drop(hca_stage);
                     self.media_check(&target)?;
                     audio = Some(self.record_audio(report_root, &target, "hca", report)?);
@@ -1356,6 +1392,7 @@ impl ExportConfig {
         {
             let result = {
                 let _permit = self.acquire_media(deadline)?;
+                let _cpu = self.acquire_cpu(deadline)?;
                 crate::media_ffi::controlled(self.cancel.clone(), deadline, || match encoding {
                     crate::media_backend::Encoding::Flac => {
                         crate::media_ffi::convert_wav_to_flac(input, output)
@@ -1403,6 +1440,40 @@ impl ExportConfig {
         );
         self.ffmpeg_deadline(cli_args, deadline)
     }
+    fn cpu_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(self.stage_limits.wait_timeout_seconds)
+    }
+    fn acquire_cpu(&self, deadline: std::time::Instant) -> Result<CpuPermits<'_>, Error> {
+        let result = (|| {
+            let local = if self.cpu.limit_stages {
+                Some(self.cpu_gate.acquire(
+                    self.cpu.budget_for_cpus(self.detected_cpus)?,
+                    &self.cancel,
+                    deadline,
+                )?)
+            } else {
+                None
+            };
+            let shared = self
+                .service_cpu_gate
+                .as_ref()
+                .map(|(gate, limit)| gate.acquire(*limit, &self.cancel, deadline))
+                .transpose()?;
+            Ok((local, shared))
+        })();
+        result.map_err(|error| match error {
+            Error::Export(_) => Error::Export("CPU stage admission timed out".into()),
+            other => other,
+        })
+    }
+    pub(crate) fn set_service_cpu_gate(
+        &mut self,
+        gate: std::sync::Arc<crate::media_gate::Gate>,
+        limit: Option<usize>,
+    ) {
+        self.service_cpu_gate = limit.map(|limit| (gate, limit));
+    }
     pub(crate) fn set_service_resource_budget(
         &mut self,
         budget: Option<std::sync::Arc<crate::resource_budget::Budget>>,
@@ -1448,6 +1519,7 @@ impl ExportConfig {
         deadline: std::time::Instant,
     ) -> Result<(), Error> {
         let _permit = self.acquire_media(deadline)?;
+        let _cpu = self.acquire_cpu(deadline)?;
         let stderr = tempfile::tempfile().map_err(err)?;
         let mut child = Command::new(&self.ffmpeg)
             .env_remove(&self.cri_key_env)
@@ -1779,6 +1851,9 @@ pub(crate) mod tests {
             split_acb_xor_env: None,
             concurrency: 1,
             cpu: Default::default(),
+            detected_cpus: crate::cpu_policy::available_cpus(),
+            cpu_gate: Default::default(),
+            service_cpu_gate: None,
             stage_limits: Default::default(),
             stage_gates: Default::default(),
             max_in_flight_bundle_bytes: 0,
@@ -2960,6 +3035,63 @@ pub(crate) mod tests {
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.retain_outputs = false;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shared_cpu_admission_bounds_native_and_media_work_and_releases_local_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = std::sync::Arc::new(crate::media_gate::Gate::default());
+        let held_cancel = std::sync::atomic::AtomicBool::new(false);
+        let held = shared
+            .acquire(
+                1,
+                &held_cancel,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let mut configs = Vec::new();
+        for name in ["first", "second"] {
+            let path = root.path().join(name);
+            fs::create_dir(&path).unwrap();
+            let mut cfg = config(&path);
+            cfg.detected_cpus = 1;
+            cfg.cpu.limit_stages = true;
+            cfg.set_service_cpu_gate(shared.clone(), Some(1));
+            configs.push((cfg, path));
+        }
+        let (cfg, path) = &configs[0];
+        std::thread::scope(|scope| {
+            let cancel = &cfg.cancel;
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            assert!(matches!(
+                cfg.acb(
+                    &synthetic_acb(0),
+                    path,
+                    0,
+                    &mut ResourceReport::default(),
+                    path
+                ),
+                Err(Error::Cancelled)
+            ));
+        });
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+        cfg.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // The nonexistent executable must never be reached while another job owns the CPU slot.
+        assert!(
+            matches!(configs[1].0.ffmpeg_deadline(&[], std::time::Instant::now() + std::time::Duration::from_millis(30)), Err(Error::Export(message)) if message == "CPU stage admission timed out")
+        );
+        drop(held);
+        for (cfg, path) in configs {
+            let mut report = ResourceReport::default();
+            cfg.acb(&synthetic_acb(0), &path, 0, &mut report, &path)
+                .unwrap();
+            assert_eq!(report.outputs.len(), 2);
+            validate_wav(&fs::read(path.join("00000.wav")).unwrap()).unwrap();
+        }
     }
 
     #[cfg(unix)]

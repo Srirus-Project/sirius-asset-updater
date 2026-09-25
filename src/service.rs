@@ -46,6 +46,8 @@ pub struct ServiceConfig {
     pub max_concurrent_jobs: usize,
     #[serde(default = "workers")]
     pub max_media_processes: usize,
+    #[serde(default)]
+    pub max_cpu_stages: Option<usize>,
     #[serde(default = "workers")]
     pub max_uploads: usize,
     #[serde(default = "workers")]
@@ -103,6 +105,7 @@ struct Inner {
     wake: Notify,
     accepting: AtomicBool,
     media_gate: Arc<crate::media_gate::Gate>,
+    cpu_gate: Arc<crate::media_gate::Gate>,
     upload_gate: Arc<tokio::sync::Semaphore>,
     download_gate: Arc<tokio::sync::Semaphore>,
     resource_budget: Option<Arc<crate::resource_budget::Budget>>,
@@ -118,6 +121,9 @@ impl Service {
         if config.profiles.is_empty()
             || config.max_concurrent_jobs == 0
             || config.max_concurrent_jobs > 64
+            || config
+                .max_cpu_stages
+                .is_some_and(|n| !(1..=256).contains(&n))
             || !(1..=16).contains(&config.max_media_processes)
             || !(1..=32).contains(&config.max_uploads)
             || !(1..=64).contains(&config.max_downloads)
@@ -197,6 +203,7 @@ impl Service {
                 wake: Notify::new(),
                 accepting: AtomicBool::new(true),
                 media_gate: Arc::default(),
+                cpu_gate: Arc::default(),
             }),
         })
     }
@@ -405,6 +412,10 @@ impl Service {
                 {
                     return Err(Error::Config);
                 }
+                export.set_service_cpu_gate(
+                    self.inner.cpu_gate.clone(),
+                    self.inner.config.max_cpu_stages,
+                );
                 export.set_service_resource_budget(self.inner.resource_budget.clone());
                 export.set_service_media_gate(
                     self.inner.media_gate.clone(),
@@ -798,6 +809,7 @@ mod lifecycle_tests {
             output_directory: root.path().join("outputs"),
             max_concurrent_jobs: 2,
             max_media_processes: 4,
+            max_cpu_stages: None,
             max_uploads: 4,
             max_downloads: 4,
             max_in_flight_bundle_bytes: 0,

@@ -164,3 +164,8 @@ included. The two receipt/index files are not counted as payload files. Reaching
 file count is not completion: journal totals, exact-tree checks and inventory persistence must
 still succeed before the job can become completed. Corruption remains a failed job, and failed
 progress persistence or cancellation stops verification without acknowledging success.
+
+`max_cpu_stages` optionally caps instrumented native decode and CLI/FFI media stages across
+all concurrent exports (1..256, default omitted/null). It composes with profile-local
+`cpu.limit_stages` and existing stage/media/byte budgets. See [CPU admission](EXPORT.md#aggregate-cpu-stage-admission)
+for acquisition order, timeouts and the distinction from an OS CPU quota.

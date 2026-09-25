@@ -1,4 +1,4 @@
-//! Opt-in export worker sizing; not a CPU usage quota.
+//! Export worker sizing and aggregate CPU-stage budgets; not a CPU usage quota.
 use crate::Error;
 use serde::Deserialize;
 
@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub auto_tune: bool,
+    pub limit_stages: bool,
     pub budget_auto: bool,
     pub budget_ratio: f64,
     pub reserved: usize,
@@ -14,6 +15,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             auto_tune: false,
+            limit_stages: false,
             budget_auto: true,
             budget_ratio: 1.0,
             reserved: 0,
@@ -38,6 +40,12 @@ impl Config {
             return Ok(configured);
         }
         let cpus = cpus.max(1);
+        let budget = self.budget_for_cpus(cpus)?;
+        Ok(configured.max(budget).min(cpus.saturating_mul(2)).min(64))
+    }
+    pub fn budget_for_cpus(&self, cpus: usize) -> Result<usize, Error> {
+        self.validate()?;
+        let cpus = cpus.max(1);
         let budget = if self.budget_auto {
             ((cpus as f64 * self.budget_ratio).floor() as usize)
                 .saturating_sub(self.reserved)
@@ -45,7 +53,7 @@ impl Config {
         } else {
             cpus
         };
-        Ok(configured.max(budget).min(cpus.saturating_mul(2)).min(64))
+        Ok(budget)
     }
     pub fn workers(&self, configured: usize) -> Result<usize, Error> {
         self.workers_for_cpus(
@@ -55,6 +63,12 @@ impl Config {
                 .unwrap_or(1),
         )
     }
+}
+
+pub(crate) fn available_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
 }
 
 #[cfg(test)]

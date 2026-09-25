@@ -110,3 +110,26 @@ sizes independently: shared service media/download/upload/byte admission still a
 Network and media concurrency are not automatically widened, and this option does not
 implement CPU load sampling or independent codec/image stage controls. Validate workload
 memory and performance before increasing concurrency on a production host.
+
+### Aggregate CPU-stage admission
+
+`cpu.limit_stages: true` enables a shared per-export CPU-stage pool sized from
+`budget_auto`, `budget_ratio` and `reserved`, independently of `auto_tune`. It defaults
+to false to preserve existing scheduling. CPU availability is captured when loading the
+export configuration. With ratio 0.5 and reservation 1 on 16 available CPUs, at most seven
+instrumented CPU stages run simultaneously even if the resource worker count is larger.
+
+The pool covers Unity parsing/object conversion, CRI container extraction, HCA decode,
+FFmpeg processing children and FFI conversion. Container wrappers release CPU slots before
+nested waveform processing; HCA releases before media validation/encoding. An image stage
+slot is taken before its CPU slot, and media admission precedes CPU admission. Auto fallback
+releases the FFI CPU slot and reacquires for CLI within the original media deadline.
+Native admission uses `stage_limits.wait_timeout_seconds`; media keeps its original deadline.
+Cancellation and failure release local slots even while waiting for the service pool.
+
+The job service can additionally set `max_cpu_stages: 8` (1..256, omitted/null disables)
+to share one pool across all exports, including profiles without a local CPU pool. Both
+limits apply when enabled. These bound admitted stages, not OS thread counts or total CPU
+percent: codecs may use internal threads, and filesystem/cache hashing and runtime overhead
+are outside this pool. CPU-use sampling/throttling remains separate work. OS quotas remain
+necessary for strict process-tree CPU isolation.
