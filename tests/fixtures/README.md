@@ -37,3 +37,8 @@ Raw-bundle tests reuse the synthetic Texture2D file for alongside decoding. Raw-
 fixtures have the UnityFS signature followed by a deterministic opaque marker; they intentionally
 do not represent decodable UnityFS archives. They prove byte retention without decoder/FFmpeg/key
 dependencies, filtered catalog scope, cache reuse, journal verification and local storage readback.
+
+CRI preservation tests use the generated ACB/HCA vector and an opaque `CRID` marker. The latter
+proves exact byte retention before any demux/alpha handling, not valid USM codec coverage. Tests
+check stage bypass, embedded-relative paths, resource limits/cancellation and contradictory
+summary rejection; default decode coverage remains in the existing real media fixtures.

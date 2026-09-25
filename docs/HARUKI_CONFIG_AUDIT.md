@@ -99,3 +99,18 @@ Sekai `start_app/on_demand`, Colorful Palette/Nuverse providers, Sekai chart has
 transitive dependencies are documented in [SELECTION.md](SELECTION.md); no fabricated category
 mapping is accepted. Existing audio/video, storage and CPU restoration are documented separately
 and must remain part of final acceptance.
+
+## CRI stage evidence
+
+Original `region.export.acb.export/decode` gates `handle_acb_files` in
+`crates/sekai-asset-pipeline/src/export/media_postprocess/acb.rs`; USM flags similarly gate
+`handle_usm_files` in `media_postprocess.rs`. Sirius `cri.acb/usm: decode|preserve` provides
+explicit container retention versus decoding, including its embedded ACB adapter, rather than
+silently dropping selected output. Summary/cache/verification retain this distinction.
+
+Do not describe original `hca.decode=false` as preserving raw HCA: in
+`extract_acb_tracks_from_reader`, it returns the default result after in-memory extraction,
+without putting tracks in generated_files or hca_tracks. The batched caller subsequently
+removes source_files. A false flag can therefore produce no waveforms and delete the source ACB.
+This source behavior is not reproduced as a destructive Sirius mode. The current new policy
+preserves full ACBs; it is not raw-waveform parity or completion of all media-stage controls.

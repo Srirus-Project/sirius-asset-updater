@@ -81,7 +81,12 @@ impl Cache {
             (&snapshot.platform, &snapshot.effective_cdn_root),
             &snapshot.client_version,
             &snapshot.protocol_version,
-            (&config.selection, &config.read_kinds, &config.raw_bundles),
+            (
+                &config.selection,
+                &config.read_kinds,
+                &config.raw_bundles,
+                &config.cri,
+            ),
             &config.image,
             (
                 &config.audio,

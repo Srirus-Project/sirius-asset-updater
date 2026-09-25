@@ -385,3 +385,36 @@ verification checks raw paths, source hashes and policy; normal storage publicat
 reads back raw files alongside receipts. Raw-only always sets `full_export=false`, even when all
 catalog resources are represented. `full_catalog` remains an independent scope declaration;
 retained raw bundles alone never satisfy full decoded acceptance.
+
+## CRI container decoding policy
+
+ACB/USM inputs can be retained as containers instead of decoded:
+
+```yaml
+cri:
+  acb: preserve # decode (default) | preserve
+  usm: decode   # decode (default) | preserve
+```
+
+`acb: preserve` records `container.acb` containing the exact ACB bytes presented to the
+reader. For embedded SplitAcb this means after chunk reassembly/XOR restoration, inside the
+parent object's export directory; the original serialized backing bytes still follow normal
+Unity export rules. It does not extract waveforms, decode HCA or apply the audio format list.
+`usm: preserve` records the original `container.usm` before alpha-channel splitting, demux or
+transcode. Its contents retain the container's original encoding/encryption; this is not a
+claim of playable decoded media. Unknown CRI signatures still fail.
+
+Outputs use `cri_acb_container` / `cri_usm_container` journal kinds and participate in ordinary
+hashes, parent object identity, aggregate limits, staging, cache and storage verification.
+A preservation policy always makes `full_export=false`, including for a full-catalog download.
+Offline verification rejects container records under a contradictory decoded policy or a false
+full-export claim. Default/explicit decode keeps the previous decoding behavior. The existing
+run-level CRI key and FFmpeg configuration remain required for normal export jobs because other
+selected Unity/CRI stages may need them; the preservation stage itself invokes neither decoder
+nor FFmpeg. Use raw_bundles.only for the separate decoder-free Unity-bundle publication workflow.
+
+This restores explicit control over whether selected CRI containers are decoded. It does not
+copy the old HCA flag: the audited Haruki native ACB path with `hca.decode=false` extracts tracks
+in memory, returns no track outputs and subsequently removes on-disk source ACBs. It is not a
+reliable raw-HCA export operation. Standalone encoded-HCA extraction and further CRI-stage skip
+policies require separate applicability/fixture work.

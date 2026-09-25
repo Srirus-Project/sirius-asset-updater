@@ -204,6 +204,7 @@ async fn prepare_with_progress(
         || summary.input_files > summary.catalog_files
         || summary.output_files == 0
         || summary.read_kinds.validate().is_err()
+        || (summary.full_export && !summary.cri.full())
         || summary
             .raw_bundles
             .as_ref()
@@ -287,6 +288,13 @@ async fn prepare_with_progress(
         }
         let mut paths = HashSet::new();
         for item in &resource.outputs {
+            if (item.kind == "cri_acb_container"
+                && summary.cri.acb != crate::export_options::ContainerMode::Preserve)
+                || (item.kind == "cri_usm_container"
+                    && summary.cri.usm != crate::export_options::ContainerMode::Preserve)
+            {
+                return Err(Error::Verification);
+            }
             if item.kind == "raw_bundle" {
                 let raw = summary.raw_bundles.as_ref().ok_or(Error::Verification)?;
                 if !raw.matches_path(&resource.source)

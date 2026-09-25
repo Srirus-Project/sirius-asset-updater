@@ -31,6 +31,8 @@ pub struct ExportConfig {
     #[serde(default)]
     pub read_kinds: crate::read_policy::Policy,
     #[serde(default)]
+    pub cri: crate::export_options::CriExport,
+    #[serde(default)]
     pub raw_bundles: Option<crate::raw_bundles::Config>,
     #[serde(default)]
     pub image: crate::export_options::ImageFormats,
@@ -119,6 +121,8 @@ pub struct ExportSummary {
     pub selection: crate::export_options::Selection,
     #[serde(default)]
     pub read_kinds: crate::read_policy::Policy,
+    #[serde(default)]
+    pub cri: crate::export_options::CriExport,
     #[serde(default)]
     pub raw_bundles: Option<crate::raw_bundles::Config>,
     #[serde(default)]
@@ -400,9 +404,11 @@ impl ExportConfig {
                 && complete_selection
                 && assets.len() == catalog_files
                 && self.selection.full()
-                && self.read_kinds.is_native(),
+                && self.read_kinds.is_native()
+                && self.cri.full(),
             selection: self.selection.clone(),
             read_kinds: self.read_kinds.clone(),
+            cri: self.cri.clone(),
             image: self.image.clone(),
             audio: self.audio.clone(),
             video: self.video,
@@ -1198,6 +1204,25 @@ impl ExportConfig {
         }
         Ok(())
     }
+    fn preserve_cri(
+        &self,
+        bytes: &[u8],
+        output: &Path,
+        root: &Path,
+        extension: &str,
+        report: &mut ResourceReport,
+    ) -> Result<(), Error> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let prior: u64 = report.outputs.iter().map(|r| r.bytes).sum();
+        if prior.saturating_add(bytes.len() as u64) > self.max_resource_output_bytes {
+            return Err(Error::Size);
+        }
+        let path = output.join(format!("container.{extension}"));
+        fs::write(&path, bytes).map_err(err)?;
+        self.record(root, &path, &format!("cri_{extension}_container"), report)
+    }
     fn acb(
         &self,
         bytes: &[u8],
@@ -1206,6 +1231,9 @@ impl ExportConfig {
         report: &mut ResourceReport,
         root: &Path,
     ) -> Result<(), Error> {
+        if self.cri.acb == crate::export_options::ContainerMode::Preserve {
+            return self.preserve_cri(bytes, output, root, "acb", report);
+        }
         let _stage = self.stage_gates.acquire(
             &self.effective_stage_limits()?,
             crate::stage_limits::Stage::Acb,
@@ -1290,6 +1318,9 @@ impl ExportConfig {
         }
         if !bytes.starts_with(b"CRID") {
             return Err(err("unknown CRI container"));
+        }
+        if self.cri.usm == crate::export_options::ContainerMode::Preserve {
+            return self.preserve_cri(&bytes, output, output, "usm", report);
         }
         let split = {
             let _cpu = self.acquire_cpu(self.cpu_deadline())?;
@@ -2153,6 +2184,7 @@ pub(crate) mod tests {
             paths: Vec::new(),
             selection: Default::default(),
             read_kinds: Default::default(),
+            cri: Default::default(),
             raw_bundles: None,
             image: Default::default(),
             audio: Default::default(),
@@ -3359,6 +3391,128 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cri_container_preservation_keeps_exact_bytes_and_rejects_decoded_completeness() {
+        for (extension, bytes) in [
+            ("acb", synthetic_acb(0x12345678)),
+            ("usm", b"CRIDsynthetic-preserved-container".to_vec()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let input = root.path().join("input");
+            fs::create_dir_all(input.join("assets")).unwrap();
+            let name = format!("source.{extension}");
+            fs::write(input.join("assets").join(&name), &bytes).unwrap();
+            let asset = crate::update::AssetReceipt {
+                relative_path: name,
+                provider: Provider::Cri,
+                bytes: bytes.len() as u64,
+                downloaded_sha256: hex::encode(Sha256::digest(&bytes)),
+                stored_sha256: hex::encode(Sha256::digest(&bytes)),
+                decrypted: false,
+            };
+            let mut cfg = config(root.path());
+            cfg.retain_outputs = true;
+            cfg.cri = yaml_serde::from_str(&format!("{extension}: preserve")).unwrap();
+            cfg.ffmpeg = root.path().join("must-not-be-invoked");
+            let output = root.path().join("exports");
+            fs::create_dir(&output).unwrap();
+            let report = cfg
+                .process_resource(&input, &output, &asset, 0, 0, None)
+                .unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.outputs.len(), 1);
+            let item = &report.outputs[0];
+            assert_eq!(item.kind, format!("cri_{extension}_container"));
+            assert!(item.object.is_none());
+            assert_eq!(item.sha256, asset.stored_sha256);
+            assert_eq!(
+                fs::read(output.join("00000").join(&item.path)).unwrap(),
+                bytes
+            );
+            let mut summary = ExportSummary {
+                schema_version: 4,
+                region: crate::region::Region::Jp,
+                platform: "iOS".into(),
+                complete: true,
+                retained: true,
+                input_files: 1,
+                catalog_files: 1,
+                succeeded: 1,
+                output_files: 1,
+                output_bytes: bytes.len() as u64,
+                catalog_sha256: "b".repeat(64),
+                full_catalog: true,
+                full_export: false,
+                cri: cfg.cri.clone(),
+                payloads: BTreeMap::from([(item.kind.clone(), 1)]),
+                ..Default::default()
+            };
+            write_json(&output.join("summary.json"), &summary).unwrap();
+            let mut journal = sonic_rs::to_vec(&report).unwrap();
+            journal.push(b'\n');
+            fs::write(output.join("resources.jsonl"), journal).unwrap();
+            crate::export_verify::verify(&output, crate::region::Region::Jp)
+                .await
+                .unwrap();
+            summary.full_export = true;
+            write_json(&output.join("summary.json"), &summary).unwrap();
+            assert!(
+                crate::export_verify::verify(&output, crate::region::Region::Jp)
+                    .await
+                    .is_err()
+            );
+            summary.full_export = false;
+            summary.cri = Default::default();
+            write_json(&output.join("summary.json"), &summary).unwrap();
+            assert!(
+                crate::export_verify::verify(&output, crate::region::Region::Jp)
+                    .await
+                    .is_err()
+            );
+            cfg.max_resource_output_bytes = bytes.len() as u64 - 1;
+            let limited = root.path().join("limited");
+            fs::create_dir(&limited).unwrap();
+            let failed = cfg
+                .process_resource(&input, &limited, &asset, 0, 0, None)
+                .unwrap();
+            assert!(!failed.errors.is_empty());
+            assert_eq!(fs::read_dir(&limited).unwrap().count(), 0);
+            cfg.max_resource_output_bytes = max_output();
+            cfg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let cancelled = root.path().join("cancelled");
+            fs::create_dir(&cancelled).unwrap();
+            let failed = cfg
+                .process_resource(&input, &cancelled, &asset, 0, 0, None)
+                .unwrap();
+            assert!(!failed.errors.is_empty());
+            assert_eq!(fs::read_dir(cancelled).unwrap().count(), 0);
+        }
+        assert!(yaml_serde::from_str::<crate::export_options::CriExport>("acb: ignored").is_err());
+        assert!(yaml_serde::from_str::<crate::export_options::CriExport>("hca: preserve").is_err());
+    }
+    #[test]
+    fn preserved_embedded_acb_uses_its_parent_directory_and_shares_the_output_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("object.acb");
+        fs::create_dir(&nested).unwrap();
+        let mut cfg = config(root.path());
+        cfg.cri.acb = crate::export_options::ContainerMode::Preserve;
+        cfg.ffmpeg = root.path().join("not-an-encoder");
+        let bytes = synthetic_acb(0x12345678);
+        let mut report = ResourceReport::default();
+        cfg.acb(&bytes, &nested, 0, &mut report, root.path())
+            .unwrap();
+        assert_eq!(report.outputs[0].path, "object.acb/container.acb");
+        cfg.max_resource_output_bytes = bytes.len() as u64;
+        let second = root.path().join("other.acb");
+        fs::create_dir(&second).unwrap();
+        assert!(matches!(
+            cfg.acb(&bytes, &second, 0, &mut report, root.path()),
+            Err(Error::Size)
+        ));
+        assert_eq!(fs::read_dir(second).unwrap().count(), 0);
+    }
+
     // Synthetic named-object records; payloads are opaque markers, not playable media.
     fn synthetic_unity_media(
         class: i32,
@@ -4316,6 +4470,16 @@ pub(crate) mod tests {
         cfg.image = crate::export_options::ImageExport::Webp {}.into();
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
+        cfg.cri.acb = crate::export_options::ContainerMode::Preserve;
+        let preserved_acb = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(base, preserved_acb);
+        cfg.cri = Default::default();
+        cfg.cri.usm = crate::export_options::ContainerMode::Preserve;
+        let preserved_usm = id(&cfg, &snapshot, &asset, &deps, 1);
+        assert_ne!(base, preserved_usm);
+        assert_ne!(preserved_acb, preserved_usm);
+        cfg.cri = yaml_serde::from_str("acb: decode\nusm: decode").unwrap();
+        assert_eq!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.raw_bundles = Some(Default::default());
         let raw_bundle_key = id(&cfg, &snapshot, &asset, &deps, 1);
         assert_ne!(base, raw_bundle_key);

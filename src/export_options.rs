@@ -399,3 +399,23 @@ mod png_tests {
         }
     }
 }
+
+/// Container retention is independent of final decoded audio/video formats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMode {
+    #[default]
+    Decode,
+    Preserve,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CriExport {
+    pub acb: ContainerMode,
+    pub usm: ContainerMode,
+}
+impl CriExport {
+    pub fn full(&self) -> bool {
+        self.acb == ContainerMode::Decode && self.usm == ContainerMode::Decode
+    }
+}
