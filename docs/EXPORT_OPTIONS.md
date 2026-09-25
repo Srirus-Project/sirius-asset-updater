@@ -124,7 +124,7 @@ Legacy summaries missing new fields deserialize conservatively with `full_export
 
 ## Resource and media concurrency
 
-`concurrency` bounds concurrently processed resources (1..4). `media_concurrency` separately
+`concurrency` bounds concurrently processed resources (1..64, default 4). `media_concurrency` separately
 bounds FFmpeg processing children shared by those resource workers (1..4, default 2).
 Native parsing/image conversion can progress while other resources wait for a media slot.
 Audio conversion, video remux/encoding and independent decode validation share this limit;
@@ -141,3 +141,11 @@ The default permits two processing children rather than tying child count to fou
 Set 4 explicitly for the previous potential parallelism. These options control scheduling, not
 output identity, and do not invalidate content caches by themselves. They are not hard RSS limits;
 output byte budgets, download concurrency and storage upload concurrency are separate controls.
+
+Resource workers are explicitly configurable beyond four for larger hosts. No automatic widening
+is applied. Each worker can hold a decoded resource and its dependencies; configure
+`max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
+assets. Media admission remains separately bounded by `media_concurrency` and the service's
+`max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
+can multiply resource workers across regions. CPU auto-tuning and independent stage controls
+remain separate restoration work; this setting restores operator-selected resource parallelism.

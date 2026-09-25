@@ -184,7 +184,7 @@ impl ExportConfig {
             return Err(Error::Config);
         }
         if !(1..=3600).contains(&self.media_timeout_seconds)
-            || !(1..=4).contains(&self.concurrency)
+            || !(1..=64).contains(&self.concurrency)
             || !(1..=4).contains(&self.media_concurrency)
             || self.max_resource_output_bytes == 0
             || self.max_resource_output_bytes > 16 * 1024 * 1024 * 1024

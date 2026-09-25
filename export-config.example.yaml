@@ -2,7 +2,7 @@
 input: ./downloads/catalog-example
 output: ./exports/run-example
 retain_outputs: true
-concurrency: 4
+concurrency: 4 # resource workers, range: 1..64; default remains 4
 # Soft size estimate for concurrent decoding; 0 disables.
 max_in_flight_bundle_bytes: 0
 # Separate per-export FFmpeg process limit (1..4); shared by decode/encode/validation.
