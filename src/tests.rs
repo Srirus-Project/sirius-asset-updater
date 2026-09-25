@@ -1520,6 +1520,7 @@ async fn job_service_auth_queue_and_real_offline_verification() {
         max_concurrent_jobs: 1,
         max_media_processes: 4,
         max_uploads: 4,
+        max_downloads: 4,
         max_queued_jobs: 1,
         retain_terminal_jobs: 10,
         timeout_seconds: 30,
@@ -2166,6 +2167,7 @@ async fn check_job_service_media_backend(ffi: bool) {
         max_concurrent_jobs: 1,
         max_media_processes: 4,
         max_uploads: 4,
+        max_downloads: 4,
         max_queued_jobs: 4,
         retain_terminal_jobs: 10,
         timeout_seconds: 30,
@@ -2859,4 +2861,77 @@ fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
         assert!(!yaml_serde::from_str::<application_log::Config>(yaml)
             .is_ok_and(|c| c.validate().is_ok()));
     }
+}
+
+#[tokio::test]
+async fn service_download_budget_bounds_clients_and_recovers_after_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let replies = Arc::new(tokio::sync::Semaphore::new(0));
+    let count = calls.clone();
+    let release = replies.clone();
+    let app = Router::new().fallback(get(move || {
+        let count = count.clone();
+        let release = release.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            release.acquire().await.unwrap().forget();
+            [0x42_u8, 0x89, 0xe3, 0x0d, 2, 0, 0, 0, 1].to_vec()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/catalog", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let root = tempfile::tempdir().unwrap();
+    let mut first = CatalogClient::build(config()).unwrap();
+    first.set_service_download_gate(gate.clone());
+    let mut second = CatalogClient::build(config()).unwrap();
+    second.set_service_download_gate(gate.clone());
+    let first_url = url.clone();
+    let first_path = root.path().join("first");
+    let first = tokio::spawn(async move {
+        first
+            .download_catalog_once(&first_url, "synthetic", "synthetic", &first_path)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let second_url = url.clone();
+    let second_path = root.path().join("second");
+    let second = tokio::spawn(async move {
+        second
+            .download_catalog_once(&second_url, "synthetic", "synthetic", &second_path)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.available_permits(), 0);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    replies.add_permits(2);
+    second.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.available_permits(), 1);
+    let held = gate.clone().acquire_owned().await.unwrap();
+    let mut cfg = config();
+    cfg.network.download_timeout_ms = 100;
+    let mut blocked = CatalogClient::build(cfg).unwrap();
+    blocked.set_service_download_gate(gate.clone());
+    let result = blocked
+        .download_catalog_once(&url, "synthetic", "synthetic", &root.path().join("blocked"))
+        .await;
+    assert!(matches!(result, Err(Error::Transport)));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!root.path().join("blocked").exists());
+    drop(held);
+    assert_eq!(gate.available_permits(), 1);
+    server.abort();
 }

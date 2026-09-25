@@ -108,7 +108,7 @@ already-held local slot. Auto backend fallback releases the FFI slot before reac
 Standalone CLI exports retain their existing per-export limit without a service-level cap.
 
 This controls simultaneous operations, not FFmpeg's internal thread count or total process RSS.
-Apply deployment CPU/memory limits separately. Shared download/memory admission and the
+Apply deployment CPU/memory limits separately. Shared memory admission and the
 remaining original resource tuning controls are separate restoration work. The service budget
 does not change cache identity or output formats.
 
@@ -121,3 +121,17 @@ source streams or create writers; their wait consumes the same per-attempt timeo
 released before retry backoff and after any bounded multipart abort. Cancellation drains work
 and releases queued waiters, preserving the existing publication/cleanup contract. Standalone
 storage commands keep the configured per-publication limit.
+
+## Shared CDN download budget
+
+`max_downloads` limits simultaneous CDN download attempts across all jobs (default 4,
+range 1..64). Catalog and resource downloads share these slots; per-profile asset concurrency
+still limits each resource batch. Admission, headers, streamed body, file writes and final sync
+share the existing `network.download_timeout_ms` attempt budget. A queued timeout sends no
+request. Cancellation releases the permit when the download future is dropped, and retries
+release slots during backoff. Failed or partial files remain in unpublished staging.
+
+Snapshot/version control requests do not consume CDN slots. Verified download-cache hits skip
+network admission. Decryption and export run after download admission is released; this setting
+is not an in-flight decoded-memory limit. Standalone downloads use the same attempt deadline
+without a service-wide semaphore. Existing retry counts and whole-run/job deadlines still apply.

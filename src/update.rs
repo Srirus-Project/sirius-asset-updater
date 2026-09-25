@@ -239,6 +239,18 @@ impl CatalogClient {
         limit: u64,
         asset: &Asset,
     ) -> Result<(u64, String), Error> {
+        self.cdn_attempt(self.download_asset_inner(url, username, password, path, limit, asset))
+            .await
+    }
+    async fn download_asset_inner(
+        &self,
+        url: &str,
+        username: &str,
+        password: &str,
+        path: &Path,
+        limit: u64,
+        asset: &Asset,
+    ) -> Result<(u64, String), Error> {
         let mut response = self
             .cdn_http
             .get(url)

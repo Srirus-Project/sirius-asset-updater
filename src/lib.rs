@@ -337,6 +337,7 @@ pub struct CatalogClient {
     config: Config,
     http: Client,
     cdn_http: Client,
+    service_download_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 impl CatalogClient {
     pub fn new(config: Config) -> Result<Self, Error> {
@@ -354,9 +355,38 @@ impl CatalogClient {
             config,
             http,
             cdn_http,
+            service_download_gate: None,
         })
     }
 
+    pub(crate) fn set_service_download_gate(
+        &mut self,
+        gate: std::sync::Arc<tokio::sync::Semaphore>,
+    ) {
+        self.service_download_gate = Some(gate);
+    }
+    async fn cdn_attempt<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.network.download_timeout_ms),
+            async {
+                let _permit = match &self.service_download_gate {
+                    Some(gate) => Some(
+                        gate.clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| Error::Cancelled)?,
+                    ),
+                    None => None,
+                };
+                operation.await
+            },
+        )
+        .await
+        .map_err(|_| Error::Transport)?
+    }
     pub async fn fetch(&self) -> Result<PathBuf, Error> {
         if !self.config.check_secrets().ready {
             return Err(Error::Preflight);
@@ -408,6 +438,16 @@ impl CatalogClient {
         Ok(snapshot)
     }
     async fn download_catalog_once(
+        &self,
+        url: &str,
+        username: &str,
+        password: &str,
+        path: &Path,
+    ) -> Result<(u64, String), Error> {
+        self.cdn_attempt(self.download_catalog_inner(url, username, password, path))
+            .await
+    }
+    async fn download_catalog_inner(
         &self,
         url: &str,
         username: &str,

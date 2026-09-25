@@ -48,6 +48,8 @@ pub struct ServiceConfig {
     pub max_media_processes: usize,
     #[serde(default = "workers")]
     pub max_uploads: usize,
+    #[serde(default = "workers")]
+    pub max_downloads: usize,
     #[serde(default = "queued")]
     pub max_queued_jobs: usize,
     #[serde(default = "retained")]
@@ -100,6 +102,7 @@ struct Inner {
     accepting: AtomicBool,
     media_gate: Arc<crate::media_gate::Gate>,
     upload_gate: Arc<tokio::sync::Semaphore>,
+    download_gate: Arc<tokio::sync::Semaphore>,
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
@@ -114,6 +117,7 @@ impl Service {
             || config.max_concurrent_jobs > 64
             || !(1..=16).contains(&config.max_media_processes)
             || !(1..=32).contains(&config.max_uploads)
+            || !(1..=64).contains(&config.max_downloads)
             || config.max_queued_jobs == 0
             || config.timeout_seconds == 0
         {
@@ -178,6 +182,7 @@ impl Service {
             inner: Arc::new(Inner {
                 access_log,
                 upload_gate: Arc::new(tokio::sync::Semaphore::new(config.max_uploads)),
+                download_gate: Arc::new(tokio::sync::Semaphore::new(config.max_downloads)),
                 config,
                 token,
                 store: Mutex::new(store),
@@ -354,7 +359,8 @@ impl Service {
                 return Err(Error::Config);
             }
             config.output = root.join("downloads");
-            let client = crate::CatalogClient::new(config)?;
+            let mut client = crate::CatalogClient::new(config)?;
+            client.set_service_download_gate(self.inner.download_gate.clone());
             tokio::select! {result=client.fetch()=>result?,_=cancelled(&mut stop)=>return Err(Error::Cancelled)}
         } else {
             profile.input.clone().ok_or(Error::Config)?
@@ -767,6 +773,7 @@ mod lifecycle_tests {
             max_concurrent_jobs: 2,
             max_media_processes: 4,
             max_uploads: 4,
+            max_downloads: 4,
             max_queued_jobs: 8,
             retain_terminal_jobs: 20,
             timeout_seconds,
