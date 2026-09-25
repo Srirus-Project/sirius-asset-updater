@@ -12,10 +12,12 @@ providers:
   #     type: s3
   #     endpoint: https://s3.example.com
   #     path_style: true # false for bucket.endpoint virtual-host addressing
+  #     request_payer: false # opt in only when this account accepts request charges
   #     public_read: false
   #     public_read_include: [] # e.g. ['\.png$']
   #     public_read_exclude: [] # exclusions always win
   #     write_options: # optional, applies to objects and publication markers
+  #       checksum_algorithm: crc32c # optional; destination must support multipart CRC32C
   #       storage_class: STANDARD
   #       server_side_encryption: aws:kms # alternatively AES256; omit for bucket default
   #       kms_key_id_env: SIRIUS_STORAGE_KMS_KEY_ID # optional; requires aws:kms

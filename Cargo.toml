@@ -55,5 +55,6 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }

@@ -146,3 +146,25 @@ This restores specific generic options, not arbitrary OpenDAL option passthrough
 credentials, addressing and ACLs retain their explicit typed fields. Other scalar options and
 region-template migration remain under audit; unsupported fields must fail instead of being
 silently ignored.
+
+
+### Requester Pays and upload checksums
+
+Haruki `options.enable_request_payer` maps to `backend.request_payer` (default false).
+Enable it only for destinations whose request charges should be accepted by the configured
+requesting account. It attaches the requester-pays header to uploads, multipart operations
+and verification reads, including publication markers. It does not grant access; a denied
+request fails publication without removing the policy or deleting local exports.
+
+Haruki `options.checksum_algorithm` maps to `backend.write_options.checksum_algorithm`.
+The supported value is `crc32c`; omission preserves the old no-extra-checksum behavior.
+The backend calculates and sends checksums for ordinary PUTs and multipart parts, including
+receipts and completion markers. This is additional transport validation: the independent
+SHA-256 read-back checks remain mandatory before completion or local cleanup.
+
+The locked OpenDAL S3 backend rejects MD5 for multipart initiation. Since retained exports
+can require multipart uploads, Sirius rejects `md5` at configuration validation rather than
+failing halfway through a large publication. Other algorithms also fail explicitly. Destinations
+must support CRC32C multipart/checksum semantics; unsupported/denied requests fail rather than
+silently retrying without checksums. Local fixture tests check actual request bodies with an
+independent CRC32C implementation; acceptance against the deployed object store remains required.

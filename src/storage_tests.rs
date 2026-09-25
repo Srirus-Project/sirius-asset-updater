@@ -71,6 +71,8 @@ struct Fake {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     acls: Mutex<HashMap<String, Option<String>>>,
     write_headers: Mutex<Vec<(String, String, String, String)>>,
+    checksums: Mutex<Vec<(String, String, String)>>,
+    payer_headers: Mutex<Vec<(String, bool)>>,
     parts: Mutex<BTreeMap<usize, Vec<u8>>>,
     mode: AtomicUsize,
     puts: AtomicUsize,
@@ -81,6 +83,19 @@ struct Fake {
 }
 async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
     let method = request.method().clone();
+    let payer = request
+        .headers()
+        .get("x-amz-request-payer")
+        .is_some_and(|v| v == "requester");
+    state
+        .payer_headers
+        .lock()
+        .unwrap()
+        .push((method.to_string(), payer));
+    let checksum = request
+        .headers()
+        .get("x-amz-checksum-crc32c")
+        .map(|v| v.to_str().unwrap().to_owned());
     let key = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_string();
     if !request
@@ -161,6 +176,20 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
             .await
             .unwrap()
             .to_vec();
+        if let Some(checksum) = checksum {
+            let actual = crc32c_reference(&data);
+            state
+                .checksums
+                .lock()
+                .unwrap()
+                .push((key.clone(), query.clone(), checksum.clone()));
+            if checksum != actual {
+                return Response::builder()
+                    .status(400)
+                    .body(Body::from("<Error><Code>BadDigest</Code></Error>"))
+                    .unwrap();
+            }
+        }
         if query.contains("uploadId=") {
             let part = query
                 .split('&')
@@ -256,6 +285,7 @@ async fn server() -> Server {
         prefix: "assets".into(),
         public_base_url: None,
         backend: Backend::S3 {
+            request_payer: false,
             endpoint,
             write_options: Box::default(),
             path_style: true,
@@ -743,6 +773,7 @@ async fn s3_write_options_reach_put_multipart_and_completion_markers() {
     std::env::set_var(&env, "alias/synthetic-key");
     if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
         **write_options = S3WriteOptions {
+            checksum_algorithm: None,
             storage_class: Some("STANDARD_IA".into()),
             server_side_encryption: Some("aws:kms".into()),
             kms_key_id_env: Some(env.clone()),
@@ -859,4 +890,114 @@ async fn shared_upload_admission_uses_attempt_deadline_before_any_write() {
     assert!(source.path().exists());
     drop(held);
     assert_eq!(gate.available_permits(), 1);
+}
+
+fn crc32c_reference(data: &[u8]) -> String {
+    use base64::Engine;
+    let mut crc = u32::MAX;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f63b78 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    base64::engine::general_purpose::STANDARD.encode((!crc).to_be_bytes())
+}
+
+#[tokio::test]
+async fn s3_crc32c_and_requester_pays_cover_parts_markers_and_readback() {
+    // Independent standard CRC32C check vector: 123456789 -> e3069283.
+    assert_eq!(crc32c_reference(b"123456789"), "4waSgw==");
+    let source = large_source();
+    let mut server = server().await;
+    if let Backend::S3 {
+        request_payer,
+        write_options,
+        ..
+    } = &mut server.config.providers[0].backend
+    {
+        *request_payer = true;
+        write_options.checksum_algorithm = Some("crc32c".into());
+    }
+    let (_tx, rx) = watch::channel(false);
+    let publication = server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    assert!(publication.files >= 3);
+    let checksums = server.state.checksums.lock().unwrap();
+    assert!(checksums.iter().any(|(_, q, _)| q.contains("partNumber=")));
+    assert!(checksums
+        .iter()
+        .any(|(p, _, _)| p.ends_with("complete.json")));
+    assert!(checksums
+        .iter()
+        .any(|(p, _, _)| p.ends_with("summary.json")));
+    let headers = server.state.payer_headers.lock().unwrap();
+    assert!(headers
+        .iter()
+        .any(|(method, payer)| method == "GET" && *payer));
+    assert!(headers
+        .iter()
+        .any(|(method, payer)| method == "PUT" && *payer));
+    assert!(headers.iter().all(|(_, payer)| *payer));
+    assert!(!server.state.unsigned.load(Ordering::SeqCst));
+}
+
+#[test]
+fn s3_checksum_policy_rejects_multipart_incompatible_and_unknown_algorithms() {
+    for algorithm in ["md5", "sha256", "CRC32C", "", "crc32c\n"] {
+        let options = S3WriteOptions {
+            checksum_algorithm: Some(algorithm.into()),
+            ..Default::default()
+        };
+        assert!(options.validate().is_err());
+    }
+    assert!(S3WriteOptions::default().validate().is_ok());
+}
+
+#[tokio::test]
+async fn s3_requester_policy_defaults_off_and_denied_readback_preserves_exports() {
+    let source = fixture();
+    let mut server = server().await;
+    let (_tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Jp, rx.clone())
+        .await
+        .unwrap();
+    assert!(server
+        .state
+        .payer_headers
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, payer)| !payer));
+    assert!(server.state.checksums.lock().unwrap().is_empty());
+    server.state.payer_headers.lock().unwrap().clear();
+    if let Backend::S3 {
+        request_payer,
+        write_options,
+        ..
+    } = &mut server.config.providers[0].backend
+    {
+        *request_payer = true;
+        write_options.checksum_algorithm = Some("crc32c".into());
+    }
+    server.config.remove_local_after_upload = true;
+    server.state.mode.store(6, Ordering::SeqCst);
+    assert!(server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .is_err());
+    assert!(source.path().join("summary.json").is_file());
+    assert!(server
+        .state
+        .payer_headers
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, payer)| *payer));
 }

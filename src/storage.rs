@@ -74,6 +74,8 @@ pub enum Backend {
         directory: PathBuf,
     },
     S3 {
+        #[serde(default)]
+        request_payer: bool,
         endpoint: String,
         #[serde(default)]
         write_options: Box<S3WriteOptions>,
@@ -96,12 +98,20 @@ pub enum Backend {
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3WriteOptions {
+    pub checksum_algorithm: Option<String>,
     pub storage_class: Option<String>,
     pub server_side_encryption: Option<String>,
     pub kms_key_id_env: Option<String>,
 }
 impl S3WriteOptions {
     fn validate(&self) -> Result<(), Error> {
+        if self
+            .checksum_algorithm
+            .as_deref()
+            .is_some_and(|s| s != "crc32c")
+        {
+            return Err(Error::Config);
+        }
         if self.storage_class.as_ref().is_some_and(|value| {
             value.is_empty()
                 || value.len() > 64
@@ -127,6 +137,9 @@ impl S3WriteOptions {
     }
     fn apply(&self, mut builder: services::S3) -> Result<services::S3, Error> {
         self.validate()?;
+        if let Some(value) = &self.checksum_algorithm {
+            builder = builder.checksum_algorithm(value);
+        }
         if let Some(value) = &self.storage_class {
             builder = builder.default_storage_class(value);
         }
@@ -811,6 +824,7 @@ impl Provider {
                 .map_err(storage_error)
             }
             Backend::S3 {
+                request_payer,
                 endpoint,
                 write_options,
                 path_style,
@@ -829,6 +843,9 @@ impl Provider {
                     .secret_access_key(&secret(secret_access_key_env)?)
                     .disable_config_load()
                     .disable_ec2_metadata();
+                if *request_payer {
+                    builder = builder.enable_request_payer();
+                }
                 builder = write_options.apply(builder)?;
                 if public {
                     builder = builder.default_acl("public-read");
