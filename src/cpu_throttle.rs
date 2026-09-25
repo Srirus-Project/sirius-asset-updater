@@ -417,6 +417,103 @@ mod tests {
             .is_err());
         }
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bounded child fixture used only by the Linux load-response test"]
+    fn load_child_fixture() {
+        if std::env::var("SIRIUS_CPU_LOAD_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        // Hard bound survives a failed parent, with no shell or external stress utility.
+        let until = Instant::now() + Duration::from_secs(15);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(move || {
+                    let mut value = 1u64;
+                    while Instant::now() < until {
+                        for _ in 0..10000 {
+                            value = std::hint::black_box(
+                                value.wrapping_mul(6364136223846793005).wrapping_add(1),
+                            );
+                        }
+                    }
+                    std::hint::black_box(value);
+                });
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated Linux runtime with at least two available CPU cores"]
+    fn linux_real_child_load_blocks_cancels_and_recovers() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let cfg = Config {
+            enabled: true,
+            sample_ms: 250,
+        };
+        let child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cpu_throttle::tests::load_child_fixture",
+                    "--ignored",
+                ])
+                .env("SIRIUS_CPU_LOAD_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut high = 0;
+        let mut maximum = 0f64;
+        while high < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "could not sustain more than one core of child CPU load"
+            );
+            let usage = sample(cfg.sample_ms, &cancel, deadline).unwrap();
+            maximum = maximum.max(usage);
+            high = if usage > 120.0 { high + 1 } else { 0 };
+            if high < 3 {
+                std::thread::sleep(Duration::from_millis(270));
+            }
+        }
+        let started = Instant::now();
+        assert!(
+            matches!(wait(&cfg, 1, &cancel, Instant::now() + Duration::from_millis(700)), Err(Error::Export(message)) if message == "CPU throttle timed out")
+        );
+        assert!(started.elapsed() >= Duration::from_millis(650));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let blocked_ms = started.elapsed().as_millis();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            assert!(matches!(
+                wait(&cfg, 1, &cancel, Instant::now() + Duration::from_secs(2)),
+                Err(Error::Cancelled)
+            ));
+        });
+        drop(child); // Reap before checking that admission resumes after load disappears.
+        cancel.store(false, Ordering::Relaxed);
+        let recovery = Instant::now();
+        wait(&cfg, 1, &cancel, Instant::now() + Duration::from_secs(3)).unwrap();
+        eprintln!(
+            "real_child_load maximum_percent={maximum:.1} blocked_ms={} recovery_ms={}",
+            blocked_ms,
+            recovery.elapsed().as_millis()
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn host_sampler_reads_real_process_tree_without_a_shell() {
