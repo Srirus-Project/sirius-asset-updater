@@ -69,6 +69,7 @@ async fn local_publication_readback_region_scope_and_explicit_cleanup() {
 struct Fake {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     acls: Mutex<HashMap<String, Option<String>>>,
+    write_headers: Mutex<Vec<(String, String, String, String)>>,
     parts: Mutex<BTreeMap<usize, Vec<u8>>>,
     mode: AtomicUsize,
     puts: AtomicUsize,
@@ -92,6 +93,20 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
     if method == "PUT" && !query.contains("uploadId=")
         || method == "POST" && query.contains("uploads")
     {
+        let header = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        state.write_headers.lock().unwrap().push((
+            query.clone(),
+            header("x-amz-storage-class"),
+            header("x-amz-server-side-encryption"),
+            header("x-amz-server-side-encryption-aws-kms-key-id"),
+        ));
         state.acls.lock().unwrap().insert(
             key.clone(),
             request
@@ -241,6 +256,7 @@ async fn server() -> Server {
         public_base_url: None,
         backend: Backend::S3 {
             endpoint,
+            write_options: Box::default(),
             path_style: true,
             public_read: false,
             public_read_include: vec![],
@@ -716,4 +732,68 @@ async fn upload_progress_counts_only_verified_objects_and_all_destinations() {
     assert_eq!(progress_rx.borrow().completed, 0);
     assert_eq!(progress_rx.borrow().bytes, 0);
     assert!(source.path().exists());
+}
+
+#[tokio::test]
+async fn s3_write_options_reach_put_multipart_and_completion_markers() {
+    let source = large_source();
+    let mut server = server().await;
+    let env = format!("SIRIUS_TEST_KMS_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, "alias/synthetic-key");
+    if let Backend::S3 { write_options, .. } = &mut server.config.providers[0].backend {
+        **write_options = S3WriteOptions {
+            storage_class: Some("STANDARD_IA".into()),
+            server_side_encryption: Some("aws:kms".into()),
+            kms_key_id_env: Some(env.clone()),
+        };
+    }
+    let (_tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    let headers = server.state.write_headers.lock().unwrap();
+    assert!(headers.iter().any(|(query, ..)| query.contains("uploads")));
+    assert!(headers.iter().any(|(query, ..)| query.is_empty()));
+    assert!(headers.len() >= 3);
+    for (_, class, encryption, key) in headers.iter() {
+        assert_eq!(class, "STANDARD_IA");
+        assert_eq!(encryption, "aws:kms");
+        assert_eq!(key, "alias/synthetic-key");
+    }
+    assert!(!server.state.unsigned.load(Ordering::SeqCst));
+    std::env::remove_var(env);
+}
+#[test]
+fn s3_write_options_reject_bad_policy_without_echoing_values() {
+    for text in [
+        "storage_class: ''",
+        "storage_class: 'bad value'",
+        "server_side_encryption: unknown",
+        "server_side_encryption: AES256\nkms_key_id_env: UNSET_SIRIUS_TEST_KMS",
+        "kms_key_id_env: UNSET_SIRIUS_TEST_KMS",
+    ] {
+        let options: S3WriteOptions = yaml_serde::from_str(text).unwrap();
+        assert!(options.validate().is_err());
+    }
+    assert!(yaml_serde::from_str::<S3WriteOptions>("endpoint: https://elsewhere.invalid").is_err());
+    let env = format!("SIRIUS_TEST_KMS_{}", uuid::Uuid::new_v4().simple());
+    let options = S3WriteOptions {
+        server_side_encryption: Some("aws:kms".into()),
+        kms_key_id_env: Some(env.clone()),
+        ..Default::default()
+    };
+    for value in ["", "invalid\nheader", "key with spaces"] {
+        std::env::set_var(&env, value);
+        assert!(options.validate().is_err());
+    }
+    std::env::remove_var(env);
+    assert!(S3WriteOptions::default().validate().is_ok());
+    assert!(
+        yaml_serde::from_str::<S3WriteOptions>("server_side_encryption: AES256")
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
 }

@@ -15,6 +15,10 @@ providers:
   #     public_read: false
   #     public_read_include: [] # e.g. ['\.png$']
   #     public_read_exclude: [] # exclusions always win
+  #     write_options: # optional, applies to objects and publication markers
+  #       storage_class: STANDARD
+  #       server_side_encryption: aws:kms # alternatively AES256; omit for bucket default
+  #       kms_key_id_env: SIRIUS_STORAGE_KMS_KEY_ID # optional; requires aws:kms
   #     bucket: sirius-assets
   #     region: auto
   #     access_key_id_env: SIRIUS_STORAGE_ACCESS_KEY_ID

@@ -118,3 +118,27 @@ Do not delete prefixes merely because an active transfer has not written a marke
 
 This restores the local/S3 publication path. Mutable registries,
 notifications, scheduling and production storage acceptance remain in the restoration audit.
+
+## S3 write policy migration
+
+Haruki's scalar `options.default_storage_class`, `options.server_side_encryption`, and
+`options.server_side_encryption_aws_kms_key_id` map to the typed Sirius
+`backend.write_options.storage_class`, `server_side_encryption`, and `kms_key_id_env` fields.
+The KMS field names an environment variable containing the key identifier or alias; do not
+place a key value in the configuration. The map rejects unknown fields. Storage classes must
+be uppercase ASCII identifiers (letters, digits, underscore, at most 64 bytes); the destination
+validates whether it supports that class. Encryption accepts `AES256` or `aws:kms`; a KMS key
+reference requires `aws:kms`. Omitted fields preserve destination bucket defaults.
+
+These policies apply to ordinary writes, multipart initiation, and publication markers,
+including public-read uploads. The same verified-readback publication contract still applies:
+classes that make new objects unavailable for immediate reads cannot complete publication.
+KMS access must permit both writes and verification reads. A failed verification retains local
+exports and does not report a completed publication. Tests observe actual signed S3 requests
+and complete a multipart publication against a local fixture; cloud bucket/KMS acceptance
+remains a deployment test.
+
+This restores specific generic options, not arbitrary OpenDAL option passthrough. Endpoint,
+credentials, addressing and ACLs retain their explicit typed fields. Other scalar options and
+region-template migration remain under audit; unsupported fields must fail instead of being
+silently ignored.

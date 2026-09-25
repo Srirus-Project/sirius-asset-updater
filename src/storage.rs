@@ -73,6 +73,8 @@ pub enum Backend {
     },
     S3 {
         endpoint: String,
+        #[serde(default)]
+        write_options: Box<S3WriteOptions>,
         #[serde(default = "path_style")]
         path_style: bool,
         #[serde(default)]
@@ -88,6 +90,52 @@ pub enum Backend {
         #[serde(default)]
         session_token_env: Option<String>,
     },
+}
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3WriteOptions {
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub kms_key_id_env: Option<String>,
+}
+impl S3WriteOptions {
+    fn validate(&self) -> Result<(), Error> {
+        if self.storage_class.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 64
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        }) || self
+            .server_side_encryption
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "AES256" | "aws:kms"))
+            || self.kms_key_id_env.is_some()
+                && self.server_side_encryption.as_deref() != Some("aws:kms")
+        {
+            return Err(Error::Config);
+        }
+        if let Some(name) = &self.kms_key_id_env {
+            let value = secret(name)?;
+            if value.len() > 2048 || !value.bytes().all(|b| (33..=126).contains(&b)) {
+                return Err(Error::Config);
+            }
+        }
+        Ok(())
+    }
+    fn apply(&self, mut builder: services::S3) -> Result<services::S3, Error> {
+        self.validate()?;
+        if let Some(value) = &self.storage_class {
+            builder = builder.default_storage_class(value);
+        }
+        if let Some(value) = &self.server_side_encryption {
+            builder = builder.server_side_encryption(value);
+        }
+        if let Some(name) = &self.kms_key_id_env {
+            builder = builder.server_side_encryption_aws_kms_key_id(&secret(name)?);
+        }
+        Ok(builder)
+    }
 }
 struct PublicReadPolicy {
     all: bool,
@@ -220,6 +268,7 @@ impl Config {
                 }
                 Backend::S3 {
                     endpoint,
+                    write_options,
                     path_style,
                     bucket,
                     region,
@@ -228,6 +277,7 @@ impl Config {
                     session_token_env,
                     ..
                 } => {
+                    write_options.validate()?;
                     let url = reqwest::Url::parse(endpoint).map_err(|_| Error::Config)?;
                     let loopback = url.host_str().is_some_and(|h| {
                         h.trim_matches(['[', ']'])
@@ -732,6 +782,7 @@ impl Provider {
             }
             Backend::S3 {
                 endpoint,
+                write_options,
                 path_style,
                 bucket,
                 region,
@@ -748,6 +799,7 @@ impl Provider {
                     .secret_access_key(&secret(secret_access_key_env)?)
                     .disable_config_load()
                     .disable_ec2_metadata();
+                builder = write_options.apply(builder)?;
                 if public {
                     builder = builder.default_acl("public-read");
                 }

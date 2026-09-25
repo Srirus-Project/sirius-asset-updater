@@ -23,7 +23,7 @@ Original `src/core/storage.rs` and `src/core/config/schema.rs` expose additional
 | S3 public-read policy and per-file include/exclude rules | Explicit opt-in with exclusion precedence; write/multipart/marker tests | Production bucket-policy acceptance |
 | Public base URL / planned storage target information | Offline target preview and per-provider publication URL receipts | Registry integration and production CDN verification |
 | Region templates in bucket/root/prefix/options | Explicit profile providers plus mandatory region prefix | Audit equivalent multi-region configuration and migration |
-| Generic scalar OpenDAL options | Typed subset only | Map supported non-game options; do not silently accept ignored options |
+| Generic scalar OpenDAL options | Typed storage class and SSE-S3/SSE-KMS write policy restored; real PUT/multipart/marker tests | Audit remaining options; do not silently accept ignored options |
 
 The source builds an additional S3 operator with `default_acl=public-read` for matched files;
 this is actual upload behavior, not merely a display setting. Public-read and address-style
@@ -45,13 +45,14 @@ Relevant original sources:
   resampling/scaling, memory I/O and resource ownership primitives.
 - `crates/sekai-asset-pipeline/src/media/ffi_disabled.rs`: explicit unsupported feature errors.
 
-Sirius currently uses native Rust Unity/CRI parsing and the configured FFmpeg executable for
-media conversion/validation. This restores media results but does not restore FFI/Auto backend
-selection. That remains required work. A feature-gated codec bridge now compiles against FFmpeg 7 and
-passes synthetic audio/ownership tests; see [MEDIA_FFI.md](MEDIA_FFI.md). It is not yet connected
-to export configuration, cancellation or the video acceptance pipeline. The codec portions are adapted independently
-of Sekai's encryption, model/chart conventions and game configuration; preserve Haruki attribution.
-Do not import the entire Sekai pipeline solely to obtain its codec layer.
+Sirius now integrates `media_backend: cli/ffi/auto` into FLAC/MP3/MP4 export. The optional
+FFmpeg 7 bridge includes cancellation/deadline checks, runtime ABI validation and native ownership
+handling; Auto falls back to CLI within the remaining deadline. Backend/library identity scopes
+export cache entries. Synthetic audio/video, service/cache, fallback and feature-disabled tests
+pass; see [MEDIA_FFI.md](MEDIA_FFI.md). Stream-copy muxing, ADX decoding and independent verification
+still use the FFmpeg executable. Real Sirius fixture and three-platform package acceptance remain
+pending. The codec portions are adapted independently of Sekai encryption, model/chart conventions
+and game configuration; preserve Haruki attribution.
 
 The adapter must account for Sirius IVF as well as M2V, independent color/alpha streams,
 WAV/FLAC preservation, multiple output formats, frame/PCM verification, resource limits,
@@ -63,5 +64,5 @@ requirements. A CLI fallback must be explicit and tested, not a successful no-op
 
 The previously broad “other OpenDAL backends” audit is resolved at the service-family level:
 FS and S3 cover the original compiled baseline. Storage **configuration and publication** parity
-is still incomplete. Media FFI/backend choice remains a release-blocking generic capability.
+is still incomplete. Media FFI/backend choice is implemented; its real-fixture and package acceptance remain release-blocking.
 Neither finding relaxes the full yhm01 acceptance, public artifact audit or 1.2.0 release gates.
