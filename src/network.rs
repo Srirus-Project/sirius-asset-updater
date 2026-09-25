@@ -37,9 +37,19 @@ impl Retry {
         )
     }
 }
+/// CDN protocol negotiation; never HTTP/2 prior knowledge over cleartext.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetHttpVersion {
+    #[default]
+    Auto,
+    Http1,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
+    pub asset_http_version: AssetHttpVersion,
     pub api_proxy: Option<crate::proxy::ProxyConfig>,
     pub cdn_proxy: Option<crate::proxy::ProxyConfig>,
     pub connect_timeout_ms: u64,
@@ -54,6 +64,7 @@ pub struct Network {
 impl Default for Network {
     fn default() -> Self {
         Self {
+            asset_http_version: AssetHttpVersion::Auto,
             api_proxy: None,
             cdn_proxy: None,
             connect_timeout_ms: 10_000,

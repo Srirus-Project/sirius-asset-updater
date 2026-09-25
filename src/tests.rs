@@ -3248,3 +3248,84 @@ async fn completion_delivery_restarts_retries_and_does_not_repeat_pipeline() {
         .contains("\"pending_events\":1"));
     receiver_task.abort();
 }
+
+#[tokio::test]
+async fn cdn_http_policy_negotiates_tls_and_preserves_origin_auth_and_redirect_policy() {
+    use crate::network::{AssetHttpVersion, Network};
+    assert_eq!(
+        Network::default().asset_http_version,
+        AssetHttpVersion::Auto
+    );
+    for invalid in ["http2", "h2c", "legacy"] {
+        assert!(
+            yaml_serde::from_str::<Network>(&format!("asset_http_version: {invalid}")).is_err()
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tls = listener_tls_config(root.path()).load().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = axum::Router::new()
+        .route(
+            "/resource",
+            axum::routing::get(|request: axum::extract::Request| async move {
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Basic c3ludGhldGljOmNkbg=="
+                );
+                assert!(!request.headers().contains_key("proxy-authorization"));
+                format!("{:?}", request.version())
+            }),
+        )
+        .route(
+            "/redirect",
+            axum::routing::get(|| async { (StatusCode::FOUND, [("location", "/resource")]) }),
+        );
+    let (stop, signal) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(crate::server::serve(listener, router, Some(tls), async {
+        let _ = signal.await;
+    }));
+    let certificate =
+        reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/listener-cert.pem"))
+            .unwrap();
+    for (policy, expected) in [
+        ("auto", reqwest::Version::HTTP_2),
+        ("http1", reqwest::Version::HTTP_11),
+    ] {
+        let network: Network =
+            yaml_serde::from_str(&format!("asset_http_version: {policy}")).unwrap();
+        let client = crate::proxy::cdn_builder(&network)
+            .unwrap()
+            .tls_certs_only([certificate.clone()])
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("https://{address}/resource"))
+            .basic_auth("synthetic", Some("cdn"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), expected);
+        assert_eq!(response.text().await.unwrap(), format!("{expected:?}"));
+        let response = client
+            .get(format!("https://{address}/redirect"))
+            .basic_auth("synthetic", Some("cdn"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+    // Test trust is injected into this fixture only; production still rejects this private CA.
+    let network = Network::default();
+    let client = crate::proxy::cdn_builder(&network)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(client
+        .get(format!("https://{address}/resource"))
+        .send()
+        .await
+        .is_err());
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}

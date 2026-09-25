@@ -74,3 +74,14 @@ pub(crate) fn builder(
     }
     Ok(builder)
 }
+
+/// Only resource/catalog requests use the CDN protocol override.
+pub(crate) fn cdn_builder(
+    network: &crate::network::Network,
+) -> Result<reqwest::ClientBuilder, Error> {
+    let builder = builder(network, network.cdn_proxy.as_ref())?;
+    Ok(match network.asset_http_version {
+        crate::network::AssetHttpVersion::Auto => builder,
+        crate::network::AssetHttpVersion::Http1 => builder.http1_only(),
+    })
+}

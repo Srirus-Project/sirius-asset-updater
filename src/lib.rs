@@ -348,7 +348,7 @@ impl CatalogClient {
         let http = proxy::builder(&config.network, config.network.api_proxy.as_ref())?
             .build()
             .map_err(|_| Error::Transport)?;
-        let cdn_http = proxy::builder(&config.network, config.network.cdn_proxy.as_ref())?
+        let cdn_http = proxy::cdn_builder(&config.network)?
             .build()
             .map_err(|_| Error::Transport)?;
         Ok(Self {

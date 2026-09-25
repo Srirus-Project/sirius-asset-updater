@@ -36,6 +36,7 @@ regional_routes: false
 
 # Optional request policy; these are the defaults. See docs/NETWORK.md.
 # network:
+#   asset_http_version: auto # auto (TLS ALPN) or http1, CDN requests only
 #   # Optional independent HTTP/HTTPS forward proxies; absent means direct.
 #   # api_proxy: {url_env: SIRIUS_API_PROXY_URL, authorization_env: SIRIUS_API_PROXY_AUTHORIZATION}
 #   # cdn_proxy: {url_env: SIRIUS_CDN_PROXY_URL, authorization_env: SIRIUS_CDN_PROXY_AUTHORIZATION}

@@ -5,6 +5,7 @@ retain these defaults; profiles in the job service use the same configuration.
 
 ```yaml
 network:
+  asset_http_version: auto # auto or http1; applies to CDN catalog/resource requests
   connect_timeout_ms: 10000
   download_timeout_ms: 60000
   snapshot_timeout_ms: 10000
@@ -79,3 +80,13 @@ Existing connection and request deadlines bound proxy connections and requests. 
 response is terminal. A failed HTTPS CONNECT may be reported as a transport error by reqwest
 and retried within the configured attempt bound; it never bypasses the proxy. Redirects remain
 terminal and are never followed with either proxy or origin credentials.
+
+## CDN HTTP version
+
+`network.asset_http_version` restores Haruki's `server.asset_http_version` choice for Sirius
+catalog and asset downloads. The default `auto` negotiates HTTP/2 through TLS ALPN when offered
+and otherwise uses HTTP/1.1. `http1` forces HTTP/1.1, including inside a configured CONNECT
+tunnel. This setting does not force HTTP/2, enable cleartext prior knowledge, disable TLS
+verification or change credentials, retry policy or receipt identity. Snapshot/version control
+clients keep their independent default negotiation. HTTP/2 is enabled in production dependencies,
+not just the development fixture dependency. Unknown values are rejected during config loading.
