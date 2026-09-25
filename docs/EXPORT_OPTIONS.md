@@ -46,6 +46,18 @@ image: {format: jpeg, quality: 90, background: [255, 255, 255]}
 JPEG is lossy and cannot store alpha. Both quality (1..100) and RGB background are
 mandatory so transparency handling is intentional. Unknown format options fail parsing.
 
+PNG supports `image: {format: png, compression: fast}` with `fast` (default), `default`
+or `best`. These select encoder effort, not image quality: all preserve RGBA and row order.
+Encoded file sizes and CPU time depend on image content; `best` is not a promise of a smaller
+file for every input. The selected compression participates in export-cache identity and summaries.
+Omitted compression and explicit `fast` serialize identically for legacy configuration compatibility.
+The same encoded-output limit applies to all modes. Compression on a non-PNG format and unknown
+options are rejected rather than silently ignored.
+
+The original Haruki `webp_lossless` flag is not reproduced: at the audited baseline its dynamic
+and native RGBA export paths always use `WebPEncoder::new_lossless`, regardless of that flag.
+Sirius likewise exports lossless WebP. Multiple image renditions remain a separate restoration item.
+
 ## Audio output
 
 `audio: wav` preserves existing PCM WAV output. `audio: flac` uses FFmpeg after native

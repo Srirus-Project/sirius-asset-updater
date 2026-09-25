@@ -51,10 +51,15 @@ not dismissed as Sekai-specific merely because the current implementation is sma
 
 - `execution.allow_cancel`: Sirius exposes cancellation but currently has no operator disable
   switch. Decide and document the service policy or restore the toggle.
-- `backends.image.png_compression`, `webp_lossless`, and region `export.images.formats`:
-  current `ImageExport` chooses one image rendition, with lossless WebP and explicit JPEG
-  quality/background. Original multiple image renditions and encoder tuning still need an
-  implementation/applicability review; audio's multiple renditions do not cover this gap.
+- Region `export.images.formats`: current `ImageExport` still chooses one image rendition.
+  Original multiple image renditions remain a genuine gap; audio's multiple renditions do not
+  cover it. PNG effort has now been restored as `image.compression: fast/default/best`, with
+  exact RGBA/row-order and cache-identity verification. JPEG already has explicit quality/background.
+- `backends.image.webp_lossless` was a nonfunctional option at this baseline: source forwards
+  it into pipeline options, but `crates/sekai-asset-pipeline/src/export/images.rs` always calls
+  `WebPEncoder::new_lossless` in `encode_dynamic_image` and `encode_native_rgba_ir`; the file
+  writer delegates to the same encoder. Sirius lossless WebP preserves that actual behavior.
+  Do not copy the ignored boolean or claim original lossy WebP support.
 - `backends.asset_studio.read_batch_size/read_kinds`: compare the actual native reader execution
   behavior before mapping to concurrency or class selection. Those are different controls.
 - `regions.*.export.raw_bundles`: independently audit filtered raw-bundle publication and paths;

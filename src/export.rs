@@ -2611,10 +2611,16 @@ pub(crate) mod tests {
             pixels: pixels.clone(),
         };
         for (i, format) in [
-            ImageExport::Png,
-            ImageExport::Webp,
-            ImageExport::Bmp,
-            ImageExport::Tga,
+            ImageExport::default(),
+            ImageExport::Png {
+                compression: crate::export_options::PngCompression::Default,
+            },
+            ImageExport::Png {
+                compression: crate::export_options::PngCompression::Best,
+            },
+            ImageExport::Webp {},
+            ImageExport::Bmp {},
+            ImageExport::Tga {},
         ]
         .into_iter()
         .enumerate()
@@ -3032,7 +3038,16 @@ pub(crate) mod tests {
         snapshot.region = Some(crate::region::Region::En);
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         snapshot.region = Some(crate::region::Region::Jp);
-        cfg.image = crate::export_options::ImageExport::Webp;
+        cfg.image = yaml_serde::from_str("format: png\ncompression: fast").unwrap();
+        assert_eq!(base, id(&cfg, &snapshot, &asset, &deps, 1));
+        let mut compression_keys = std::collections::HashSet::new();
+        compression_keys.insert(base.clone());
+        for compression in ["default", "best"] {
+            cfg.image =
+                yaml_serde::from_str(&format!("format: png\ncompression: {compression}")).unwrap();
+            assert!(compression_keys.insert(id(&cfg, &snapshot, &asset, &deps, 1)));
+        }
+        cfg.image = crate::export_options::ImageExport::Webp {};
         assert_ne!(base, id(&cfg, &snapshot, &asset, &deps, 1));
         cfg.image = Default::default();
         cfg.audio = crate::export_options::AudioExport::Flac.into();

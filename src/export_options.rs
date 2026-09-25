@@ -59,18 +59,49 @@ impl Selection {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PngCompression {
+    #[default]
+    Fast,
+    Default,
+    Best,
+}
+impl PngCompression {
+    fn is_fast(&self) -> bool {
+        *self == Self::Fast
+    }
+    fn native(self) -> unity_rs_core::image_export::PngCompression {
+        use unity_rs_core::image_export::PngCompression as P;
+        match self {
+            Self::Fast => P::Fast,
+            Self::Default => P::Default,
+            Self::Best => P::Best,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageExport {
-    #[default]
-    Png,
-    Webp,
-    Bmp,
-    Tga,
+    Png {
+        #[serde(default, skip_serializing_if = "PngCompression::is_fast")]
+        compression: PngCompression,
+    },
+    Webp {},
+    Bmp {},
+    Tga {},
     Jpeg {
         quality: u8,
         background: [u8; 3],
     },
+}
+impl Default for ImageExport {
+    fn default() -> Self {
+        Self::Png {
+            compression: PngCompression::Fast,
+        }
+    }
 }
 impl ImageExport {
     pub fn validate(&self) -> Result<(), Error> {
@@ -82,10 +113,10 @@ impl ImageExport {
     pub fn native(&self) -> unity_rs_core::image_export::ImageFormat {
         use unity_rs_core::image_export::ImageFormat as F;
         match self {
-            Self::Png => F::Png,
-            Self::Webp => F::Webp,
-            Self::Bmp => F::Bmp,
-            Self::Tga => F::Tga,
+            Self::Png { .. } => F::Png,
+            Self::Webp {} => F::Webp,
+            Self::Bmp {} => F::Bmp,
+            Self::Tga {} => F::Tga,
             Self::Jpeg { .. } => F::Jpeg,
         }
     }
@@ -95,12 +126,13 @@ impl ImageExport {
         order: unity_rs_core::image_export::ImageRowOrder,
         limit: u64,
     ) -> Result<Vec<u8>, Error> {
-        use unity_rs_core::image_export::{
-            write_rgba_image_with_options, ImageEncodeOptions, PngCompression,
-        };
+        use unity_rs_core::image_export::{write_rgba_image_with_options, ImageEncodeOptions};
         self.validate()?;
         let mut options = ImageEncodeOptions {
-            png_compression: PngCompression::Fast,
+            png_compression: match self {
+                Self::Png { compression } => compression.native(),
+                _ => PngCompression::Fast.native(),
+            },
             maximum_output_bytes: limit,
             ..Default::default()
         };
@@ -187,5 +219,100 @@ impl<'de> Deserialize<'de> for AudioFormats {
             return Err(serde::de::Error::custom("duplicate audio format"));
         }
         Ok(Self(values))
+    }
+}
+
+#[cfg(test)]
+mod png_tests {
+    use super::*;
+    use unity_rs_core::{image_export::ImageRowOrder, texture::RgbaImage};
+    #[test]
+    fn compression_changes_encoding_preserves_rgba_and_legacy_config() {
+        let legacy: ImageExport = yaml_serde::from_str("format: png").unwrap();
+        assert_eq!(sonic_rs::to_string(&legacy).unwrap(), r#"{"format":"png"}"#);
+        let pixels: Vec<u8> = (0..64)
+            .flat_map(|y| {
+                (0..128).flat_map(move |x| {
+                    [
+                        (x * 2) as u8,
+                        (y * 3) as u8,
+                        ((x / 8 + y / 8) * 13) as u8,
+                        ((x + y) % 256) as u8,
+                    ]
+                })
+            })
+            .collect();
+        let image = RgbaImage {
+            width: 128,
+            height: 64,
+            pixels: pixels.clone(),
+        };
+        let baseline = legacy
+            .encode(&image, ImageRowOrder::Display, 1024 * 1024)
+            .unwrap();
+        let mut encodings = std::collections::HashSet::new();
+        for compression in ["fast", "default", "best"] {
+            let config: ImageExport =
+                yaml_serde::from_str(&format!("format: png\ncompression: {compression}")).unwrap();
+            for (flipped, order) in [
+                (false, ImageRowOrder::Display),
+                (true, ImageRowOrder::UnityDecoded),
+            ] {
+                let bytes = config.encode(&image, order, 1024 * 1024).unwrap();
+                if !flipped {
+                    if compression == "fast" {
+                        assert_eq!(bytes, baseline);
+                    }
+                    encodings.insert(bytes.clone());
+                }
+                let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes))
+                    .read_info()
+                    .unwrap();
+                let mut decoded = vec![0; decoder.output_buffer_size().unwrap()];
+                let info = decoder.next_frame(&mut decoded).unwrap();
+                assert_eq!(
+                    (info.width, info.height, info.color_type),
+                    (128, 64, png::ColorType::Rgba)
+                );
+                let expected: Vec<u8> = if flipped {
+                    pixels
+                        .chunks_exact(128 * 4)
+                        .rev()
+                        .flatten()
+                        .copied()
+                        .collect()
+                } else {
+                    pixels.clone()
+                };
+                assert_eq!(&decoded[..info.buffer_size()], expected);
+                assert!(config.encode(&image, order, 1).is_err());
+            }
+            let json = sonic_rs::to_string(&config).unwrap();
+            let restored: ImageExport = sonic_rs::from_str(&json).unwrap();
+            assert_eq!(
+                restored
+                    .encode(&image, ImageRowOrder::Display, 1024 * 1024)
+                    .unwrap(),
+                config
+                    .encode(&image, ImageRowOrder::Display, 1024 * 1024)
+                    .unwrap()
+            );
+        }
+        assert!(
+            encodings.len() > 1,
+            "compression must affect actual encoded bytes"
+        );
+        for invalid in [
+            "format: png\ncompression: 9",
+            "format: png\ncompression: unknown",
+            "format: webp\ncompression: best",
+            "format: bmp\nquality: 90",
+            "format: tga\ncompression: fast",
+        ] {
+            assert!(
+                yaml_serde::from_str::<ImageExport>(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }
