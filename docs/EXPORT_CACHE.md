@@ -64,6 +64,12 @@ backend. Removing an idle cache only causes future decoding work.
 
 ## Capacity and eviction
 
+Size the byte limit to hold at least one complete export when full re-exports should reuse the
+cache. Eviction is least-recently-used, and a full re-export visits resources in the same order
+as the run that filled the cache, so a smaller budget evicts every entry before it is needed:
+on the JP catalog (~35 GiB decoded output) an 8 GiB limit produced no hits, while 48 GiB
+produced 13,367 of 13,367 during 1.2.0 acceptance.
+
 `cache_max_bytes` and `cache_max_entries` are optional. Omitted limits preserve unbounded
 legacy capacity; configured byte capacity must be positive and entry capacity accepts
 1..1000000. Limits require cache_directory and do not change resource identity. Bytes count
