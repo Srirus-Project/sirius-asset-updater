@@ -17,6 +17,19 @@ logging:
 
 Without this section, application events use info-level text on stderr. `level` accepts
 `off`, `error`, `warn`, `info`, `debug` and `trace`. `format` is `text` or `json`.
+
+`level` also accepts the original Haruki per-target directive list,
+`default[,target=level...]`, for example
+`warn,sirius_asset_updater::export=debug,sirius_asset_updater::export::cache=off`. The
+first item must be a bare default level; each further item is `target=level`. An event uses
+the level of the longest configured target equal to its target or a `::`-separated module
+prefix of it (`sirius_asset_updater::exp` does not cover `sirius_asset_updater::export`),
+otherwise the default. Levels are the six lowercase names above; case variants, `warning`,
+bare targets, empty items and whitespace are rejected rather than normalized. Directives are
+bounded to 1024 bytes and 64 targets; targets are non-empty ASCII `[A-Za-z0-9_:]` and must not
+repeat. Invalid values fail configuration loading. Directives only lower or raise application
+targets: dependency targets such as `hyper=warn` are accepted for configuration portability but
+remain disabled, and `RUST_LOG` is still ignored.
 Output is `{type: stderr}`, `{type: stdout}`, or a file as shown above. Stdout output is
 explicitly opt-in because it interleaves logs with CLI JSON/command output; prefer stderr
 or files for scripting. Existing CLI usage/error diagnostics and failures before logger

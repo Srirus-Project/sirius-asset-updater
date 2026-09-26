@@ -39,11 +39,83 @@ impl Level {
             Self::Trace => true,
         }
     }
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "off" => Self::Off,
+            "error" => Self::Error,
+            "warn" => Self::Warn,
+            "info" => Self::Info,
+            "debug" => Self::Debug,
+            "trace" => Self::Trace,
+            _ => return None,
+        })
+    }
+}
+/// A single level or `default[,target=level...]`; the longest matching target wins.
+/// Targets match exactly or at a `::` module boundary; `filter::Targets` uses raw prefixes.
+#[derive(Clone, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Levels {
+    default: Level,
+    targets: Vec<(String, Level)>,
+}
+impl From<Level> for Levels {
+    fn from(default: Level) -> Self {
+        Self {
+            default,
+            targets: vec![],
+        }
+    }
+}
+impl TryFrom<String> for Levels {
+    type Error = io::Error;
+    fn try_from(value: String) -> io::Result<Self> {
+        value.parse()
+    }
+}
+impl std::str::FromStr for Levels {
+    type Err = io::Error;
+    fn from_str(value: &str) -> io::Result<Self> {
+        if value.len() > 1024 {
+            return Err(invalid());
+        }
+        let mut items = value.split(',');
+        let default = items.next().and_then(Level::parse).ok_or_else(invalid)?;
+        let mut targets: Vec<(String, Level)> = vec![];
+        for item in items {
+            let (target, level) = item.split_once('=').ok_or_else(invalid)?;
+            let level = Level::parse(level).ok_or_else(invalid)?;
+            if target.is_empty()
+                || !target
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+                || targets.len() == 64
+                || targets.iter().any(|(t, _)| t == target)
+            {
+                return Err(invalid());
+            }
+            targets.push((target.into(), level));
+        }
+        targets.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+        Ok(Self { default, targets })
+    }
+}
+impl Levels {
+    fn level(&self, target: &str) -> Level {
+        self.targets
+            .iter()
+            .find(|(t, _)| {
+                target
+                    .strip_prefix(t.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            })
+            .map_or(self.default, |(_, level)| *level)
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub level: Level,
+    pub level: Levels,
     pub format: Format,
     pub output: Output,
     pub queue_capacity: usize,
@@ -51,7 +123,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            level: Level::Info,
+            level: Level::Info.into(),
             format: Format::Text,
             output: Output::Stderr {},
             queue_capacity: 4096,
@@ -66,6 +138,10 @@ fn invalid() -> io::Error {
 }
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
+        // Templates are an access-log format; application events have no placeholder set.
+        if matches!(self.format, Format::Template) {
+            return Err(invalid());
+        }
         crate::access_log::Config {
             format: self.format.clone(),
             output: self.output.clone(),
@@ -202,7 +278,7 @@ impl<S: Subscriber> Layer<S> for AppLayer {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
         let target = metadata.target();
         (target == APP_TARGET || target.starts_with(APP_PREFIX))
-            && self.config.level.accepts(metadata.level())
+            && self.config.level.level(target).accepts(metadata.level())
     }
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
         let mut fields = Fields::default();
@@ -222,6 +298,7 @@ impl<S: Subscriber> Layer<S> for AppLayer {
                 Ok(line) => line,
                 Err(_) => return,
             },
+            Format::Template => return,
             Format::Text => format!(
                 "{} {} {} dropped={} {}",
                 record.timestamp, record.level, record.target, record.queue_dropped_records, fields

@@ -13,7 +13,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 
@@ -23,6 +23,8 @@ pub enum Format {
     #[default]
     Json,
     Text,
+    /// Access logs only: renders `template` placeholders; see [`Placeholder`].
+    Template,
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +69,8 @@ pub struct Config {
     pub queue_capacity: usize,
     pub trusted_proxies: Vec<String>,
     pub proxy_header: String,
+    /// Required with, and only accepted with, `format: template`.
+    pub template: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -76,12 +80,14 @@ impl Default for Config {
             queue_capacity: queue_capacity(),
             trusted_proxies: vec![],
             proxy_header: proxy_header(),
+            template: None,
         }
     }
 }
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
         self.trust()?;
+        self.template()?;
         if !(1..=65536).contains(&self.queue_capacity) {
             return Err(invalid());
         }
@@ -115,6 +121,120 @@ impl Config {
             .map(|p| p.parse().map_err(|_| invalid()))
             .collect::<io::Result<Vec<IpNet>>>()?;
         Ok(Trust { proxies, header })
+    }
+    fn template(&self) -> io::Result<Option<Vec<Part>>> {
+        match (&self.format, &self.template) {
+            (Format::Template, Some(template)) => parse_template(template).map(Some),
+            (Format::Template, None) | (_, Some(_)) => Err(invalid()),
+            _ => Ok(None),
+        }
+    }
+}
+/// Original Haruki placeholders plus Sirius record fields. `path` is the matched route
+/// template, never the raw request path or query.
+#[derive(Clone, Copy)]
+enum Placeholder {
+    Time,
+    Status,
+    Method,
+    Path,
+    Latency,
+    RequestId,
+    PeerIp,
+    ClientIp,
+    Outcome,
+    DurationMs,
+    QueueDroppedRecords,
+}
+impl Placeholder {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "time" => Self::Time,
+            "status" => Self::Status,
+            "method" => Self::Method,
+            "path" | "route" => Self::Path,
+            "latency" => Self::Latency,
+            "request_id" => Self::RequestId,
+            "peer_ip" => Self::PeerIp,
+            "client_ip" => Self::ClientIp,
+            "outcome" => Self::Outcome,
+            "duration_ms" => Self::DurationMs,
+            "queue_dropped_records" => Self::QueueDroppedRecords,
+            _ => return None,
+        })
+    }
+    fn value(self, record: &Record, elapsed: Duration) -> String {
+        let ip = |ip: Option<IpAddr>| ip.map_or_else(|| "-".into(), |p| p.to_string());
+        match self {
+            Self::Time => record.timestamp.clone(),
+            Self::Status => record.status.map_or_else(|| "-".into(), |s| s.to_string()),
+            Self::Method => record.method.clone(),
+            Self::Path => record.route.clone(),
+            // Same rendering as the original: two decimals, seconds from one second upward.
+            Self::Latency => {
+                let ms = elapsed.as_secs_f64() * 1000.0;
+                if ms >= 1000.0 {
+                    format!("{:.2}s", ms / 1000.0)
+                } else {
+                    format!("{ms:.2}ms")
+                }
+            }
+            Self::RequestId => record.request_id.clone(),
+            Self::PeerIp => ip(record.peer_ip),
+            Self::ClientIp => ip(record.client_ip),
+            Self::Outcome => record.outcome.into(),
+            Self::DurationMs => record.duration_ms.to_string(),
+            Self::QueueDroppedRecords => record.queue_dropped_records.to_string(),
+        }
+    }
+}
+#[derive(Clone)]
+enum Part {
+    Literal(String),
+    Value(Placeholder),
+}
+fn line_breaking(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+fn parse_template(template: &str) -> io::Result<Vec<Part>> {
+    // The original appended a newline unless the template already ended with one.
+    let template = template.strip_suffix('\n').unwrap_or(template);
+    if template.is_empty() || template.len() > 1024 || template.chars().any(line_breaking) {
+        return Err(invalid());
+    }
+    let mut parts = vec![];
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        if start > 0 {
+            parts.push(Part::Literal(rest[..start].into()));
+        }
+        let (name, after) = rest[start + 2..].split_once('}').ok_or_else(invalid)?;
+        parts.push(Part::Value(Placeholder::parse(name).ok_or_else(invalid)?));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        parts.push(Part::Literal(rest.into()));
+    }
+    Ok(parts)
+}
+fn render(parts: &[Part], record: &Record, elapsed: Duration) -> String {
+    let mut line = String::new();
+    for part in parts {
+        match part {
+            Part::Literal(text) => line.push_str(text),
+            Part::Value(field) => escape_into(&mut line, &field.value(record, elapsed)),
+        }
+    }
+    line
+}
+/// Escapes backslashes and line-breaking/control characters so one record stays one line.
+pub(crate) fn escape_into(line: &mut String, value: &str) {
+    for c in value.chars() {
+        if c == '\\' || line_breaking(c) {
+            line.extend(c.escape_debug());
+        } else {
+            line.push(c);
+        }
     }
 }
 fn invalid() -> io::Error {
@@ -184,6 +304,7 @@ pub struct RequestId(pub String);
 struct Inner {
     config: Config,
     trust: Trust,
+    template: Option<Vec<Part>>,
     writer: NonBlocking,
     _guard: WorkerGuard,
 }
@@ -199,6 +320,7 @@ impl AccessLog {
             .finish(writer);
         Ok(Self(Arc::new(Inner {
             trust: config.trust()?,
+            template: config.template()?,
             config,
             writer,
             _guard: guard,
@@ -231,11 +353,14 @@ struct Pending {
 }
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.record.duration_ms = self.start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let elapsed = self.start.elapsed();
+        self.record.duration_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
         self.record.queue_dropped_records = self.log.dropped_records();
-        let mut line = match self.log.0.config.format {
-            Format::Json => match sonic_rs::to_vec(&self.record) { Ok(bytes) => bytes, Err(_) => return },
-            Format::Text => format!("{} id={} peer={} client={} method={} route={:?} status={} outcome={} duration_ms={} queue_dropped_records={}",
+        let mut line = match (&self.log.0.config.format, &self.log.0.template) {
+            (Format::Template, Some(parts)) => render(parts, &self.record, elapsed).into_bytes(),
+            (Format::Template, None) => return,
+            (Format::Json, _) => match sonic_rs::to_vec(&self.record) { Ok(bytes) => bytes, Err(_) => return },
+            (Format::Text, _) => format!("{} id={} peer={} client={} method={} route={:?} status={} outcome={} duration_ms={} queue_dropped_records={}",
                 self.record.timestamp, self.record.request_id,
                 self.record.peer_ip.map_or_else(|| "-".into(), |p| p.to_string()),
                 self.record.client_ip.map_or_else(|| "-".into(), |p| p.to_string()),

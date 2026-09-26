@@ -6,7 +6,7 @@ this belongs in the job-service YAML passed to `serve`.
 
 ```yaml
 access_log:
-  format: json # json or text
+  format: json # json, text or template
   output:
     type: file # alternatively: {type: stdout}
     path: ./logs/access.log
@@ -34,6 +34,35 @@ HTTP extension methods are `OTHER`. Text format quotes route templates; JSON is 
 per line. A stdout sink shares that stream with any other application output; use a file
 for a dedicated JSON stream.
 
+`format: template` restores the original Haruki format string and requires `template`;
+`template` is rejected with other formats. Placeholders are `${name}`:
+
+| Placeholder | Value |
+|---|---|
+| `${time}` | request-arrival timestamp (RFC 3339 UTC, as in JSON) |
+| `${status}` | HTTP status, `-` when cancelled |
+| `${method}` | method as recorded (`OTHER` for extensions) |
+| `${path}`, `${route}` | matched route template or `<unmatched>` |
+| `${latency}` | elapsed time, original rendering (`12.50ms`, `1.23s`) |
+| `${request_id}`, `${outcome}`, `${duration_ms}`, `${queue_dropped_records}` | record fields |
+| `${peer_ip}`, `${client_ip}` | addresses, `-` when unknown |
+
+```yaml
+access_log:
+  format: template
+  template: "[${time}] ${status} - ${method} ${path} ${latency}\n"
+```
+
+Unknown or unclosed placeholders, an empty template, templates over 1024 bytes and control or
+Unicode line/paragraph separator characters fail configuration loading. One trailing newline is
+accepted for compatibility with original templates; every record is still exactly one line.
+Other `$` text is literal. Substituted values escape backslashes and control/line-separator
+characters (`\n`, `\u{1b}`), so no value can split or forge a record. Differences from the
+original: `${path}` is the route template, never the raw path or query, because raw URLs are not
+logged; `${time}` is UTC RFC 3339 rather than local `YYYY-MM-DD HH:MM:SS`. Every original
+placeholder is otherwise supported; unknown `${...}` text was left literal by the original but is
+rejected here.
+
 The timestamp is request arrival and duration runs until response headers are available.
 `outcome: response` includes the HTTP status, including 401/403/404/5xx. A cancelled
 handler future records `outcome: cancelled` and a null status. This does not measure
@@ -60,6 +89,7 @@ queue drop count, also available through `AccessLog::dropped_records()`. The wor
 flushes queued records on normal shutdown. These are best-effort operational logs, not
 a durable audit ledger: abrupt termination or storage failure can lose records.
 
-This restores access logging and trusted-hop handling. Application log level/format/file
-configuration is a separate restoration item; this block does not redirect existing
-pipeline progress output or change tracing filters.
+This restores access logging, templates and trusted-hop handling. Application log
+level/format/file configuration is documented separately in
+[APPLICATION_LOG.md](APPLICATION_LOG.md); this block does not redirect existing pipeline
+progress output or change tracing filters.

@@ -2782,7 +2782,7 @@ fn application_logging_filters_levels_fields_and_dependency_targets_and_flushes_
     let path = directory.path().join("application.log");
     for _ in 0..2 {
         let config = application_log::Config {
-            level: application_log::Level::Info,
+            level: application_log::Level::Info.into(),
             format: Format::Json,
             output: Output::File {
                 path: path.clone(),
@@ -2834,7 +2834,7 @@ fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("events.log");
     let mut config = application_log::Config {
-        level: application_log::Level::Off,
+        level: application_log::Level::Off.into(),
         format: Format::Text,
         output: Output::File {
             path: path.clone(),
@@ -2849,7 +2849,7 @@ fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
     });
     drop(guard);
     assert!(std::fs::read_to_string(&path).unwrap().is_empty());
-    config.level = application_log::Level::Trace;
+    config.level = application_log::Level::Trace.into();
     let (subscriber, guard) = config.subscriber().unwrap();
     tracing::subscriber::with_default(subscriber, || {
         tracing::trace!(stage = "雪".repeat(2000), "bounded application event");
@@ -2879,6 +2879,230 @@ fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
     ] {
         assert!(!yaml_serde::from_str::<application_log::Config>(yaml)
             .is_ok_and(|c| c.validate().is_ok()));
+    }
+}
+
+#[test]
+fn application_log_level_directives_parse_strictly() {
+    use crate::application_log::{Config, Levels};
+    let parse = |text: &str| {
+        yaml_serde::from_str::<Config>(text).is_ok_and(|config| config.validate().is_ok())
+    };
+    for text in [
+        "level: off",
+        "level: trace",
+        "level: 'warn,sirius_asset_updater::export=debug'",
+        "level: 'info,hyper=warn,sirius_asset_updater=error,sirius_asset_updater::jobs=off'",
+    ] {
+        assert!(parse(text), "{text}");
+    }
+    let many = (0..64).map(|i| format!(",t{i}=debug")).collect::<String>();
+    assert!(format!("info{many}").parse::<Levels>().is_ok());
+    let wide = (0..9)
+        .map(|i| format!(",t{i}_{}=debug", "x".repeat(110)))
+        .collect::<String>();
+    for text in [
+        String::new(),
+        "INFO".into(),
+        "warning".into(),
+        "info,".into(),
+        ",info".into(),
+        "info,,a=debug".into(),
+        "info,debug".into(),
+        "info,a".into(),
+        "info,=debug".into(),
+        "info,a=verbose".into(),
+        "info,a=".into(),
+        "info,a b=debug".into(),
+        "info, a=debug".into(),
+        "info,a-b=debug".into(),
+        "info,a.b=debug".into(),
+        "info,a=debug=trace".into(),
+        "info,a=debug,a=trace".into(),
+        "sirius_asset_updater=debug".into(),
+        format!("info{many},t64=debug"),
+        format!("info{wide}"),
+    ] {
+        assert!(text.parse::<Levels>().is_err(), "{text}");
+        let yaml = format!("level: '{text}'");
+        assert!(!parse(&yaml), "{yaml}");
+    }
+    assert!(!parse("level: 1"));
+    assert!(!parse("level: [info]"));
+    assert!(!parse("format: template"));
+}
+
+#[test]
+fn application_log_level_directives_filter_emitted_events_by_target() {
+    use crate::{
+        access_log::{Format, Output, Rotation},
+        application_log,
+    };
+    use sonic_rs::JsonValueTrait;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("application.log");
+    let config = application_log::Config {
+        level: "warn,sirius_asset_updater::export=debug,sirius_asset_updater::export::cache=off,\
+                sirius_asset_updater::exp=trace,hyper=trace"
+            .parse()
+            .unwrap(),
+        format: Format::Json,
+        output: Output::File {
+            path: path.clone(),
+            rotation: Rotation::Never,
+            max_files: 7,
+        },
+        queue_capacity: 128,
+    };
+    let (subscriber, guard) = config.subscriber().unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "sirius_asset_updater", "root-info-dropped");
+        tracing::warn!(target: "sirius_asset_updater", "root-warn");
+        tracing::info!(target: "sirius_asset_updater::jobs", "jobs-info-dropped");
+        tracing::debug!(target: "sirius_asset_updater::export", "export-debug");
+        tracing::trace!(target: "sirius_asset_updater::export", "export-trace-dropped");
+        tracing::debug!(target: "sirius_asset_updater::export::media", "media-debug");
+        tracing::error!(target: "sirius_asset_updater::export::cache", "cache-error-dropped");
+        tracing::debug!(target: "sirius_asset_updater::exporter", "exporter-debug-dropped");
+        tracing::trace!(target: "sirius_asset_updater::exp", "exp-trace");
+        tracing::trace!(target: "sirius_asset_updater::exp::inner", "exp-inner-trace");
+        tracing::error!(target: "hyper", "dependency-dropped");
+        tracing::error!(target: "hyper::proto", "dependency-child-dropped");
+    });
+    drop(guard);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<sonic_rs::Value> = text
+        .lines()
+        .map(|s| sonic_rs::from_str(s).unwrap())
+        .collect();
+    let messages: Vec<_> = rows
+        .iter()
+        .map(|row| row["fields"]["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "root-warn",
+            "export-debug",
+            "media-debug",
+            "exp-trace",
+            "exp-inner-trace"
+        ]
+    );
+    assert_eq!(
+        rows[2]["target"].as_str(),
+        Some("sirius_asset_updater::export::media")
+    );
+    assert!(!text.contains("-dropped"));
+}
+
+#[test]
+fn access_log_template_configuration_is_bounded_and_rejects_unknown_placeholders() {
+    let load = |text: &str| {
+        yaml_serde::from_str::<crate::access_log::Config>(text)
+            .is_ok_and(|config| config.validate().is_ok())
+    };
+    // The original Haruki default template, including its trailing newline.
+    assert!(load(
+        "{format: template, template: \"[${time}] ${status} - ${method} ${path} ${latency}\\n\"}"
+    ));
+    assert!(load(
+        "{format: template, template: 'id=${request_id} ${route} ${peer_ip} ${client_ip} \
+         ${outcome} ${duration_ms} ${queue_dropped_records} $ {} literal'}"
+    ));
+    let long = format!("{{format: template, template: '{}'}}", "x".repeat(1025));
+    for text in [
+        "format: template",
+        "{format: json, template: '${status}'}",
+        "{format: text, template: '${status}'}",
+        "{format: template, template: ''}",
+        "{format: template, template: \"\\n\"}",
+        "{format: template, template: '${ip}'}",
+        "{format: template, template: '${STATUS}'}",
+        "{format: template, template: '${}'}",
+        "{format: template, template: '${status'}",
+        "{format: template, template: '${env:HOME}'}",
+        "{format: template, template: \"${status}\\t${method}\"}",
+        "{format: template, template: \"${status}\\n${method}\"}",
+        "{format: template, template: \"${status}\\r\\n\"}",
+        "{format: template, template: \"${status}\\n\\n\"}",
+        "{format: template, template: \"${status}\\u2028\"}",
+        "{format: template, template: \"\\e[31m${status}\"}",
+        long.as_str(),
+    ] {
+        assert!(!load(text), "{text}");
+    }
+    let mut escaped = String::new();
+    crate::access_log::escape_into(&mut escaped, "a\nb\r\u{1b}\\c\u{2028}雪 \"q\"");
+    assert_eq!(escaped, "a\\nb\\r\\u{1b}\\\\c\\u{2028}雪 \"q\"");
+}
+
+#[tokio::test]
+async fn access_log_template_renders_escaped_lines_without_raw_paths() {
+    use tower::ServiceExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("access.log");
+    let mut config = access_log_config(path.clone());
+    config.format = crate::access_log::Format::Template;
+    config.template = Some(
+        "[${time}] ${status} - ${method} ${path} ${latency} client=${client_ip} \
+         peer=${peer_ip} id=${request_id} ${outcome} ${duration_ms}ms q=${queue_dropped_records}\n"
+            .into(),
+    );
+    let log = crate::access_log::AccessLog::new(config).unwrap();
+    let app =
+        log.wrap(axum::Router::new().route("/players/{id}", axum::routing::get(|| async { "ok" })));
+    let mut ids = vec![];
+    for uri in [
+        "/players/%0Aforged%0D%0A${method}%1B?q=%0Ainjected-query",
+        "/players/plain-secret",
+        "/unmatched%0Aforged-unmatched",
+    ] {
+        let mut request = axum::http::Request::get(uri)
+            .header("x-forwarded-for", "unknown, 10.0.0.2")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:123".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    drop(app);
+    drop(log);
+    let raw = std::fs::read_to_string(path).unwrap();
+    for secret in ["forged", "injected", "plain-secret", "%0A", "\r", "\u{1b}"] {
+        assert!(!raw.contains(secret), "{secret}");
+    }
+    let lines: Vec<_> = raw.lines().collect();
+    assert_eq!(lines.len(), 3);
+    for (line, (id, (status, route))) in lines.iter().zip(ids.iter().zip([
+        ("200", "/players/{id}"),
+        ("200", "/players/{id}"),
+        ("404", "<unmatched>"),
+    ])) {
+        let (time, rest) = line.strip_prefix('[').unwrap().split_once("] ").unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(time).is_ok());
+        let fields: Vec<_> = rest.split(' ').collect();
+        assert_eq!(fields[..4], [status, "-", "GET", route]);
+        assert!(fields[4].ends_with("ms") || fields[4].ends_with('s'));
+        assert!(fields[4]
+            .trim_end_matches(['m', 's'])
+            .parse::<f64>()
+            .is_ok());
+        // An invalid forwarding chain falls back to the trusted socket peer.
+        assert_eq!(
+            fields[5..8],
+            ["client=127.0.0.1", "peer=127.0.0.1", &format!("id={id}")]
+        );
+        assert_eq!(fields[8], "response");
+        assert!(fields[9].trim_end_matches("ms").parse::<u64>().is_ok());
+        assert_eq!(fields[10], "q=0");
     }
 }
 
