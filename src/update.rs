@@ -94,9 +94,7 @@ impl CatalogClient {
                 let key = &key;
                 async move {
                     let path = stage.join("assets").join(&asset.relative_path);
-                    tokio::fs::create_dir_all(path.parent().ok_or(Error::AssetPath)?)
-                        .await
-                        .map_err(|_| Error::Io)?;
+                    staged_dir(path.parent().ok_or(Error::AssetPath)?)?;
                     let url = format!("{remote_dir}/{}", asset.relative_path);
                     let scoped_catalog = format!(
                         "{}:{}:{}:{}",
@@ -219,9 +217,7 @@ impl CatalogClient {
         }
         // Preserve the provider/dependency graph, not just a list of bundle names.
         let bytes = sonic_rs::to_vec(&catalog).map_err(|_| Error::Catalog)?;
-        let mut file = tokio::fs::File::create(stage.join("locations.json"))
-            .await
-            .map_err(|_| Error::Io)?;
+        let mut file = staged_file(&stage.join("locations.json"))?;
         file.write_all(&bytes).await.map_err(|_| Error::Io)?;
         file.sync_all().await.map_err(|_| Error::Io)?;
         tracing::info!(stage = "version_recheck", "Rechecking download version");
@@ -258,7 +254,7 @@ impl CatalogClient {
         }
         // The entire run lives in a private TempDir. Retried requests truncate this
         // unpublished file; no Range continuation or mixed-generation append.
-        let mut file = tokio::fs::File::create(path).await.map_err(|_| Error::Io)?;
+        let mut file = staged_file(path)?;
         let mut size = 0;
         let mut hash = Sha256::new();
         let mut prefix = Vec::new();
@@ -278,6 +274,17 @@ impl CatalogClient {
         file.sync_all().await.map_err(|_| Error::Io)?;
         Ok((size, hex::encode(hash.finalize())))
     }
+}
+// Entries inside a private staging directory are created synchronously. A detached
+// `tokio::fs` job keeps running after its fetch future is dropped and could recreate the
+// staging tree after the TempDir guard removed it, leaking `.catalog-*` into the output.
+pub(crate) fn staged_dir(path: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(path).map_err(|_| Error::Io)
+}
+pub(crate) fn staged_file(path: &Path) -> Result<tokio::fs::File, Error> {
+    std::fs::File::create(path)
+        .map(tokio::fs::File::from_std)
+        .map_err(|_| Error::Io)
 }
 async fn file_hash(path: &Path) -> Result<String, Error> {
     let mut file = tokio::fs::File::open(path).await.map_err(|_| Error::Io)?;

@@ -70,9 +70,7 @@ pub(crate) async fn restore(
     if source.metadata().await.map_err(|_| Error::Io)?.len() != metadata.bytes {
         return Ok(None);
     }
-    let mut target = tokio::fs::File::create(destination)
-        .await
-        .map_err(|_| Error::Io)?;
+    let mut target = crate::update::staged_file(destination)?;
     let mut buffer = vec![0; 65536];
     let mut digest = Sha256::new();
     let mut size = 0u64;

@@ -788,7 +788,7 @@ impl CatalogClient {
         if response.content_length().is_some_and(|s| s > MAX) {
             return Err(Error::Size);
         }
-        let mut file = tokio::fs::File::create(path).await.map_err(|_| Error::Io)?;
+        let mut file = update::staged_file(path)?;
         let mut size = 0u64;
         let mut digest = Sha256::new();
         let mut prefix = Vec::new();
@@ -941,9 +941,7 @@ fn status(response: &reqwest::Response) -> Result<(), Error> {
     }
 }
 async fn write_receipt(dir: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = tokio::fs::File::create(dir.join("receipt.json"))
-        .await
-        .map_err(|_| Error::Io)?;
+    let mut file = update::staged_file(&dir.join("receipt.json"))?;
     file.write_all(bytes).await.map_err(|_| Error::Io)?;
     file.sync_all().await.map_err(|_| Error::Io)
 }

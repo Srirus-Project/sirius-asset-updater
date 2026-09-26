@@ -3815,7 +3815,11 @@ async fn download_progress_reports_verified_batches_before_completion_and_resets
         .unwrap();
         // Dropping an incomplete fetch must not publish partial input.
     }
-    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    let leftovers: Vec<_> = std::fs::read_dir(output.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
     fixture.stalled_assets.lock().unwrap().clear();
     let path = client.fetch().await.unwrap();
     assert_eq!(verify::verify(&path).await.unwrap().asset_files_verified, 2);
