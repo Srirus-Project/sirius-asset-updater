@@ -377,12 +377,8 @@ impl ExportConfig {
         let catalog = crate::catalog::Catalog::parse(
             &fs::read(input.join("catalog_main.bin")).map_err(err)?,
         )?;
-        let plan = catalog.plan(
-            receipt
-                .catalog_url
-                .strip_suffix("/catalog_main.bin")
-                .ok_or(Error::Verification)?,
-        )?;
+        let (remote, placeholder) = receipt.remote()?;
+        let plan = catalog.plan_with(&remote, placeholder.as_deref())?;
         let by_id: BTreeMap<_, _> = plan
             .assets
             .iter()
@@ -4654,6 +4650,10 @@ pub(crate) mod tests {
             credential_ref: "unused".into(),
             observed_at: chrono::Utc::now(),
             source: "test".into(),
+            catalog_layout: None,
+            catalog_url: None,
+            bundle_base_url: None,
+            cdn_authorization: None,
         }
     }
     #[test]

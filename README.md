@@ -22,8 +22,10 @@ Use an external scheduler for recurring downloads; the updater does not manage g
 
 Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. CLI configurations select one region; the job service accepts regional profiles. JP retains its existing functionality; Global
-currently supports verified server discovery/version queries and region-aware asset transport,
-not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
+supports verified server discovery/version queries and asset download, verification and export
+from schema-3 snapshots, with anonymous CDN roots and optional localized catalogs. The CDN
+layout and access were verified live; a production end-to-end Global acceptance run is still
+pending. SDK login is not implemented. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start

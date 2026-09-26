@@ -2,6 +2,28 @@
 
 ## 1.2.1 (unreleased)
 
+- Global (HK/EN/KR) asset download, verification and export. The updater accepts schema-3
+  snapshots with an explicit `catalog_layout`, `catalog_url`, `bundle_base_url` and
+  `cdn_authorization`. It recomputes the URLs from the layout and rejects any difference. The
+  Global layout is `{root}/asset/{platform}/catalog_{version}[_{locale}].bin` with a sibling
+  `.hash`; bundles are in `{root}/asset/{platform}`. JP URLs and schema-1/2 snapshots are
+  unchanged. Schema-2 snapshots are refused for Global.
+- `catalog_locale` (`en`, `zh-Hant`, `zh-Hans`, `ko`; Global only) selects a localized catalog
+  per profile. The default is the base catalog.
+- Global downloads read the catalog `.hash` before and after the run. The base hash must match
+  the snapshot's `platform_hash`, and any change fails the run without publishing.
+- Remote bundle ids `https://dummy.net/asset/{platform}/…` map onto the bundle base. Every other
+  absolute URL is still rejected.
+- `cdn_roots.*.authorization: none` (HK/EN/KR only; no `username_env`/`credential_env`) sends
+  no Authorization header and needs no CDN secret. `basic` stays the default and is required for
+  JP.
+- Receipts record `catalog_layout`, `bundle_base_url`, `catalog_locale` and `catalog_hash`.
+  Verification and export use the stored bundle base instead of stripping the catalog URL.
+  Older JP receipts still verify.
+- Global examples use the verified server-list CDN roots with anonymous access. Dry-run plans
+  show `catalog_locale`.
+- Upgrade note: a proxy's `resource_snapshot` needs this updater. Older updaters reject
+  schema-3 snapshots.
 - **Breaking:** rename the Global Traditional Chinese region from `tw` to `hk`, matching the
   game's own identifiers (`/prod/hk_…`, `l12-prod-hk-…`). All output uses `hk`: job records,
   summaries, receipts, logs, cache identities, regional API routes, publication object keys

@@ -187,3 +187,15 @@ the ledger; queued and running cancellations completed; an incremental second up
 output; unrelated services on the host were untouched. Published archives were re-downloaded,
 checksum-verified and startup-tested. Global remains limited to verified capabilities; CN is
 reserved.
+
+Post-1.2.0 (1.2.1, unreleased): Global (HK/EN/KR) asset download, verification and export using
+schema-3 snapshots. The Global CDN layout
+(`{CdnRoot}/asset/Android/catalog_{rv}[_{locale}].bin|.hash`, bundles in `{CdnRoot}/asset/Android`,
+remote ids `https://dummy.net/asset/Android/…`), anonymous access and JP-identical bundle
+encryption were verified live on 2026-09-26 with the user's approval. Tests use only synthetic
+catalogs, the synthetic CTR vector and local mocks. They cover layout derivation and
+substitution rejection, locale selection, anonymous download/verify/raw export in each Global
+region, `.hash` pinning before and after, in-place replacement, malformed hashes,
+`dummy.net`-only mapping with rejection of other absolute hosts, receipt tampering, legacy JP
+receipts, and schema-2/JP compatibility. SplitAcb on a live Global song bundle is still
+unverified.

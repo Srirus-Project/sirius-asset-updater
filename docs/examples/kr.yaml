@@ -1,4 +1,4 @@
-# JSON is valid YAML. Replace the CDN placeholder with the selected server-list base URL.
+# JSON is valid YAML. The CDN root is the first server-list line; it serves catalogs anonymously (docs/REGIONS.md). Add "catalog_locale": "ko" for the localized catalog.
 {
   "region": "kr",
   "platform": "Android",
@@ -10,9 +10,8 @@
   "client_version": "1.0.1",
   "output": "./downloads/kr/catalogs",
   "cdn_roots": {
-    "https://cdn.example.invalid/prod/kr_REPLACE_FROM_SERVER_LIST": {
-      "username_env": "SIRIUS_KR_CDN_USERNAME",
-      "credential_env": "SIRIUS_KR_CDN_CREDENTIAL"
+    "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52": {
+      "authorization": "none"
     }
   }
 }

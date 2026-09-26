@@ -31,8 +31,11 @@ impl Config {
         if let Some(name) = &self.refresh_token_env {
             names.push(name);
         }
+        // Anonymous (`none`) roots have no CDN secrets to check.
         for auth in self.cdn_roots.values() {
-            names.extend([&auth.username_env, &auth.credential_env]);
+            if auth.authorization == crate::CdnAuthorization::Basic {
+                names.extend([&auth.username_env, &auth.credential_env]);
+            }
         }
         if let Some(decrypt) = self.assets.as_ref().and_then(|c| c.decrypt.as_ref()) {
             names.extend([&decrypt.key_hex_env, &decrypt.nonce_seed_hex_env]);
@@ -167,6 +170,11 @@ impl CatalogClient {
             || old.protocol_version != new.protocol_version
             || old.effective_cdn_root != new.effective_cdn_root
             || old.credential_ref != new.credential_ref
+            || old.schema_version != new.schema_version
+            || old.catalog_layout != new.catalog_layout
+            || old.catalog_url != new.catalog_url
+            || old.bundle_base_url != new.bundle_base_url
+            || old.cdn_authorization != new.cdn_authorization
         {
             return Err(Error::Snapshot);
         }

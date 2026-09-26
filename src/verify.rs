@@ -111,18 +111,15 @@ pub async fn verify(directory: &Path) -> Result<Verification, Error> {
         return Err(Error::Verification);
     }
     let catalog = Catalog::parse(&bytes)?;
-    let remote = receipt
-        .catalog_url
-        .strip_suffix("/catalog_main.bin")
-        .ok_or(Error::Verification)?;
-    let full_plan = catalog.plan(remote)?;
+    let (remote, placeholder) = receipt.remote()?;
+    let full_plan = catalog.plan_with(&remote, placeholder.as_deref())?;
     let selection = receipt
         .update
         .as_ref()
         .map(|u| u.selection.clone())
         .unwrap_or_default();
     let selected = catalog.select(&selection)?;
-    let plan = selected.plan(remote)?;
+    let plan = selected.plan_with(&remote, placeholder.as_deref())?;
     let mut result = Verification {
         full_catalog: receipt.update.is_some()
             && selected.locations.len() == catalog.locations.len(),

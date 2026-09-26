@@ -853,6 +853,9 @@ struct DownloadPlan {
     refresh_enabled: bool,
     catalog_only: bool,
     decryption_enabled: bool,
+    /// Global localized catalog, when the profile selects one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog_locale: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<SelectionPlan>,
     missing_secrets: usize,
@@ -920,6 +923,7 @@ fn dry_run_plan(profile: &Profile, request: Request) -> DryRunPlan {
                     refresh_enabled: report.refresh_enabled,
                     catalog_only: !report.assets_enabled,
                     decryption_enabled: report.decryption_enabled,
+                    catalog_locale: c.catalog_locale.clone(),
                     selection: selection.map(|s| SelectionPlan {
                         entire_catalog: s.keys.is_empty()
                             && s.include.is_empty()

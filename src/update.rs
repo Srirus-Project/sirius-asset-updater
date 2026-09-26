@@ -2,7 +2,7 @@
 use crate::{
     assets::{Asset, AssetConfig, BundleKey, Provider},
     catalog::Catalog,
-    secret, status, CatalogClient, Error, SnapshotResponse,
+    secret, status, CatalogClient, CatalogTarget, CdnCredentials, Error, SnapshotResponse,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +32,8 @@ impl CatalogClient {
     pub(crate) async fn download_assets(
         &self,
         snapshot: &SnapshotResponse,
+        target: &CatalogTarget,
+        credentials: &CdnCredentials,
         stage: &Path,
         config: &AssetConfig,
     ) -> Result<UpdateReceipt, Error> {
@@ -40,11 +42,15 @@ impl CatalogClient {
             .map_err(|_| Error::Io)?;
         let catalog_sha256 = hex::encode(Sha256::digest(&catalog_bytes));
         let catalog = Catalog::parse(&catalog_bytes)?;
-        let catalog_url = snapshot.catalog_url(&self.config, chrono::Utc::now())?;
-        let remote_dir = catalog_url
-            .strip_suffix("/catalog_main.bin")
-            .ok_or(Error::Snapshot)?;
-        let mut plan = catalog.select(&config.selection)?.plan(remote_dir)?;
+        // Re-validate freshness; the bundle directory comes from the layout, not the URL text.
+        if snapshot.target(&self.config, chrono::Utc::now())? != *target {
+            return Err(Error::Snapshot);
+        }
+        let catalog_url = &target.catalog_url;
+        let remote_dir = target.bundle_base_url.as_str();
+        let mut plan = catalog
+            .select(&config.selection)?
+            .plan_with(remote_dir, target.remote_placeholder.as_deref())?;
         config.selection.prioritize(&mut plan)?;
         self.report_download(0, Some(plan.assets.len()), 0);
         let key = config
@@ -52,13 +58,6 @@ impl CatalogClient {
             .as_ref()
             .map(|c| BundleKey::from_hex(&secret(&c.key_hex_env)?, &secret(&c.nonce_seed_hex_env)?))
             .transpose()?;
-        let auth = self
-            .config
-            .cdn_roots
-            .get(&snapshot.snapshot.effective_cdn_root)
-            .ok_or(Error::Snapshot)?;
-        let username = secret(&auth.username_env)?;
-        let password = secret(&auth.credential_env)?;
         let mut receipt = UpdateReceipt {
             selection: config.selection.clone(),
             cache_hits: 0,
@@ -91,10 +90,7 @@ impl CatalogClient {
             let end = (next + workers).min(plan.assets.len());
             let limit = remaining.min(config.max_file_bytes);
             let tasks = plan.assets[next..end].iter().map(|asset| {
-                let catalog_url = &catalog_url;
                 let catalog_sha256 = &catalog_sha256;
-                let username = &username;
-                let password = &password;
                 let key = &key;
                 async move {
                     let path = stage.join("assets").join(&asset.relative_path);
@@ -130,7 +126,7 @@ impl CatalogClient {
                             break;
                         }
                         let result = self
-                            .download_asset(&url, username, password, &path, limit, asset)
+                            .download_asset(&url, credentials, &path, limit, asset)
                             .await;
                         match result {
                             Ok(value) => {
@@ -235,28 +231,24 @@ impl CatalogClient {
     async fn download_asset(
         &self,
         url: &str,
-        username: &str,
-        password: &str,
+        credentials: &CdnCredentials,
         path: &Path,
         limit: u64,
         asset: &Asset,
     ) -> Result<(u64, String), Error> {
-        self.cdn_attempt(self.download_asset_inner(url, username, password, path, limit, asset))
+        self.cdn_attempt(self.download_asset_inner(url, credentials, path, limit, asset))
             .await
     }
     async fn download_asset_inner(
         &self,
         url: &str,
-        username: &str,
-        password: &str,
+        credentials: &CdnCredentials,
         path: &Path,
         limit: u64,
         asset: &Asset,
     ) -> Result<(u64, String), Error> {
         let mut response = self
-            .cdn_http
-            .get(url)
-            .basic_auth(username, Some(password))
+            .cdn_get(url, credentials)
             .send()
             .await
             .map_err(|_| Error::Transport)?;

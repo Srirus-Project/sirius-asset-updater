@@ -133,12 +133,69 @@ pub struct Config {
     pub cdn_roots: BTreeMap<String, CdnAuth>,
     #[serde(default)]
     pub assets: Option<assets::AssetConfig>,
+    /// Global only: download the localized catalog `catalog_{version}_{locale}.bin` instead of
+    /// the base (Japanese) catalog. One of [`CATALOG_LOCALES`]; omitted selects the base catalog.
+    #[serde(default)]
+    pub catalog_locale: Option<String>,
+}
+/// Localized Global catalog suffixes (the client's `LocaleManager` codes; Japanese is the base).
+pub const CATALOG_LOCALES: &[&str] = &["en", "zh-Hant", "zh-Hans", "ko"];
+/// The only absolute remote-bundle host a Global catalog may name. The client replaces it with
+/// its CDN root; any other absolute URL is rejected.
+pub const GLOBAL_REMOTE_PLACEHOLDER: &str = "https://dummy.net";
+/// CDN authorization for one configured root.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnAuthorization {
+    /// HTTP Basic with `username_env`/`credential_env` (required for JP).
+    #[default]
+    Basic,
+    /// No Authorization header; accepted only for HK/EN/KR roots without credential references.
+    None,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CdnAuth {
+    #[serde(default)]
+    pub authorization: CdnAuthorization,
+    /// Required for `basic`; must be omitted for `none`.
+    #[serde(default)]
     pub username_env: String,
+    /// Required for `basic`; must be omitted for `none`.
+    #[serde(default)]
     pub credential_env: String,
+}
+/// How a client family lays out catalogs and bundles on its CDN.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogLayout {
+    /// `{root}/asset/{version}/{platform}/{hash}/catalog_main.bin`, bundles beside it.
+    Jp,
+    /// `{root}/asset/{platform}/catalog_{version}[_{locale}].bin` with a sibling `.hash`;
+    /// bundles in `{root}/asset/{platform}`.
+    Global,
+}
+impl CatalogLayout {
+    fn for_region(region: region::Region) -> Self {
+        if region.family() == "global" {
+            Self::Global
+        } else {
+            Self::Jp
+        }
+    }
+}
+/// Everything a download needs from a validated snapshot. URLs are derived from the layout,
+/// never from string surgery on another URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogTarget {
+    pub layout: CatalogLayout,
+    pub catalog_url: String,
+    /// Global: the catalog's `.hash` URL, read before and after the download.
+    pub hash_url: Option<String>,
+    pub bundle_base_url: String,
+    /// Global: `https://dummy.net/asset/{platform}`, mapped onto `bundle_base_url`.
+    pub remote_placeholder: Option<String>,
+    pub authorization: CdnAuthorization,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -157,6 +214,16 @@ pub struct Snapshot {
     pub credential_ref: String,
     pub observed_at: DateTime<Utc>,
     pub source: String,
+    /// Schema 3 only (all four fields): explicit layout, base catalog URL, bundle directory
+    /// and CDN authorization. They must equal what the layout derives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_layout: Option<CatalogLayout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_authorization: Option<CdnAuthorization>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +238,19 @@ pub struct Receipt {
     pub bytes: u64,
     pub sha256: String,
     pub downloaded_at: DateTime<Utc>,
+    /// Since 1.2.1. Absent in older receipts, which are JP layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_layout: Option<CatalogLayout>,
+    /// Since 1.2.1: the directory remote bundle paths were resolved against. Older receipts
+    /// derive it from a JP `catalog_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_base_url: Option<String>,
+    /// Global: the configured localized catalog, absent for the base catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_locale: Option<String>,
+    /// Global: the catalog `.hash` read before and after the download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<update::UpdateReceipt>,
 }
@@ -265,6 +345,28 @@ impl Config {
         if let Some(assets) = &self.assets {
             assets.validate()?;
         }
+        let global = self.region.family() == "global";
+        if self
+            .catalog_locale
+            .as_deref()
+            .is_some_and(|locale| !global || !CATALOG_LOCALES.contains(&locale))
+        {
+            return Err(Error::Config);
+        }
+        for auth in self.cdn_roots.values() {
+            let valid = match auth.authorization {
+                CdnAuthorization::Basic => {
+                    !auth.username_env.is_empty() && !auth.credential_env.is_empty()
+                }
+                // JP CDNs require Basic; anonymous access is verified only for Global.
+                CdnAuthorization::None => {
+                    global && auth.username_env.is_empty() && auth.credential_env.is_empty()
+                }
+            };
+            if !valid {
+                return Err(Error::Config);
+            }
+        }
         if !root(&self.game_api_root, true)
             || !component(&self.environment)
             || !component(&self.client_version)
@@ -286,6 +388,14 @@ impl Snapshot {
             }
             (2, Some(region))
                 if region != region::Region::Cn
+                    && self.catalog_layout.is_none()
+                    && matches!(self.platform.as_str(), "iOS" | "Android") =>
+            {
+                Ok(region)
+            }
+            (3, Some(region))
+                if region != region::Region::Cn
+                    && self.catalog_layout == Some(CatalogLayout::for_region(region))
                     && matches!(self.platform.as_str(), "iOS" | "Android") =>
             {
                 Ok(region)
@@ -294,10 +404,31 @@ impl Snapshot {
         }
     }
 }
+pub(crate) fn catalog_hash(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    (text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
+}
+fn lower_hex32(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 impl SnapshotResponse {
     pub fn catalog_url(&self, config: &Config, now: DateTime<Utc>) -> Result<String, Error> {
+        Ok(self.target(config, now)?.catalog_url)
+    }
+    /// Validates identity, freshness, layout and credential scope before any CDN request.
+    pub fn target(&self, config: &Config, now: DateTime<Utc>) -> Result<CatalogTarget, Error> {
         let s = &self.snapshot;
         let age = now.signed_duration_since(s.observed_at).num_milliseconds();
+        let explicit = [
+            s.catalog_layout.is_some(),
+            s.catalog_url.is_some(),
+            s.bundle_base_url.is_some(),
+            s.cdn_authorization.is_some(),
+        ];
         if self.stale
             || !(0..=300_000).contains(&age)
             || !match s.schema_version {
@@ -308,8 +439,13 @@ impl SnapshotResponse {
                         && s.protocol_version == "1.0.3"
                 }
                 2 => s.region == Some(config.region),
+                3 => s.region == Some(config.region),
                 _ => false,
             }
+            // Schema 3 states the layout explicitly; earlier schemas never carry it.
+            || explicit
+                .iter()
+                .any(|present| *present != (s.schema_version == 3))
             || s.environment != config.environment
             || s.platform != config.platform().name()
             || s.client_version != config.client_version
@@ -320,21 +456,129 @@ impl SnapshotResponse {
         {
             return Err(Error::Snapshot);
         }
+        let layout = s.catalog_layout.unwrap_or(CatalogLayout::Jp);
+        let authorization = s.cdn_authorization.unwrap_or_default();
+        if layout != CatalogLayout::for_region(config.region)
+            || (layout == CatalogLayout::Global && !lower_hex32(&s.platform_hash))
+            || (layout == CatalogLayout::Jp && config.catalog_locale.is_some())
+        {
+            return Err(Error::Snapshot);
+        }
         let auth = config
             .cdn_roots
             .get(&s.effective_cdn_root)
             .ok_or(Error::Snapshot)?;
-        // A remote reference may not select an arbitrary local environment variable.
-        if s.credential_ref != auth.credential_env {
+        // A remote reference may not select an arbitrary local environment variable, and the
+        // snapshot cannot turn a Basic root anonymous (or the reverse).
+        let expected_ref = match auth.authorization {
+            CdnAuthorization::Basic => auth.credential_env.as_str(),
+            CdnAuthorization::None => "",
+        };
+        if authorization != auth.authorization || s.credential_ref != expected_ref {
             return Err(Error::Snapshot);
         }
-        Ok(format!(
-            "{}/asset/{}/{}/{}/catalog_main.bin",
-            s.effective_cdn_root,
-            s.resource_version,
-            config.platform().name(),
-            s.platform_hash
-        ))
+        let root = &s.effective_cdn_root;
+        let platform = config.platform().name();
+        let version = &s.resource_version;
+        let (base_catalog, target) = match layout {
+            CatalogLayout::Jp => {
+                let base = format!("{root}/asset/{version}/{platform}/{}", s.platform_hash);
+                let catalog = format!("{base}/catalog_main.bin");
+                (
+                    catalog.clone(),
+                    CatalogTarget {
+                        layout,
+                        catalog_url: catalog,
+                        hash_url: None,
+                        bundle_base_url: base,
+                        remote_placeholder: None,
+                        authorization,
+                    },
+                )
+            }
+            CatalogLayout::Global => {
+                let base = format!("{root}/asset/{platform}");
+                let stem = match &config.catalog_locale {
+                    Some(locale) => format!("{base}/catalog_{version}_{locale}"),
+                    None => format!("{base}/catalog_{version}"),
+                };
+                (
+                    format!("{base}/catalog_{version}.bin"),
+                    CatalogTarget {
+                        layout,
+                        catalog_url: format!("{stem}.bin"),
+                        hash_url: Some(format!("{stem}.hash")),
+                        bundle_base_url: base,
+                        remote_placeholder: Some(format!(
+                            "{GLOBAL_REMOTE_PLACEHOLDER}/asset/{platform}"
+                        )),
+                        authorization,
+                    },
+                )
+            }
+        };
+        if s.catalog_url
+            .as_ref()
+            .is_some_and(|url| *url != base_catalog)
+            || s.bundle_base_url
+                .as_ref()
+                .is_some_and(|url| *url != target.bundle_base_url)
+        {
+            return Err(Error::Snapshot);
+        }
+        Ok(target)
+    }
+}
+impl Receipt {
+    /// Bundle directory and optional Global placeholder for offline planning. Older receipts
+    /// (JP) derive the directory from their catalog URL; newer ones must be consistent with it.
+    pub fn remote(&self) -> Result<(String, Option<String>), Error> {
+        let layout = self.catalog_layout.unwrap_or(CatalogLayout::Jp);
+        let platform = self.snapshot.platform.as_str();
+        if !matches!(platform, "iOS" | "Android") {
+            return Err(Error::Verification);
+        }
+        match layout {
+            CatalogLayout::Jp => {
+                let derived = self
+                    .catalog_url
+                    .strip_suffix("/catalog_main.bin")
+                    .ok_or(Error::Verification)?;
+                if self
+                    .bundle_base_url
+                    .as_ref()
+                    .is_some_and(|base| base != derived)
+                    || self.catalog_locale.is_some()
+                {
+                    return Err(Error::Verification);
+                }
+                Ok((derived.to_owned(), None))
+            }
+            CatalogLayout::Global => {
+                let base = self.bundle_base_url.as_ref().ok_or(Error::Verification)?;
+                let expected = format!("{}/asset/{platform}", self.snapshot.effective_cdn_root);
+                let stem = match &self.catalog_locale {
+                    Some(locale) => format!(
+                        "{base}/catalog_{}_{locale}.bin",
+                        self.snapshot.resource_version
+                    ),
+                    None => format!("{base}/catalog_{}.bin", self.snapshot.resource_version),
+                };
+                if *base != expected
+                    || self.catalog_url != stem
+                    || self
+                        .catalog_locale
+                        .as_deref()
+                        .is_some_and(|l| !CATALOG_LOCALES.contains(&l))
+                {
+                    return Err(Error::Verification);
+                }
+                Ok((
+                    base.clone(),
+                    Some(format!("{GLOBAL_REMOTE_PLACEHOLDER}/asset/{platform}")),
+                ))
+            }
+        }
     }
 }
 pub struct CatalogClient {
@@ -462,27 +706,80 @@ impl CatalogClient {
             sonic_rs::from_slice(&bytes).map_err(|_| Error::Snapshot)?;
         Ok(snapshot)
     }
+    /// Basic credentials for `root`, or `None` for an anonymous (`none`) root.
+    pub(crate) fn cdn_credentials(&self, root: &str) -> Result<CdnCredentials, Error> {
+        let auth = self.config.cdn_roots.get(root).ok_or(Error::Snapshot)?;
+        Ok(match auth.authorization {
+            CdnAuthorization::Basic => {
+                Some((secret(&auth.username_env)?, secret(&auth.credential_env)?))
+            }
+            CdnAuthorization::None => None,
+        })
+    }
+    pub(crate) fn cdn_get(
+        &self,
+        url: &str,
+        credentials: &CdnCredentials,
+    ) -> reqwest::RequestBuilder {
+        let request = self.cdn_http.get(url);
+        match credentials {
+            Some((username, password)) => request.basic_auth(username, Some(password)),
+            None => request,
+        }
+    }
     async fn download_catalog_once(
         &self,
         url: &str,
-        username: &str,
-        password: &str,
+        credentials: &CdnCredentials,
         path: &Path,
     ) -> Result<(u64, String), Error> {
-        self.cdn_attempt(self.download_catalog_inner(url, username, password, path))
+        self.cdn_attempt(self.download_catalog_inner(url, credentials, path))
             .await
+    }
+    /// Global catalog `.hash` (the client's catalog version token): bounded, retried like the
+    /// catalog, 32 hex digits after trimming.
+    async fn catalog_hash(&self, url: &str, credentials: &CdnCredentials) -> Result<String, Error> {
+        const MAX: usize = 256;
+        let mut attempt = 0;
+        loop {
+            let result = self
+                .cdn_attempt(async {
+                    let mut response = self
+                        .cdn_get(url, credentials)
+                        .send()
+                        .await
+                        .map_err(|_| Error::Transport)?;
+                    status(&response)?;
+                    if response.content_length().is_some_and(|n| n > MAX as u64) {
+                        return Err(Error::Size);
+                    }
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|_| Error::Transport)? {
+                        if bytes.len() + chunk.len() > MAX {
+                            return Err(Error::Size);
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    catalog_hash(&bytes).ok_or(Error::Catalog)
+                })
+                .await;
+            match result {
+                Err(error) if self.config.network.catalog_retry.retry(&error, attempt) => {
+                    tokio::time::sleep(self.config.network.catalog_retry.delay(attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
     async fn download_catalog_inner(
         &self,
         url: &str,
-        username: &str,
-        password: &str,
+        credentials: &CdnCredentials,
         path: &Path,
     ) -> Result<(u64, String), Error> {
         let mut response = self
-            .cdn_http
-            .get(url)
-            .basic_auth(username, Some(password))
+            .cdn_get(url, credentials)
             .send()
             .await
             .map_err(|_| Error::Transport)?;
@@ -513,14 +810,26 @@ impl CatalogClient {
         Ok((size, hex::encode(digest.finalize())))
     }
     async fn download(&self, snapshot: SnapshotResponse) -> Result<PathBuf, Error> {
-        let url = snapshot.catalog_url(&self.config, Utc::now())?;
-        let auth = self
-            .config
-            .cdn_roots
-            .get(&snapshot.snapshot.effective_cdn_root)
-            .ok_or(Error::Snapshot)?;
-        let username = secret(&auth.username_env)?;
-        let password = secret(&auth.credential_env)?;
+        let target = snapshot.target(&self.config, Utc::now())?;
+        let url = target.catalog_url.clone();
+        let credentials = self.cdn_credentials(&snapshot.snapshot.effective_cdn_root)?;
+        // Global: the `.hash` pins the catalog generation. The base catalog's hash must be the
+        // one the API reported; it is read again after the download and must not change.
+        let catalog_hash = match &target.hash_url {
+            Some(hash_url) => {
+                tracing::info!(
+                    stage = "catalog_hash",
+                    region = self.config.region.name(),
+                    "Download stage"
+                );
+                let hash = self.catalog_hash(hash_url, &credentials).await?;
+                if self.config.catalog_locale.is_none() && hash != snapshot.snapshot.platform_hash {
+                    return Err(Error::Snapshot);
+                }
+                Some(hash)
+            }
+            None => None,
+        };
         tracing::info!(
             stage = "catalog_download",
             region = self.config.region.name(),
@@ -538,12 +847,7 @@ impl CatalogClient {
         let mut downloaded = None;
         for attempt in 0..self.config.network.catalog_retry.attempts {
             match self
-                .download_catalog_once(
-                    &url,
-                    &username,
-                    &password,
-                    &staging.path().join("catalog_main.bin"),
-                )
+                .download_catalog_once(&url, &credentials, &staging.path().join("catalog_main.bin"))
                 .await
             {
                 Ok(result) => {
@@ -575,23 +879,37 @@ impl CatalogClient {
         }
         let update = if let Some(config) = &self.config.assets {
             Some(
-                self.download_assets(&snapshot, staging.path(), config)
+                self.download_assets(&snapshot, &target, &credentials, staging.path(), config)
                     .await?,
             )
         } else {
             if self.config.refresh_token_env.is_some() {
                 self.revalidate(&snapshot).await?;
             } else {
-                snapshot.catalog_url(&self.config, Utc::now())?;
+                snapshot.target(&self.config, Utc::now())?;
             }
             None
         };
+        if let (Some(hash_url), Some(expected)) = (&target.hash_url, &catalog_hash) {
+            tracing::info!(
+                stage = "catalog_hash_recheck",
+                region = self.config.region.name(),
+                "Download stage"
+            );
+            if self.catalog_hash(hash_url, &credentials).await? != *expected {
+                return Err(Error::Snapshot);
+            }
+        }
         let receipt = Receipt {
             snapshot: snapshot.snapshot,
             catalog_url: url,
             bytes: size,
             sha256,
             downloaded_at: Utc::now(),
+            catalog_layout: Some(target.layout),
+            bundle_base_url: Some(target.bundle_base_url),
+            catalog_locale: self.config.catalog_locale.clone(),
+            catalog_hash,
             update,
         };
         let receipt_bytes = sonic_rs::to_vec_pretty(&receipt).map_err(|_| Error::Io)?;
@@ -613,6 +931,8 @@ impl CatalogClient {
         Ok(path)
     }
 }
+/// Basic (username, password) for a CDN root, or `None` when the root is anonymous.
+pub(crate) type CdnCredentials = Option<(String, String)>;
 fn status(response: &reqwest::Response) -> Result<(), Error> {
     if response.status() == reqwest::StatusCode::OK {
         Ok(())

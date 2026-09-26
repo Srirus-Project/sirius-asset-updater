@@ -22,9 +22,11 @@ fn config() -> Config {
         client_version: "1.0.3".into(),
         output: PathBuf::from("unused"),
         assets: None,
+        catalog_locale: None,
         cdn_roots: BTreeMap::from([(
             "https://static.example".into(),
             CdnAuth {
+                authorization: CdnAuthorization::Basic,
                 username_env: "USER".into(),
                 credential_env: "PASSWORD".into(),
             },
@@ -48,6 +50,10 @@ fn snapshot() -> SnapshotResponse {
             credential_ref: "PASSWORD".into(),
             observed_at: Utc::now(),
             source: "remote".into(),
+            catalog_layout: None,
+            catalog_url: None,
+            bundle_base_url: None,
+            cdn_authorization: None,
         },
     }
 }
@@ -88,6 +94,7 @@ fn config_rejects_remote_plaintext_and_cdn_plaintext() {
     cfg.cdn_roots = BTreeMap::from([(
         "http://127.0.0.1:99".into(),
         CdnAuth {
+            authorization: CdnAuthorization::Basic,
             username_env: "A".into(),
             credential_env: "B".into(),
         },
@@ -129,6 +136,7 @@ async fn serve(
     cfg.cdn_roots = BTreeMap::from([(
         root.clone(),
         CdnAuth {
+            authorization: CdnAuthorization::Basic,
             username_env: user,
             credential_env: pass.clone(),
         },
@@ -1446,21 +1454,45 @@ fn legacy_tw_inputs_and_snapshots_are_read_as_hk_and_never_emitted() {
         snapshot.snapshot.region_identity().unwrap(),
         region::Region::Hk
     );
-    assert_eq!(
-        snapshot.catalog_url(&cfg, Utc::now()).unwrap(),
-        format!("{base}/asset/r1/Android/h1/catalog_main.bin")
-    );
+    // A schema-2 Global snapshot names no Global layout; it is never downloaded as JP layout.
+    assert!(matches!(
+        snapshot.catalog_url(&cfg, Utc::now()),
+        Err(Error::Snapshot)
+    ));
     assert_eq!(
         receipt.snapshot.region_identity().unwrap(),
         region::Region::Hk
     );
     assert_eq!(request.region, region::Region::Hk);
-    // Canonical snapshots and every re-serialized record use hk only.
-    let canonical = legacy_snapshot.replace(r#""tw""#, r#""hk""#);
-    assert!(sonic_rs::from_str::<SnapshotResponse>(&canonical)
-        .unwrap()
-        .catalog_url(&cfg, Utc::now())
-        .is_ok());
+    // Canonical schema-3 snapshots and every re-serialized record use hk only.
+    let canonical = legacy_snapshot
+        .replace(r#""tw""#, r#""hk""#)
+        .replace(r#""schema_version":2"#, r#""schema_version":3"#)
+        .replace(r#""platform_hash":"h1""#, &format!(r#""platform_hash":"{}""#, "a".repeat(32)))
+        .replace(
+            r#""credential_ref":"P""#,
+            &format!(
+                r#""credential_ref":"","catalog_layout":"global","cdn_authorization":"none",
+                "catalog_url":"{base}/asset/Android/catalog_r1.bin","bundle_base_url":"{base}/asset/Android""#
+            ),
+        );
+    let mut anonymous = cfg.clone();
+    anonymous.cdn_roots.insert(
+        base.into(),
+        CdnAuth {
+            authorization: CdnAuthorization::None,
+            username_env: String::new(),
+            credential_env: String::new(),
+        },
+    );
+    assert!(anonymous.validate().is_ok());
+    assert_eq!(
+        sonic_rs::from_str::<SnapshotResponse>(&canonical)
+            .unwrap()
+            .catalog_url(&anonymous, Utc::now())
+            .unwrap(),
+        format!("{base}/asset/Android/catalog_r1.bin")
+    );
     for json in [
         sonic_rs::to_string(&snapshot).unwrap(),
         sonic_rs::to_string(&receipt).unwrap(),
@@ -1484,6 +1516,7 @@ fn regional_snapshots_require_explicit_identity_and_keep_cdn_prefixes() {
     cfg.cdn_roots = BTreeMap::from([(
         base.into(),
         CdnAuth {
+            authorization: CdnAuthorization::Basic,
             username_env: "U".into(),
             credential_env: "P".into(),
         },
@@ -1497,9 +1530,17 @@ fn regional_snapshots_require_explicit_identity_and_keep_cdn_prefixes() {
     s.snapshot.protocol_version = "1.0.1".into();
     s.snapshot.effective_cdn_root = base.into();
     s.snapshot.credential_ref = "P".into();
+    // Global snapshots must state the Global layout (schema 3); schema 2 is JP layout only.
+    assert!(s.catalog_url(&cfg, Utc::now()).is_err());
+    s.snapshot.schema_version = 3;
+    s.snapshot.platform_hash = "0123456789abcdef0123456789abcdef".into();
+    s.snapshot.catalog_layout = Some(CatalogLayout::Global);
+    s.snapshot.cdn_authorization = Some(CdnAuthorization::Basic);
+    s.snapshot.catalog_url = Some(format!("{base}/asset/Android/catalog_r1.bin"));
+    s.snapshot.bundle_base_url = Some(format!("{base}/asset/Android"));
     assert_eq!(
         s.catalog_url(&cfg, Utc::now()).unwrap(),
-        "https://cdn.example/prod/en_fixture/asset/r1/Android/h1/catalog_main.bin"
+        "https://cdn.example/prod/en_fixture/asset/Android/catalog_r1.bin"
     );
     for region in [
         None,
@@ -3230,7 +3271,11 @@ async fn service_download_budget_bounds_clients_and_recovers_after_cancellation(
     let first_path = root.path().join("first");
     let first = tokio::spawn(async move {
         first
-            .download_catalog_once(&first_url, "synthetic", "synthetic", &first_path)
+            .download_catalog_once(
+                &first_url,
+                &Some(("synthetic".into(), "synthetic".into())),
+                &first_path,
+            )
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3244,7 +3289,11 @@ async fn service_download_budget_bounds_clients_and_recovers_after_cancellation(
     let second_path = root.path().join("second");
     let second = tokio::spawn(async move {
         second
-            .download_catalog_once(&second_url, "synthetic", "synthetic", &second_path)
+            .download_catalog_once(
+                &second_url,
+                &Some(("synthetic".into(), "synthetic".into())),
+                &second_path,
+            )
             .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -3262,7 +3311,11 @@ async fn service_download_budget_bounds_clients_and_recovers_after_cancellation(
     let mut blocked = CatalogClient::build(cfg).unwrap();
     blocked.set_service_download_gate(gate.clone());
     let result = blocked
-        .download_catalog_once(&url, "synthetic", "synthetic", &root.path().join("blocked"))
+        .download_catalog_once(
+            &url,
+            &Some(("synthetic".into(), "synthetic".into())),
+            &root.path().join("blocked"),
+        )
         .await;
     assert!(matches!(result, Err(Error::Transport)));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -3776,4 +3829,594 @@ async fn download_progress_reports_verified_batches_before_completion_and_resets
     assert_eq!((p.completed, p.total, p.bytes), (0, None, 0));
     std::env::set_var(&client.config.internal_token_env, token);
     server.abort();
+}
+
+// ---- Global (HK/EN/KR) layout -------------------------------------------------------------
+// Synthetic only: catalogs come from `catalog_fixture`, bundles from the synthetic CTR vector,
+// hashes are arbitrary hex strings. No game data or keys.
+const GLOBAL_BASE_HASH: &str = "0123456789abcdef0123456789abcdef";
+const GLOBAL_LOCALE_HASH: &str = "fedcba9876543210fedcba9876543210";
+fn global_config(region: region::Region, root: &str) -> Config {
+    let mut cfg = config();
+    cfg.region = region;
+    cfg.client_version = "1.0.1".into();
+    cfg.cdn_roots = BTreeMap::from([(
+        root.into(),
+        CdnAuth {
+            authorization: CdnAuthorization::None,
+            username_env: String::new(),
+            credential_env: String::new(),
+        },
+    )]);
+    cfg
+}
+fn global_snapshot(region: region::Region, root: &str) -> SnapshotResponse {
+    let mut s = snapshot();
+    s.snapshot.schema_version = 3;
+    s.snapshot.region = Some(region);
+    s.snapshot.platform = "Android".into();
+    s.snapshot.client_version = "1.0.1".into();
+    s.snapshot.protocol_version = "1.0.1".into();
+    s.snapshot.resource_version = "1.0.0.104".into();
+    s.snapshot.platform_hash = GLOBAL_BASE_HASH.into();
+    s.snapshot.effective_cdn_root = root.into();
+    s.snapshot.credential_ref = String::new();
+    s.snapshot.catalog_layout = Some(CatalogLayout::Global);
+    s.snapshot.catalog_url = Some(format!("{root}/asset/Android/catalog_1.0.0.104.bin"));
+    s.snapshot.bundle_base_url = Some(format!("{root}/asset/Android"));
+    s.snapshot.cdn_authorization = Some(CdnAuthorization::None);
+    s
+}
+type GlobalFiles = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+type GlobalSeen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+type GlobalReplacement = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+#[derive(Clone)]
+struct GlobalCdn {
+    snapshot: Arc<Mutex<SnapshotResponse>>,
+    files: GlobalFiles,
+    /// (path, Authorization header if any) for every CDN request.
+    seen: GlobalSeen,
+    /// Replaces one file after the first catalog `.bin` response (same-version replacement).
+    after_catalog: GlobalReplacement,
+}
+async fn serve_global(
+    mut cfg: Config,
+    catalogs: &[(&str, Vec<u8>)],
+) -> (CatalogClient, GlobalCdn, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let token = format!("TEST_TOKEN_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "internal-fixture");
+    cfg.game_api_root = root.clone();
+    cfg.internal_token_env = token;
+    let auth = cfg.cdn_roots.values().next().unwrap().clone();
+    cfg.cdn_roots = BTreeMap::from([(root.clone(), auth)]);
+    let mut files = BTreeMap::from([
+        (
+            "catalog_1.0.0.104.hash".to_string(),
+            format!("{GLOBAL_BASE_HASH}\n").into_bytes(),
+        ),
+        (
+            "fixture.bundle".to_string(),
+            include_bytes!("../tests/fixtures/bundle-prefix.bin").to_vec(),
+        ),
+        ("sound.acb".to_string(), b"@UTFsynthetic".to_vec()),
+        ("plain.bundle".to_string(), b"UnityFS\0plain".to_vec()),
+    ]);
+    for (name, bytes) in catalogs {
+        files.insert((*name).into(), bytes.clone());
+    }
+    let cdn = GlobalCdn {
+        snapshot: Arc::new(Mutex::new(global_snapshot(cfg.region, &root))),
+        files: Arc::new(Mutex::new(files)),
+        seen: Arc::new(Mutex::new(Vec::new())),
+        after_catalog: Arc::new(Mutex::new(None)),
+    };
+    let app = Router::new()
+        .route(
+            "/internal/v1/resources/snapshot",
+            get(|State(f): State<GlobalCdn>| async move {
+                let mut snapshot = f.snapshot.lock().unwrap().clone();
+                snapshot.snapshot.observed_at = Utc::now();
+                sonic_rs::to_string(&snapshot).unwrap()
+            }),
+        )
+        .route(
+            "/asset/Android/{*path}",
+            get(
+                |State(f): State<GlobalCdn>,
+                 axum::extract::Path(path): axum::extract::Path<String>,
+                 headers: HeaderMap| async move {
+                    f.seen.lock().unwrap().push((
+                        path.clone(),
+                        headers
+                            .get("authorization")
+                            .map(|v| v.to_str().unwrap().to_owned()),
+                    ));
+                    let body = f.files.lock().unwrap().get(&path).cloned();
+                    if path.ends_with(".bin") {
+                        if let Some((name, bytes)) = f.after_catalog.lock().unwrap().take() {
+                            f.files.lock().unwrap().insert(name, bytes);
+                        }
+                    }
+                    match body {
+                        Some(bytes) => (StatusCode::OK, bytes).into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(cdn.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (CatalogClient::build(cfg).unwrap(), cdn, task)
+}
+fn global_catalog() -> Vec<u8> {
+    catalog_fixture(
+        &[
+            (
+                "https://dummy.net/asset/Android/fixture.bundle",
+                CRYPT_PROVIDER,
+            ),
+            (
+                "https://dummy.net/asset/Android/plain.bundle",
+                UNITY_PROVIDER,
+            ),
+            ("https://dummy.net/asset/Android/sound.acb", CRI_PROVIDER),
+            (
+                "{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/local.bundle",
+                CRYPT_PROVIDER,
+            ),
+        ],
+        true,
+    )
+}
+
+#[test]
+fn global_snapshot_policy_derives_layout_urls_and_rejects_substitution() {
+    let root = "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_fixture";
+    let cfg = global_config(region::Region::Kr, root);
+    assert!(cfg.validate().is_ok());
+    let now = Utc::now();
+    let valid = global_snapshot(region::Region::Kr, root);
+    let target = valid.target(&cfg, now).unwrap();
+    assert_eq!(target.layout, CatalogLayout::Global);
+    assert_eq!(
+        target.catalog_url,
+        format!("{root}/asset/Android/catalog_1.0.0.104.bin")
+    );
+    assert_eq!(
+        target.hash_url.as_deref(),
+        Some(format!("{root}/asset/Android/catalog_1.0.0.104.hash").as_str())
+    );
+    assert_eq!(target.bundle_base_url, format!("{root}/asset/Android"));
+    assert_eq!(
+        target.remote_placeholder.as_deref(),
+        Some("https://dummy.net/asset/Android")
+    );
+    assert_eq!(target.authorization, CdnAuthorization::None);
+    // Locale selection derives the localized catalog and hash; the bundle directory is shared.
+    for locale in CATALOG_LOCALES {
+        let mut localized = cfg.clone();
+        localized.catalog_locale = Some((*locale).into());
+        assert!(localized.validate().is_ok());
+        let t = valid.target(&localized, now).unwrap();
+        assert_eq!(
+            t.catalog_url,
+            format!("{root}/asset/Android/catalog_1.0.0.104_{locale}.bin")
+        );
+        assert_eq!(
+            t.hash_url.unwrap(),
+            format!("{root}/asset/Android/catalog_1.0.0.104_{locale}.hash")
+        );
+        assert_eq!(t.bundle_base_url, target.bundle_base_url);
+    }
+    for bad in ["ja", "", "zh-hant", "../en", "en/../ko"] {
+        let mut localized = cfg.clone();
+        localized.catalog_locale = Some(bad.into());
+        assert!(localized.validate().is_err(), "{bad}");
+    }
+    for case in 0..14 {
+        let mut s = valid.clone();
+        match case {
+            0 => s.snapshot.catalog_url = Some("https://evil.example/asset/Android/c.bin".into()),
+            1 => {
+                s.snapshot.catalog_url = Some(format!("{root}/asset/Android/catalog_1.0.0.105.bin"))
+            }
+            2 => s.snapshot.bundle_base_url = Some(format!("{root}/asset")),
+            3 => s.snapshot.catalog_layout = Some(CatalogLayout::Jp),
+            4 => s.snapshot.cdn_authorization = Some(CdnAuthorization::Basic),
+            5 => s.snapshot.credential_ref = "SIRIUS_ANY_SECRET".into(),
+            6 => s.snapshot.platform_hash = "h1".into(),
+            7 => s.snapshot.platform_hash = GLOBAL_BASE_HASH.to_uppercase(),
+            8 => s.snapshot.catalog_url = None,
+            9 => s.snapshot.cdn_authorization = None,
+            10 => s.snapshot.schema_version = 2,
+            11 => s.snapshot.effective_cdn_root = "https://other.example/prod/kr_x".into(),
+            12 => s.snapshot.region = Some(region::Region::En),
+            _ => s.snapshot.resource_version = "..".into(),
+        }
+        assert!(
+            matches!(s.target(&cfg, now), Err(Error::Snapshot)),
+            "case {case}"
+        );
+    }
+    // A Basic root cannot be made anonymous by a snapshot (or the reverse).
+    let mut basic = cfg.clone();
+    basic.cdn_roots.insert(
+        root.into(),
+        CdnAuth {
+            authorization: CdnAuthorization::Basic,
+            username_env: "U".into(),
+            credential_env: "P".into(),
+        },
+    );
+    assert!(valid.target(&basic, now).is_err());
+    let mut s = valid.clone();
+    s.snapshot.cdn_authorization = Some(CdnAuthorization::Basic);
+    s.snapshot.credential_ref = "P".into();
+    assert!(s.target(&basic, now).is_ok());
+    // JP keeps Basic and never selects a locale; `none` is refused there.
+    let mut jp = config();
+    jp.catalog_locale = Some("en".into());
+    assert!(jp.validate().is_err());
+    let mut jp = config();
+    jp.cdn_roots.values_mut().next().unwrap().authorization = CdnAuthorization::None;
+    assert!(jp.validate().is_err());
+    // `none` must not carry secret references; `basic` needs both.
+    let mut mixed = cfg.clone();
+    mixed.cdn_roots.values_mut().next().unwrap().credential_env = "P".into();
+    assert!(mixed.validate().is_err());
+    let mut missing = cfg.clone();
+    missing.cdn_roots.values_mut().next().unwrap().authorization = CdnAuthorization::Basic;
+    assert!(missing.validate().is_err());
+    // A JP-layout snapshot never satisfies a Global region, and a Global one never JP.
+    let mut jp_snapshot = snapshot();
+    jp_snapshot.snapshot.observed_at = now;
+    jp_snapshot.snapshot.schema_version = 3;
+    jp_snapshot.snapshot.region = Some(region::Region::Jp);
+    jp_snapshot.snapshot.catalog_layout = Some(CatalogLayout::Global);
+    jp_snapshot.snapshot.cdn_authorization = Some(CdnAuthorization::Basic);
+    jp_snapshot.snapshot.catalog_url =
+        Some("https://static.example/asset/iOS/catalog_r1.bin".into());
+    jp_snapshot.snapshot.bundle_base_url = Some("https://static.example/asset/iOS".into());
+    assert!(jp_snapshot.target(&config(), now).is_err());
+    // Schema 3 with JP layout is the same URL scheme as schema 2.
+    jp_snapshot.snapshot.catalog_layout = Some(CatalogLayout::Jp);
+    jp_snapshot.snapshot.catalog_url =
+        Some("https://static.example/asset/r1/iOS/h1/catalog_main.bin".into());
+    jp_snapshot.snapshot.bundle_base_url = Some("https://static.example/asset/r1/iOS/h1".into());
+    assert_eq!(
+        jp_snapshot.catalog_url(&config(), now).unwrap(),
+        "https://static.example/asset/r1/iOS/h1/catalog_main.bin"
+    );
+    // Schema 1/2 must not carry schema-3 fields.
+    let mut two = snapshot();
+    two.snapshot.observed_at = now;
+    two.snapshot.schema_version = 2;
+    two.snapshot.region = Some(region::Region::Jp);
+    assert!(two.target(&config(), now).is_ok());
+    two.snapshot.catalog_layout = Some(CatalogLayout::Jp);
+    assert!(two.target(&config(), now).is_err());
+}
+
+#[test]
+fn global_placeholder_maps_only_dummy_net_and_rejects_other_absolute_hosts() {
+    use crate::catalog::Catalog;
+    let base = "https://cdn.example/prod/hk_x/asset/Android";
+    let placeholder = Some("https://dummy.net/asset/Android");
+    let plan = Catalog::parse(&global_catalog())
+        .unwrap()
+        .plan_with(base, placeholder)
+        .unwrap();
+    assert_eq!(
+        plan.assets
+            .iter()
+            .map(|a| (a.relative_path.as_str(), a.provider))
+            .collect::<Vec<_>>(),
+        [
+            ("fixture.bundle", assets::Provider::EncryptedBundle),
+            ("plain.bundle", assets::Provider::UnityBundle),
+            ("sound.acb", assets::Provider::Cri)
+        ]
+    );
+    assert_eq!(plan.embedded_locations, 1);
+    // Without the Global placeholder (JP), dummy.net ids are rejected as before.
+    assert!(matches!(
+        Catalog::parse(&global_catalog()).unwrap().plan(base),
+        Err(Error::AssetPath)
+    ));
+    for id in [
+        "https://evil.example/asset/Android/a.bundle",
+        "https://dummy.net.evil.example/asset/Android/a.bundle",
+        "https://dummy.net:443/asset/Android/a.bundle",
+        "http://dummy.net/asset/Android/a.bundle",
+        "https://user@dummy.net/asset/Android/a.bundle",
+        "https://dummy.net/asset/iOS/a.bundle",
+        "https://dummy.net/asset/AndroidX/a.bundle",
+        "https://dummy.net/asset/Android",
+        "https://dummy.net/asset/Android/",
+        "https://dummy.net/asset/Android/../a.bundle",
+        "https://dummy.net/asset/Android//a.bundle",
+        "https://dummy.net/asset/Android/a.bundle?x=1",
+        "https://DUMMY.NET/asset/Android/a.bundle",
+    ] {
+        assert!(
+            matches!(
+                Catalog::parse(&catalog_fixture(&[(id, CRYPT_PROVIDER)], false))
+                    .unwrap()
+                    .plan_with(base, placeholder),
+                Err(Error::AssetPath)
+            ),
+            "{id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn global_download_verify_and_export_are_anonymous_on_the_global_layout() {
+    for region in [region::Region::Hk, region::Region::En, region::Region::Kr] {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = global_config(region, "https://placeholder.example");
+        cfg.output = root.path().join("downloads");
+        enable_assets(&mut cfg, true);
+        let (client, cdn, task) =
+            serve_global(cfg, &[("catalog_1.0.0.104.bin", global_catalog())]).await;
+        let path = client.fetch().await.unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!("catalog-{}-Android-", region.name())),
+            "{name}"
+        );
+        assert!(std::fs::read(path.join("assets/fixture.bundle"))
+            .unwrap()
+            .starts_with(b"UnityFS\0"));
+        let receipt: Receipt =
+            sonic_rs::from_slice(&std::fs::read(path.join("receipt.json")).unwrap()).unwrap();
+        let base = format!("{}/asset/Android", receipt.snapshot.effective_cdn_root);
+        assert_eq!(receipt.catalog_layout, Some(CatalogLayout::Global));
+        assert_eq!(receipt.bundle_base_url.as_deref(), Some(base.as_str()));
+        assert_eq!(receipt.catalog_url, format!("{base}/catalog_1.0.0.104.bin"));
+        assert_eq!(receipt.catalog_hash.as_deref(), Some(GLOBAL_BASE_HASH));
+        assert_eq!(receipt.catalog_locale, None);
+        assert_eq!(receipt.update.as_ref().unwrap().assets.len(), 3);
+        {
+            let seen = cdn.seen.lock().unwrap();
+            assert_eq!(
+                seen.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+                [
+                    "catalog_1.0.0.104.hash",
+                    "catalog_1.0.0.104.bin",
+                    "fixture.bundle",
+                    "plain.bundle",
+                    "sound.acb",
+                    "catalog_1.0.0.104.hash"
+                ]
+            );
+            assert!(seen.iter().all(|(_, auth)| auth.is_none()));
+        }
+        let text = std::fs::read_to_string(path.join("receipt.json")).unwrap();
+        assert!(!text.contains("internal-fixture") && !text.contains("dummy.net"));
+        // Offline verification uses the stored bundle base, not string stripping.
+        let report = crate::verify::verify(&path).await.unwrap();
+        assert_eq!(report.region, region);
+        assert_eq!(report.asset_files_verified, 3);
+        assert_eq!(report.decrypted_bundles, 1);
+        assert_eq!(report.platform_hash, GLOBAL_BASE_HASH);
+        // Raw export (no media tools) plans the same Global graph and verifies per region.
+        let output = root.path().join("export");
+        let yaml = format!(
+            "input: {path:?}\noutput: {output:?}\nretain_outputs: true\nraw_bundles:\n  mode: only\n  include: ['bundle$']\n"
+        );
+        let export: crate::export::ExportConfig = yaml_serde::from_str(&yaml).unwrap();
+        let summary = export.run().await.unwrap();
+        assert!(summary.complete);
+        assert_eq!(summary.catalog_files, 3);
+        crate::export_verify::verify(&output, region).await.unwrap();
+        assert!(crate::export_verify::verify(&output, region::Region::Jp)
+            .await
+            .is_err());
+        // A tampered bundle base (or a JP-style reinterpretation) fails verification.
+        for tamper in 0..3 {
+            let mut value: Receipt = sonic_rs::from_str(&text).unwrap();
+            match tamper {
+                0 => value.bundle_base_url = Some("https://evil.example/asset/Android".into()),
+                1 => value.bundle_base_url = None,
+                _ => value.catalog_layout = None,
+            }
+            std::fs::write(path.join("receipt.json"), sonic_rs::to_vec(&value).unwrap()).unwrap();
+            assert!(crate::verify::verify(&path).await.is_err(), "{tamper}");
+        }
+        std::fs::write(path.join("receipt.json"), &text).unwrap();
+        assert!(crate::verify::verify(&path).await.is_ok());
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn global_locale_profile_downloads_the_localized_catalog_and_pins_its_hash() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = global_config(region::Region::Kr, "https://placeholder.example");
+    cfg.output = root.path().join("downloads");
+    cfg.catalog_locale = Some("ko".into());
+    enable_assets(&mut cfg, true);
+    let localized = catalog_fixture(
+        &[("https://dummy.net/asset/Android/sound.acb", CRI_PROVIDER)],
+        false,
+    );
+    let (client, cdn, task) = serve_global(
+        cfg,
+        &[
+            ("catalog_1.0.0.104.bin", global_catalog()),
+            ("catalog_1.0.0.104_ko.bin", localized.clone()),
+            (
+                "catalog_1.0.0.104_ko.hash",
+                GLOBAL_LOCALE_HASH.as_bytes().to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let path = client.fetch().await.unwrap();
+    assert_eq!(
+        std::fs::read(path.join("catalog_main.bin")).unwrap(),
+        localized
+    );
+    let receipt: Receipt =
+        sonic_rs::from_slice(&std::fs::read(path.join("receipt.json")).unwrap()).unwrap();
+    assert_eq!(receipt.catalog_locale.as_deref(), Some("ko"));
+    assert_eq!(receipt.catalog_hash.as_deref(), Some(GLOBAL_LOCALE_HASH));
+    // The API's platform hash (base catalog) stays the job identity.
+    assert_eq!(receipt.snapshot.platform_hash, GLOBAL_BASE_HASH);
+    assert!(receipt
+        .catalog_url
+        .ends_with("/asset/Android/catalog_1.0.0.104_ko.bin"));
+    assert_eq!(
+        cdn.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "catalog_1.0.0.104_ko.hash",
+            "catalog_1.0.0.104_ko.bin",
+            "sound.acb",
+            "catalog_1.0.0.104_ko.hash"
+        ]
+    );
+    assert_eq!(
+        crate::verify::verify(&path)
+            .await
+            .unwrap()
+            .asset_files_verified,
+        1
+    );
+    // The locale is part of the verified receipt identity.
+    let mut value = receipt;
+    value.catalog_locale = Some("en".into());
+    std::fs::write(path.join("receipt.json"), sonic_rs::to_vec(&value).unwrap()).unwrap();
+    assert!(crate::verify::verify(&path).await.is_err());
+    task.abort();
+}
+
+#[tokio::test]
+async fn global_hash_mismatch_replacement_or_foreign_hosts_never_publish() {
+    for case in 0..4 {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = global_config(region::Region::Hk, "https://placeholder.example");
+        cfg.output = root.path().join("downloads");
+        enable_assets(&mut cfg, true);
+        let catalog = if case == 2 {
+            catalog_fixture(
+                &[(
+                    "https://evil.example/asset/Android/fixture.bundle",
+                    CRYPT_PROVIDER,
+                )],
+                false,
+            )
+        } else {
+            global_catalog()
+        };
+        let (client, cdn, task) = serve_global(cfg, &[("catalog_1.0.0.104.bin", catalog)]).await;
+        match case {
+            // The CDN's base hash differs from the API snapshot: stop before the catalog.
+            0 => {
+                cdn.files.lock().unwrap().insert(
+                    "catalog_1.0.0.104.hash".into(),
+                    GLOBAL_LOCALE_HASH.as_bytes().to_vec(),
+                );
+            }
+            // Same version, catalog replaced during the run: the final hash check fails.
+            1 => {
+                *cdn.after_catalog.lock().unwrap() = Some((
+                    "catalog_1.0.0.104.hash".into(),
+                    GLOBAL_LOCALE_HASH.as_bytes().to_vec(),
+                ));
+            }
+            2 => {}
+            // A malformed `.hash` body is rejected.
+            _ => {
+                cdn.files
+                    .lock()
+                    .unwrap()
+                    .insert("catalog_1.0.0.104.hash".into(), b"<html>".to_vec());
+            }
+        }
+        let result = client.fetch().await;
+        match case {
+            0 | 1 => assert!(matches!(result, Err(Error::Snapshot)), "{case}"),
+            2 => assert!(matches!(result, Err(Error::AssetPath)), "{case}"),
+            _ => assert!(matches!(result, Err(Error::Catalog)), "{case}"),
+        }
+        let seen: Vec<_> = cdn
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        match case {
+            0 | 3 => assert_eq!(seen, ["catalog_1.0.0.104.hash"], "{case}"),
+            2 => assert_eq!(
+                seen,
+                ["catalog_1.0.0.104.hash", "catalog_1.0.0.104.bin"],
+                "{case}"
+            ),
+            _ => {}
+        }
+        let published = std::fs::read_dir(root.path().join("downloads"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(published, 0, "{case}");
+        task.abort();
+    }
+}
+
+#[test]
+fn receipts_written_before_explicit_bundle_bases_still_verify_as_jp() {
+    // A 1.2.0 JP receipt: no layout, no bundle base; the base comes from the catalog URL.
+    let old = format!(
+        r#"{{"snapshot":{},"catalog_url":"https://static.example/asset/r1/iOS/h1/catalog_main.bin","bytes":1,"sha256":"{}","downloaded_at":"{}"}}"#,
+        sonic_rs::to_string(&snapshot().snapshot).unwrap(),
+        "a".repeat(64),
+        Utc::now().to_rfc3339()
+    );
+    let receipt: Receipt = sonic_rs::from_str(&old).unwrap();
+    assert_eq!(
+        receipt.remote().unwrap(),
+        ("https://static.example/asset/r1/iOS/h1".to_string(), None)
+    );
+    // New JP receipts store the same base explicitly and it must agree.
+    let mut explicit: Receipt = sonic_rs::from_str(&old).unwrap();
+    explicit.catalog_layout = Some(CatalogLayout::Jp);
+    explicit.bundle_base_url = Some("https://static.example/asset/r1/iOS/h1".into());
+    assert!(explicit.remote().is_ok());
+    explicit.bundle_base_url = Some("https://static.example/asset/r2/iOS/h1".into());
+    assert!(explicit.remote().is_err());
+    explicit.bundle_base_url = None;
+    explicit.catalog_locale = Some("en".into());
+    assert!(explicit.remote().is_err());
+    // A Global receipt without its explicit base is never guessed.
+    let mut global: Receipt = sonic_rs::from_str(&old).unwrap();
+    global.catalog_layout = Some(CatalogLayout::Global);
+    assert!(global.remote().is_err());
+}
+
+#[test]
+fn global_examples_are_anonymous_and_accept_their_catalog_locale() {
+    for (name, source, locale) in [
+        ("hk", include_str!("../docs/examples/hk.yaml"), "zh-Hant"),
+        ("en", include_str!("../docs/examples/en.yaml"), "en"),
+        ("kr", include_str!("../docs/examples/kr.yaml"), "ko"),
+    ] {
+        let mut cfg: Config = yaml_serde::from_str(source).unwrap();
+        assert_eq!(cfg.region.name(), name);
+        cfg.validate().unwrap();
+        let (root, auth) = cfg.cdn_roots.iter().next().unwrap();
+        assert!(root.contains(&format!("/prod/{name}_")), "{root}");
+        assert_eq!(auth.authorization, CdnAuthorization::None);
+        let report = cfg.check_secrets();
+        assert!(!report.missing_env.iter().any(|n| n.contains("CDN")));
+        cfg.catalog_locale = Some(locale.into());
+        cfg.validate().unwrap();
+    }
 }

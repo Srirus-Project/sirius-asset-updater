@@ -118,8 +118,8 @@ with tempfile.TemporaryDirectory() as tmp:
     if m["name"] == "sirius-asset-updater":
         regional = json.loads((root / "docs/examples/en.yaml").read_text().split("\n", 1)[1])
         regional.update(internal_token_env="SIRIUS_INTERNAL_TOKEN", refresh_token_env="SIRIUS_API_TOKEN")
-        for auth in regional["cdn_roots"].values():
-            auth.update(username_env="SIRIUS_CDN_USERNAME", credential_env="SIRIUS_CDN_CREDENTIAL")
+        # Global examples use anonymous CDN roots: no CDN secret is needed for readiness.
+        assert all(auth == {"authorization": "none"} for auth in regional["cdn_roots"].values())
         (root / "sirius-asset-config.yaml").write_text(json.dumps(regional))
         check = subprocess.run([str(exe), "check"], cwd=root, env=env, check=True, capture_output=True, timeout=15)
         assert json.loads(check.stdout)["ready"]

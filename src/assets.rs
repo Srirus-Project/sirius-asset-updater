@@ -92,10 +92,17 @@ pub(crate) fn safe_relative(path: &str) -> bool {
 }
 impl Catalog {
     pub fn plan(&self, remote_dir: &str) -> Result<Plan, Error> {
+        self.plan_with(remote_dir, None)
+    }
+    /// `placeholder` is the exact absolute bundle directory a Global catalog names
+    /// (`https://dummy.net/asset/{platform}`); the client substitutes its CDN root, so ids under
+    /// it resolve against `remote_dir`. Every other absolute URL is rejected.
+    pub fn plan_with(&self, remote_dir: &str, placeholder: Option<&str>) -> Result<Plan, Error> {
         let mut assets = BTreeMap::<String, Asset>::new();
         let mut embedded_locations = 0;
         let mut logical_locations = 0;
         let prefix = format!("{remote_dir}/");
+        let placeholder = placeholder.map(|p| format!("{p}/"));
         for location in &self.locations {
             let provider = match location.provider_id.as_str() {
                 "Fwk.Crypt.AssetBundleCryptProvider" => Provider::EncryptedBundle,
@@ -113,6 +120,11 @@ impl Catalog {
             let path = if let Some(relative) = id.strip_prefix("{Fwk.Resource.RemoteAssetDir}/") {
                 relative
             } else if let Some(relative) = id.strip_prefix(&prefix) {
+                relative
+            } else if let Some(relative) = placeholder
+                .as_deref()
+                .and_then(|placeholder| id.strip_prefix(placeholder))
+            {
                 relative
             } else if let Some(relative) =
                 id.strip_prefix("{UnityEngine.AddressableAssets.Addressables.RuntimePath}/")

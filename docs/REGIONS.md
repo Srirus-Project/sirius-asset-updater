@@ -8,9 +8,9 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy and verified download/export pipeline |
-| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
+| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
+| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 `global` is not a region. HK, EN and KR have distinct API roots and Master versions. EN and KR
@@ -53,12 +53,73 @@ Publication names contain region and platform; receipts and export summaries ret
 Cache keys additionally include region, environment and platform, even for shared CDN URLs.
 Old ciphertext caches are not deleted but use a different namespace and may be downloaded again.
 
-Global transport supports HTTPS CDN prefixes and Android paths, but end-to-end Global asset
-acquisition/decryption has not been verified. A successful version query does not imply a
-ready resource snapshot: `x-asset-version: unknown` or a missing Android hash produces no ready
-snapshot. The updater refuses to manufacture hashes or substitute an iOS/JP snapshot. Keep
-separate output, cache and export directories for each region. Real credentials and keys are
-never shipped; do not reuse JP credentials for Global.
+The updater refuses to manufacture hashes or substitute an iOS/JP snapshot. Keep separate
+output, cache and export directories for each region. Real credentials and keys are never
+shipped; do not reuse JP credentials for Global.
+
+## Global assets (HK/EN/KR)
+
+Global downloads need an API proxy with `resource_snapshot` enabled for the region (proxy
+`docs/REGIONS.md#resource-snapshots`). That proxy serves **schema-3** snapshots. A Global
+updater accepts only schema 3 with `catalog_layout: global`; a schema-2 snapshot (JP layout) is
+refused for Global, and a Global layout is refused for JP. JP keeps accepting schema-1/2
+snapshots unchanged.
+
+Schema 3 states `catalog_url`, `bundle_base_url` and `cdn_authorization` explicitly. The
+updater derives both URLs itself from the layout, the configured root, platform and resource
+version, and fails before any CDN request if they differ. A snapshot therefore cannot point
+downloads anywhere else. The Global client layout, verified live, is:
+
+| Item | URL |
+| --- | --- |
+| Base (Japanese) catalog | `{root}/asset/Android/catalog_{resource_version}.bin` |
+| Localized catalog | `{root}/asset/Android/catalog_{resource_version}_{locale}.bin` |
+| Catalog version token | the same path with `.hash` (32 hex digits) |
+| Bundles | `{root}/asset/Android/<file>` (no version directory; file names are content-addressed) |
+
+- **Catalog locale.** The base catalog is identical across HK/EN/KR and is the default. Set
+  `catalog_locale` to `en`, `zh-Hant`, `zh-Hans` or `ko` in a profile's download configuration
+  to download the localized catalog instead (HK uses `zh-Hant`, EN `en`, KR `ko`). It is
+  rejected for JP. The receipt records it, and the cache identity follows the catalog URL, so
+  each locale is cached separately. Use one profile per locale.
+- **Catalog hash.** Before the catalog, the updater reads the catalog's `.hash`. For the base
+  catalog it must equal the snapshot's `platform_hash`. After the assets (and API
+  revalidation), it reads the `.hash` again and fails without publishing if it changed. This
+  catches a catalog replaced in place under the same resource version. The value is recorded
+  as the receipt's `catalog_hash`. The client uses this file only as a version token. It is not
+  a digest of the catalog bytes, so integrity still rests on the recorded SHA-256 of every
+  downloaded file.
+- **Remote bundle ids.** Global catalogs name remote bundles
+  `https://dummy.net/asset/Android/<file>`, and the client substitutes its CDN root. The
+  updater maps exactly that prefix onto `bundle_base_url`. Any other absolute URL is rejected
+  with `invalid_asset_path`. That includes other hosts, `http`, ports, user info, other
+  platforms, case variants and unsafe relative paths. `{…RuntimePath}/Android/…` entries are
+  embedded in the app and are counted but not downloaded.
+- **Anonymous CDN.** The Global resource CDN serves `.hash`, catalogs and bundles without
+  authorization (verified 2026-09-26). Configure the root with `authorization: none` and no
+  `username_env`/`credential_env`. No Authorization header is sent, and `check` needs no CDN
+  secret. `none` is accepted only for HK/EN/KR. JP roots keep the default `authorization: basic`
+  with both references. The snapshot's `cdn_authorization` and `credential_ref` (empty for
+  `none`) must match the configured root.
+- **Receipts.** Receipts now store `catalog_layout` and `bundle_base_url` explicitly.
+  Verification and export plan from them instead of stripping `/catalog_main.bin`. Receipts
+  from 1.2.0 and earlier have neither field. They are JP layout and keep verifying by deriving
+  the directory from their catalog URL. A Global receipt without `bundle_base_url` is rejected.
+- **Decryption and export.** Bundle encryption is the same as JP, so the same
+  `decrypt.key_hex_env`/`nonce_seed_hex_env` values apply. CRI and SplitAcb export settings are
+  unchanged.
+
+```yaml
+region: hk
+catalog_locale: zh-Hant        # optional; omit for the base catalog
+cdn_roots:
+  https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10:
+    authorization: none
+```
+
+Mixed versions: a 1.2.0 updater rejects schema-3 snapshots, which carry unknown fields, so it
+fails closed on Global. A 1.2.1 updater accepts the schema-2 JP snapshots of a 1.2.0 proxy.
+Upgrade updaters before enabling `resource_snapshot` on the proxy.
 
 ## Upgrade from v1.0.0
 
