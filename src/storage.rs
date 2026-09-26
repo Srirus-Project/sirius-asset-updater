@@ -862,11 +862,13 @@ impl Provider {
                 if root.starts_with(&source) || source.starts_with(&root) {
                     return Err(Error::Config);
                 }
-                let root = root.to_str().ok_or(Error::Config)?;
+                // Join rather than format: the canonical root is a verbatim `\\?\` path on
+                // Windows, where a literal `/` is not a separator.
+                let staging = root.join(".staging");
                 Operator::new(
                     services::Fs::default()
-                        .root(root)
-                        .atomic_write_dir(&format!("{root}/.staging")),
+                        .root(root.to_str().ok_or(Error::Config)?)
+                        .atomic_write_dir(staging.to_str().ok_or(Error::Config)?),
                 )
                 .map_err(storage_error)
             }
