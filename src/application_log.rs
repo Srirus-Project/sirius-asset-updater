@@ -165,6 +165,16 @@ impl Config {
         };
         let value: yaml_serde::Value =
             crate::config_env::load(path, document).map_err(|_| invalid())?;
+        Self::from_value(&value)
+    }
+    /// Same as [`Self::from_file`] for document text already read (e.g. a remote snapshot),
+    /// so the logging section and the command see the same bytes.
+    pub fn from_text(text: &str, document: crate::config_env::Document) -> io::Result<Self> {
+        let value: yaml_serde::Value =
+            crate::config_env::from_str(text, document).map_err(|_| invalid())?;
+        Self::from_value(&value)
+    }
+    fn from_value(value: &yaml_serde::Value) -> io::Result<Self> {
         let config = match value.get("logging") {
             Some(value) if !value.is_null() => {
                 yaml_serde::from_value(value.clone()).map_err(|_| invalid())?

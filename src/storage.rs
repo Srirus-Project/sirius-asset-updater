@@ -340,78 +340,7 @@ impl Config {
             {
                 return Err(Error::Config);
             }
-            match &p.backend {
-                Backend::Local { directory } => {
-                    if directory.as_os_str().is_empty() {
-                        return Err(Error::Config);
-                    }
-                }
-                Backend::S3 {
-                    credentials_file,
-                    assume_role,
-                    endpoint,
-                    write_options,
-                    path_style,
-                    bucket,
-                    region,
-                    access_key_id_env,
-                    secret_access_key_env,
-                    session_token_env,
-                    ..
-                } => {
-                    write_options.validate()?;
-                    if let Some(role) = assume_role {
-                        role.validate()?;
-                    }
-                    let url = reqwest::Url::parse(endpoint).map_err(|_| Error::Config)?;
-                    let loopback = url.host_str().is_some_and(|h| {
-                        h.trim_matches(['[', ']'])
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback())
-                    });
-                    if endpoint.len() > 2048
-                        || endpoint.chars().any(char::is_whitespace)
-                        || endpoint.contains('\\')
-                        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
-                        || url.host_str().is_none()
-                        || !url.username().is_empty()
-                        || url.password().is_some()
-                        || url.query().is_some()
-                        || url.fragment().is_some()
-                        || url.path() != "/"
-                        || (!path_style
-                            && (bucket.contains('.')
-                                || url.host_str().is_some_and(|host| {
-                                    host.trim_matches(['[', ']'])
-                                        .parse::<std::net::IpAddr>()
-                                        .is_ok()
-                                })))
-                        || bucket.is_empty()
-                        || bucket.len() > 63
-                        || !bucket.bytes().all(|b| {
-                            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
-                        })
-                        || !component(region)
-                    {
-                        return Err(Error::Config);
-                    }
-                    if let Some(file) = credentials_file {
-                        if !access_key_id_env.is_empty()
-                            || !secret_access_key_env.is_empty()
-                            || session_token_env.is_some()
-                        {
-                            return Err(Error::Config);
-                        }
-                        file.read()?;
-                    } else {
-                        secret(access_key_id_env)?;
-                        secret(secret_access_key_env)?;
-                        if let Some(env) = session_token_env {
-                            secret(env)?;
-                        }
-                    }
-                }
-            }
+            validate_backend(&p.backend)?;
         }
         Ok(())
     }
@@ -941,88 +870,171 @@ impl Provider {
                 )
                 .map_err(storage_error)
             }
-            Backend::S3 {
-                credentials_file,
-                assume_role,
-                request_payer,
-                endpoint,
-                write_options,
-                path_style,
-                bucket,
-                region,
-                access_key_id_env,
-                secret_access_key_env,
-                session_token_env,
-                ..
-            } => {
-                let mut builder = services::S3::default()
-                    .endpoint(endpoint)
-                    .bucket(bucket)
-                    .region(region)
-                    .disable_config_load()
-                    .disable_ec2_metadata();
-                if *request_payer {
-                    builder = builder.enable_request_payer();
-                }
-                builder = write_options.apply(builder)?;
-                if public {
-                    builder =
-                        builder.default_acl(write_options.public_acl().unwrap_or("public-read"));
-                } else if let Some(acl) = &write_options.default_acl {
-                    // A public default participates in selection; exclusions use explicit private ACL.
-                    builder = builder.default_acl(if write_options.public_acl().is_some() {
-                        "private"
-                    } else {
-                        acl
-                    });
-                }
-                if !path_style {
-                    builder = builder.enable_virtual_host_style();
-                }
-                if let Some(file) = credentials_file {
-                    let chain = match assume_role {
-                        Some(role) => role.chain_from_source((**file).clone())?,
-                        None => reqsign_core::ProvideCredentialChain::new().push((**file).clone()),
-                    };
-                    builder = builder.credential_provider_chain(chain);
-                } else {
-                    builder = builder
-                        .access_key_id(&secret(access_key_id_env)?)
-                        .secret_access_key(&secret(secret_access_key_env)?);
-                    let token = session_token_env
-                        .as_ref()
-                        .map(|name| secret(name))
-                        .transpose()?;
-                    if let Some(value) = &token {
-                        builder = builder.session_token(value);
-                    }
-                    if let Some(role) = assume_role {
-                        builder = builder.credential_provider_chain(role.chain(
-                            &secret(access_key_id_env)?,
-                            &secret(secret_access_key_env)?,
-                            token.as_deref(),
-                        )?);
-                    }
-                }
-                let client = reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .no_proxy()
-                    .no_gzip()
-                    .no_brotli()
-                    .no_deflate()
-                    .no_zstd()
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(Duration::from_secs(60))
-                    .build()
-                    .map_err(|_| Error::Config)?;
-                let transport = HttpTransporter::new(
-                    opendal_http_transport_reqwest::ReqwestTransport::new(client),
-                );
-                Ok(Operator::new(builder)
-                    .map_err(storage_error)?
-                    .with_context(OperationContext::new().with_http_transport(transport)))
+            backend @ Backend::S3 { .. } => s3_operator(backend, public),
+        }
+    }
+}
+
+/// Validate one backend, including referenced credential sources, without storage I/O.
+pub(crate) fn validate_backend(backend: &Backend) -> Result<(), Error> {
+    match backend {
+        Backend::Local { directory } => {
+            if directory.as_os_str().is_empty() {
+                return Err(Error::Config);
             }
         }
+        Backend::S3 {
+            credentials_file,
+            assume_role,
+            endpoint,
+            write_options,
+            path_style,
+            bucket,
+            region,
+            access_key_id_env,
+            secret_access_key_env,
+            session_token_env,
+            ..
+        } => {
+            write_options.validate()?;
+            if let Some(role) = assume_role {
+                role.validate()?;
+            }
+            let url = reqwest::Url::parse(endpoint).map_err(|_| Error::Config)?;
+            let loopback = url.host_str().is_some_and(|h| {
+                h.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            });
+            if endpoint.len() > 2048
+                || endpoint.chars().any(char::is_whitespace)
+                || endpoint.contains('\\')
+                || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+                || (!path_style
+                    && (bucket.contains('.')
+                        || url.host_str().is_some_and(|host| {
+                            host.trim_matches(['[', ']'])
+                                .parse::<std::net::IpAddr>()
+                                .is_ok()
+                        })))
+                || bucket.is_empty()
+                || bucket.len() > 63
+                || !bucket
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+                || !component(region)
+            {
+                return Err(Error::Config);
+            }
+            if let Some(file) = credentials_file {
+                if !access_key_id_env.is_empty()
+                    || !secret_access_key_env.is_empty()
+                    || session_token_env.is_some()
+                {
+                    return Err(Error::Config);
+                }
+                file.read()?;
+            } else {
+                secret(access_key_id_env)?;
+                secret(secret_access_key_env)?;
+                if let Some(env) = session_token_env {
+                    secret(env)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+/// Build a signed, verified-TLS, no-proxy, no-redirect S3 operator for a validated backend.
+pub(crate) fn s3_operator(backend: &Backend, public: bool) -> Result<Operator, Error> {
+    match backend {
+        Backend::S3 {
+            credentials_file,
+            assume_role,
+            request_payer,
+            endpoint,
+            write_options,
+            path_style,
+            bucket,
+            region,
+            access_key_id_env,
+            secret_access_key_env,
+            session_token_env,
+            ..
+        } => {
+            let mut builder = services::S3::default()
+                .endpoint(endpoint)
+                .bucket(bucket)
+                .region(region)
+                .disable_config_load()
+                .disable_ec2_metadata();
+            if *request_payer {
+                builder = builder.enable_request_payer();
+            }
+            builder = write_options.apply(builder)?;
+            if public {
+                builder = builder.default_acl(write_options.public_acl().unwrap_or("public-read"));
+            } else if let Some(acl) = &write_options.default_acl {
+                // A public default participates in selection; exclusions use explicit private ACL.
+                builder = builder.default_acl(if write_options.public_acl().is_some() {
+                    "private"
+                } else {
+                    acl
+                });
+            }
+            if !path_style {
+                builder = builder.enable_virtual_host_style();
+            }
+            if let Some(file) = credentials_file {
+                let chain = match assume_role {
+                    Some(role) => role.chain_from_source((**file).clone())?,
+                    None => reqsign_core::ProvideCredentialChain::new().push((**file).clone()),
+                };
+                builder = builder.credential_provider_chain(chain);
+            } else {
+                builder = builder
+                    .access_key_id(&secret(access_key_id_env)?)
+                    .secret_access_key(&secret(secret_access_key_env)?);
+                let token = session_token_env
+                    .as_ref()
+                    .map(|name| secret(name))
+                    .transpose()?;
+                if let Some(value) = &token {
+                    builder = builder.session_token(value);
+                }
+                if let Some(role) = assume_role {
+                    builder = builder.credential_provider_chain(role.chain(
+                        &secret(access_key_id_env)?,
+                        &secret(secret_access_key_env)?,
+                        token.as_deref(),
+                    )?);
+                }
+            }
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .map_err(|_| Error::Config)?;
+            let transport = HttpTransporter::new(
+                opendal_http_transport_reqwest::ReqwestTransport::new(client),
+            );
+            Ok(Operator::new(builder)
+                .map_err(storage_error)?
+                .with_context(OperationContext::new().with_http_transport(transport)))
+        }
+        Backend::Local { .. } => Err(Error::Config),
     }
 }
 

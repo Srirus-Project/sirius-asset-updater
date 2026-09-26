@@ -5,7 +5,7 @@ restores the original `HARUKI__A__B=value` mechanism, with one prefix per Sirius
 
 | Prefix | Document |
 | --- | --- |
-| `SIRIUS_ASSET__` | Download/update configuration (`SIRIUS_ASSET_CONFIG_PATH`, `check`, `probe`, service `download_config`) |
+| `SIRIUS_ASSET__` | Download/update configuration (`SIRIUS_ASSET_CONFIG_PATH` or `SIRIUS_ASSET_CONFIG_URI`, `check`, `probe`, service `download_config`) |
 | `SIRIUS_ASSET_EXPORT__` | `export CONFIG` and service `export_config` |
 | `SIRIUS_ASSET_SERVICE__` | `serve CONFIG` |
 | `SIRIUS_ASSET_STORAGE__` | Service profile `storage_config` |
@@ -29,6 +29,10 @@ mapping is also an error. Application logging reads the overridden `logging` sec
 apply wherever that document kind is loaded, including every service profile that references a
 document of that kind; the service re-reads profile documents per job, so the job process's
 environment at load time is what counts.
+
+`SIRIUS_ASSET_CONFIG_SOURCE__` uses the same path rules but is not a document override: it is the
+typed bootstrap for a remote download configuration and is built from the environment alone
+(see [REMOTE_CONFIG.md](REMOTE_CONFIG.md)). Download overrides apply after a remote fetch.
 
 Limits: at most 256 overrides per document kind, 16 path segments, 64 KiB per value and
 sequence index 1024. Only ASCII letters, digits and `_` are accepted in segments, so mapping keys

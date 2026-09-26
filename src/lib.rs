@@ -69,6 +69,8 @@ pub enum Error {
     Catalog,
     #[error("local file operation failed")]
     Io,
+    #[error("remote configuration source is unavailable")]
+    RemoteConfig,
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -94,6 +96,7 @@ impl Error {
             Self::Size => "size_limit",
             Self::Catalog => "invalid_catalog",
             Self::Io => "io_failed",
+            Self::RemoteConfig => "remote_config_unavailable",
         }
     }
     pub fn http_status(&self) -> Option<u16> {
@@ -642,6 +645,7 @@ pub mod access_log;
 
 pub mod application_log;
 pub mod config_env;
+pub mod config_source;
 
 mod media_gate;
 

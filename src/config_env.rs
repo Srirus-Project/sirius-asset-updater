@@ -22,6 +22,9 @@ pub enum Document {
     Storage,
     /// `publish`/`plan-storage` command documents.
     Publish,
+    /// Remote download-configuration bootstrap (`SIRIUS_ASSET_CONFIG_SOURCE__*`); built only
+    /// from the environment, never read from a file.
+    ConfigSource,
 }
 impl Document {
     pub fn prefix(self) -> &'static str {
@@ -31,6 +34,7 @@ impl Document {
             Self::Service => "SIRIUS_ASSET_SERVICE__",
             Self::Storage => "SIRIUS_ASSET_STORAGE__",
             Self::Publish => "SIRIUS_ASSET_PUBLISH__",
+            Self::ConfigSource => "SIRIUS_ASSET_CONFIG_SOURCE__",
         }
     }
 }
@@ -52,10 +56,13 @@ pub fn from_str<T: serde::de::DeserializeOwned>(
     text: &str,
     document: Document,
 ) -> Result<T, Error> {
-    let vars: Vec<(String, String)> = std::env::vars_os()
+    from_str_with(text, document, &process_vars())
+}
+/// UTF-8 environment snapshot; non-UTF-8 names or values cannot address a document.
+pub(crate) fn process_vars() -> Vec<(String, String)> {
+    std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .collect();
-    from_str_with(text, document, &vars)
+        .collect()
 }
 pub(crate) fn from_str_with<T: serde::de::DeserializeOwned>(
     text: &str,

@@ -12,26 +12,33 @@ async fn main() -> std::process::ExitCode {
                 _ => Document::Publish,
             },
         ),
-        _ if args.is_empty() || args == ["check"] || args == ["probe"] => (
-            Some(std::path::PathBuf::from(
-                std::env::var("SIRIUS_ASSET_CONFIG_PATH")
-                    .unwrap_or_else(|_| "sirius-asset-config.yaml".into()),
-            )),
-            Document::Download,
-        ),
         _ => (None, Document::Download),
     };
-    let _logging =
-        match sirius_asset_updater::application_log::Config::from_file(path.as_deref(), document)
-            .and_then(|c| c.init())
-        {
-            Ok(guard) => guard,
+    // The download configuration (local or SIRIUS_ASSET_CONFIG_URI) is read exactly once, so
+    // logging and the command decode the same snapshot.
+    let download = if args.is_empty() || args == ["check"] || args == ["probe"] {
+        match sirius_asset_updater::config_source::read_download_config().await {
+            Ok(text) => Some(text),
             Err(error) => {
                 eprintln!("{error}");
                 return std::process::ExitCode::FAILURE;
             }
-        };
-    match run().await {
+        }
+    } else {
+        None
+    };
+    let logging = match &download {
+        Some(text) => sirius_asset_updater::application_log::Config::from_text(text, document),
+        None => sirius_asset_updater::application_log::Config::from_file(path.as_deref(), document),
+    };
+    let _logging = match logging.and_then(|c| c.init()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match run(download).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error_code = error.code(), "Sirius asset command failed");
@@ -44,7 +51,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
 }
-async fn run() -> Result<(), Error> {
+async fn run(download: Option<String>) -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--version"] {
         println!("sirius-asset-updater {}", env!("CARGO_PKG_VERSION"));
@@ -146,10 +153,8 @@ async fn run() -> Result<(), Error> {
         );
         return Err(Error::Config);
     }
-    let path = std::env::var("SIRIUS_ASSET_CONFIG_PATH")
-        .unwrap_or_else(|_| "sirius-asset-config.yaml".into());
-    let config: Config = sirius_asset_updater::config_env::load(
-        std::path::Path::new(&path),
+    let config: Config = sirius_asset_updater::config_env::from_str(
+        download.as_deref().ok_or(Error::Config)?,
         sirius_asset_updater::config_env::Document::Download,
     )?;
     let check = config.check()?;

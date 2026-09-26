@@ -40,8 +40,12 @@ cp sirius-asset-config.example.yaml sirius-asset-config.yaml
 # Release archive: ./sirius-asset-updater (sirius-asset-updater.exe on Windows)
 ```
 
-`SIRIUS_ASSET_CONFIG_PATH` overrides the configuration path; `SIRIUS_ASSET__A__B=value` style
-variables override individual fields (see [CONFIG_OVERRIDES.md](docs/CONFIG_OVERRIDES.md)). `check` validates configuration
+`SIRIUS_ASSET_CONFIG_PATH` overrides the configuration path; alternatively
+`SIRIUS_ASSET_CONFIG_URI=opendal://fs|s3/KEY` reads it (bounded to 1 MiB) from a local-root or S3
+backend described by typed `SIRIUS_ASSET_CONFIG_SOURCE__*` variables with environment-referenced
+credentials (see [REMOTE_CONFIG.md](docs/REMOTE_CONFIG.md); setting both is an error).
+`SIRIUS_ASSET__A__B=value` style variables override individual fields, also after a remote fetch
+(see [CONFIG_OVERRIDES.md](docs/CONFIG_OVERRIDES.md)). `check` validates configuration
 and secret presence offline. `probe` refreshes/reads the API snapshot without contacting the CDN.
 API, internal and CDN credentials have separate scopes; API and internal tokens must differ.
 `refresh_token_env` lets the updater renew version observations before and during a download.

@@ -2,7 +2,8 @@
 
 1. Start Sirius API Proxy with matching environment/client/CDN settings. Use
    `sirius-asset-config.example.yaml` as the updater template and keep secrets in the
-   environment. `SIRIUS_ASSET_CONFIG_PATH` selects the configuration.
+   environment. `SIRIUS_ASSET_CONFIG_PATH` selects the configuration, or `SIRIUS_ASSET_CONFIG_URI` reads it
+   from an `fs`/`s3` source ([REMOTE_CONFIG.md](REMOTE_CONFIG.md)); never set both.
 2. Set `SIRIUS_INTERNAL_TOKEN` for snapshot reads and a different `SIRIUS_API_TOKEN` for
    optional version refreshes. CDN username/password are separate and only go to their
    configured origin. Supply bundle key/nonce seed only when decryption is enabled.
