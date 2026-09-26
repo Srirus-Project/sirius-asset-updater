@@ -1692,6 +1692,11 @@ mod lifecycle_tests {
                 if path.is_dir() {
                     out.push((path.clone(), vec![]));
                     pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "lock") {
+                    // Ownership locks are never written, only held. Windows locks are mandatory
+                    // byte-range locks, so a held lock file is unreadable; compare its length.
+                    let len = std::fs::metadata(&path).unwrap().len();
+                    out.push((path.clone(), len.to_le_bytes().to_vec()));
                 } else {
                     out.push((path.clone(), std::fs::read(&path).unwrap()));
                 }
