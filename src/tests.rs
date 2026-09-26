@@ -4401,6 +4401,40 @@ fn receipts_written_before_explicit_bundle_bases_still_verify_as_jp() {
     assert!(global.remote().is_err());
 }
 
+/// Every shipped example document decodes with its own type (unknown fields rejected) and,
+/// where validation needs no files or secrets, passes it. Global examples are checked below.
+#[test]
+fn shipped_root_examples_parse_and_validate() {
+    let download: Config =
+        yaml_serde::from_str(include_str!("../sirius-asset-config.example.yaml")).unwrap();
+    assert_eq!(download.region, region::Region::Jp);
+    assert!(download
+        .cdn_roots
+        .values()
+        .all(|auth| auth.authorization == CdnAuthorization::Basic));
+    download.validate().unwrap();
+
+    let export: export::ExportConfig =
+        yaml_serde::from_str(include_str!("../export-config.example.yaml")).unwrap();
+    export.validate().unwrap();
+
+    let storage: storage::Config =
+        yaml_serde::from_str(include_str!("../storage-config.example.yaml")).unwrap();
+    storage.validate().unwrap();
+
+    let publish: storage::Command =
+        yaml_serde::from_str(include_str!("../publish-config.example.yaml")).unwrap();
+    assert_eq!(publish.region, region::Region::Jp);
+    publish.storage.validate().unwrap();
+
+    let service: service::ServiceConfig =
+        yaml_serde::from_str(include_str!("../sirius-service-config.example.yaml")).unwrap();
+    let profile = &service.profiles["jp-full"];
+    assert_eq!(profile.region, region::Region::Jp);
+    assert!(profile.download_config.is_some() && profile.export_config.is_some());
+    assert!(profile.storage_config.is_none() && profile.input.is_none());
+}
+
 #[test]
 fn global_examples_are_anonymous_and_accept_their_catalog_locale() {
     for (name, source, locale) in [
