@@ -494,7 +494,7 @@ pub(crate) mod tests {
         let inventory = std::fs::read_to_string(verified.inventory.path()).unwrap();
         assert_eq!(inventory.lines().count(), 3);
         assert!(inventory.contains("00000/payload.bin"));
-        assert!(verify(root.path(), Region::Tw).await.is_err());
+        assert!(verify(root.path(), Region::Hk).await.is_err());
         assert!(verify(root.path(), Region::Cn).await.is_err());
         let path = root.path().join("summary.json");
         let mut summary: ExportSummary =

@@ -1,7 +1,7 @@
 # Retained export verification
 
 Run `sirius-asset-updater verify-export DIRECTORY REGION` with an explicit expected region
-(`jp`, `tw`, `en`, or `kr`). CN is reserved. This requires no game server or FFmpeg.
+(`jp`, `hk`, `en`, or `kr`). CN is reserved. This requires no game server or FFmpeg.
 Service jobs automatically verify retained exports after decoding, before reporting completion;
 the job directory receives `export-verification.json`. Validation-only exports have no retained
 payloads and cannot pass this check.

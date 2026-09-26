@@ -8,12 +8,12 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy and verified download/export pipeline |
-| `tw` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
 | `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
 | `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
-`global` is not a region. TW, EN and KR have distinct API roots and Master versions. EN and KR
+`global` is not a region. HK, EN and KR have distinct API roots and Master versions. EN and KR
 may share CDN hosts but use distinct base paths. Known production endpoints and CDN paths
 that belong to another region are rejected; custom deployment origins remain configurable.
 The `|`-separated entries returned by discovery are alternate URLs: select exactly one URL,
@@ -41,7 +41,7 @@ Global automatic Master storage is rejected until that pipeline is verified.
 ## Asset updater
 
 Configure the same region, platform, client version and protocol version as the proxy.
-`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for TW/EN/KR; it can be pinned explicitly
+`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR; it can be pinned explicitly
 when deploying a new verified bundle. `cdn_roots` matches the entire HTTPS base URL, including
 its path. Username/password environment references belong only to that configured base URL.
 Redirects remain disabled and unknown roots/references are rejected before CDN requests.
@@ -70,6 +70,29 @@ must not be parsed as the previous `catalog-UUID` naming convention.
 
 `cn` has no default API/CDN, invented area ID, copied Global protocol or fallback to JP.
 Enabling it later requires verified endpoints, login/protobuf contracts and resource behavior.
+
+## Upgrade to 1.2.1: `tw` renamed to `hk`
+
+The Global Traditional Chinese (TW/HK/MO) region is now identified as `hk`, matching the
+game's own naming (CDN paths `/prod/hk_…`, endpoints `l12-prod-hk-…`). Area ID, platform and
+protocol are unchanged.
+
+- Input: configurations, job requests, service profiles, completion targets and the
+  `verify-export` CLI argument accept the legacy `tw` only as a deprecated alias for `hk`; the
+  first use in a process logs one warning. Update inputs to `hk`; the alias may be removed later.
+- Snapshots and receipts: snapshots or receipts whose region is `tw` (from an older API proxy,
+  or written by an older updater) are read as `hk` and pass the same identity checks.
+- Output: job records, summaries, receipts, logs, publication object keys and `{region}` /
+  `{server}` storage templates always emit `hk`. **Published paths change** from `…/tw/…` to
+  `…/hk/…`; move or re-publish consumers accordingly. Existing `tw` publications are not moved.
+- Local state: job journals and completion ledgers containing `tw` are read as `hk`.
+  Completion-target identities keep their previous digest, so pending deliveries survive the
+  upgrade. Download-cache and export-cache identities now include `hk`, so entries created
+  under `tw` are simply missed and rebuilt; they can never be served to another region.
+  New job working directories are created under `hk/`; old `tw/` directories are not reused
+  and can be removed once no longer needed.
+- `regional_routes: true` builds `/api/v1/hk/…` and `/internal/v1/hk/…`, so it requires an
+  API proxy that already serves `hk` routes. Single-region proxies are unaffected.
 
 ## Multi-region API deployment
 

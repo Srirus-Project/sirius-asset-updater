@@ -698,7 +698,7 @@ async fn storage_plan_and_publication_urls_share_region_scoped_targets_without_w
     let mut provider = local(missing.clone());
     provider.public_base_url = Some("https://cdn.example/root%20path/".into());
     let mut config = config(provider);
-    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+    for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let plan = config.plan(region).unwrap();
         let target = &plan.providers[0];
         assert!(plan.preview);
@@ -712,6 +712,10 @@ async fn storage_plan_and_publication_urls_share_region_scoped_targets_without_w
         assert!(!missing.exists());
         let json = sonic_rs::to_string(&plan).unwrap();
         assert!(!json.contains("directory") && !json.contains("backend"));
+        if region == Region::Hk {
+            assert!(target.prefix.starts_with("assets/hk/publications/"));
+            assert!(!json.contains("/tw/") && !json.contains(r#""tw""#));
+        }
     }
     assert!(config.plan(Region::Cn).is_err());
     let (_tx, rx) = watch::channel(false);
@@ -1061,7 +1065,7 @@ async fn storage_region_templates_match_preview_and_actual_local_and_s3_publicat
         *bucket = "sirius-{region}".into();
     }
     server.config.providers[0].prefix = "release-{server}".into();
-    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+    for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let source = fixture_region(region);
         let preview = local_config.plan(region).unwrap();
         let directory = destination.path().join(region.name());

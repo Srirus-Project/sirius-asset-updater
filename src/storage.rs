@@ -302,7 +302,7 @@ fn storage_error(error: opendal::Error) -> Error {
 impl Config {
     /// Validate every operational Sirius region without performing storage I/O.
     pub fn validate(&self) -> Result<(), Error> {
-        for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+        for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
             self.resolved(region)?.validate_resolved()?;
         }
         Ok(())

@@ -103,8 +103,14 @@ pub(crate) fn load(configs: &[Config], forbidden: &[String]) -> Result<Vec<Targe
                 .map_err(|_| Error::Config)?;
             token.set_sensitive(true);
             let identity = hex::encode(Sha256::digest(
-                sonic_rs::to_vec(&(c.name.as_str(), c.region, url.as_str()))
-                    .map_err(|_| Error::Config)?,
+                // Hash input is frozen (hk keeps its pre-1.2.1 tag) so journaled pending
+                // deliveries keep matching their target after the region rename.
+                sonic_rs::to_vec(&(
+                    c.name.as_str(),
+                    c.region.persisted_digest_tag(),
+                    url.as_str(),
+                ))
+                .map_err(|_| Error::Config)?,
             ));
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -225,6 +231,16 @@ mod tests {
         assert_eq!(
             load(std::slice::from_ref(&c), &[]).unwrap()[0].identity,
             first
+        );
+        // hk targets keep the digest they had under the pre-1.2.1 region name.
+        let mut hk = c.clone();
+        hk.region = Region::Hk;
+        let url = hk.endpoint.clone();
+        assert_eq!(
+            load(std::slice::from_ref(&hk), &[]).unwrap()[0].identity,
+            hex::encode(Sha256::digest(
+                sonic_rs::to_vec(&(hk.name.as_str(), "tw", url.as_str())).unwrap()
+            ))
         );
         let mut changed = c.clone();
         changed.endpoint = "https://different.example/completions".into();

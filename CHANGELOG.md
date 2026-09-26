@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 (unreleased)
+
+- **Breaking:** rename the Global Traditional Chinese region from `tw` to `hk`, matching the
+  game's own identifiers (`/prod/hk_…`, `l12-prod-hk-…`). All output uses `hk`: job records,
+  summaries, receipts, logs, cache identities, regional API routes, publication object keys
+  and `{region}`/`{server}` storage templates. Published paths move from `…/tw/…` to
+  `…/hk/…`; existing publications are not relocated.
+- Accept `tw` only as a deprecated input alias for `hk` in configurations, job requests and
+  the `verify-export` CLI argument, logging one warning per process.
+- Read API snapshots and on-disk receipts/journals whose region is `tw` as `hk`, so older API
+  proxies and existing state keep working. Completion-target identities are unchanged; download
+  and export caches keyed by `tw` are missed and rebuilt rather than reused.
+- See `docs/REGIONS.md` ("Upgrade to 1.2.1") for migration notes.
+
 ## 1.2.0
 
 Restores the reusable service capabilities of the original Haruki asset updater for Sirius.

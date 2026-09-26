@@ -182,7 +182,7 @@ independent CRC32C implementation; acceptance against the deployed object store 
 
 ## Sirius region templates
 
-`{region}` expands to the selected Sirius region (`jp`, `tw`, `en`, `kr`). `{server}` is a
+`{region}` expands to the selected Sirius region (`jp`, `hk`, `en`, `kr`). `{server}` is a
 migration alias with exactly the same meaning. It does not refer to environment, platform,
 UI language, Sekai region names or S3 signing region. CN remains reserved and cannot be planned
 or published. Unknown placeholders and unmatched braces fail configuration.

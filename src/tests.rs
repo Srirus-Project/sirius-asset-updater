@@ -1394,6 +1394,88 @@ async fn crypt_provider_preserves_plaintext_builtin_bundles_and_receipts() {
 }
 
 #[test]
+fn legacy_tw_inputs_and_snapshots_are_read_as_hk_and_never_emitted() {
+    let _lock = region::tests::LEGACY_ALIAS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = "https://l12-prod-hk-a.gamerfusiontech.com/prod/hk_fixture";
+    let legacy_snapshot = format!(
+        r#"{{"stale":false,"snapshot":{{"region":"tw","schema_version":2,"environment":"release",
+        "platform":"Android","client_version":"1.0.1","protocol_version":"1.0.1","master_version":null,
+        "resource_version":"r1","platform_hash":"h1","effective_cdn_root":"{base}",
+        "credential_ref":"P","observed_at":"{}","source":"remote"}}}}"#,
+        Utc::now().to_rfc3339()
+    );
+    let mut parsed = None;
+    let warnings = region::tests::legacy_warnings(|| {
+        // Download config (YAML), API snapshot, receipt and job request all accept the alias.
+        let yaml = format!(
+            "region: tw\ngame_api_root: http://127.0.0.1:9999\ninternal_token_env: T\n\
+             environment: release\nclient_version: 1.0.1\noutput: out\n\
+             cdn_roots:\n  {base}:\n    username_env: U\n    credential_env: P\n"
+        );
+        let cfg: Config = yaml_serde::from_str(&yaml).unwrap();
+        let snapshot: SnapshotResponse = sonic_rs::from_str(&legacy_snapshot).unwrap();
+        let receipt: Receipt = sonic_rs::from_str(&format!(
+            r#"{{"snapshot":{},"catalog_url":"{base}/c","bytes":1,"sha256":"{}","downloaded_at":"{}"}}"#,
+            sonic_rs::to_string(&snapshot.snapshot).unwrap().replace(r#""hk""#, r#""tw""#),
+            "a".repeat(64),
+            Utc::now().to_rfc3339()
+        ))
+        .unwrap();
+        let request: crate::jobs::Request =
+            sonic_rs::from_str(r#"{"region":"tw","profile":"p","operation":"update"}"#).unwrap();
+        parsed = Some((cfg, snapshot, receipt, request));
+    });
+    assert_eq!(warnings, 1, "the deprecated alias warns once");
+    let (cfg, snapshot, receipt, request) = parsed.unwrap();
+    assert_eq!(cfg.region, region::Region::Hk);
+    assert!(cfg.validate().is_ok());
+    assert_eq!(
+        cfg.api_url(false, "snapshot"),
+        "http://127.0.0.1:9999/api/v1/snapshot"
+    );
+    let mut routed = cfg.clone();
+    routed.regional_routes = true;
+    assert_eq!(
+        routed.api_url(true, "snapshot"),
+        "http://127.0.0.1:9999/internal/v1/hk/snapshot"
+    );
+    assert_eq!(snapshot.snapshot.region, Some(region::Region::Hk));
+    assert_eq!(
+        snapshot.snapshot.region_identity().unwrap(),
+        region::Region::Hk
+    );
+    assert_eq!(
+        snapshot.catalog_url(&cfg, Utc::now()).unwrap(),
+        format!("{base}/asset/r1/Android/h1/catalog_main.bin")
+    );
+    assert_eq!(
+        receipt.snapshot.region_identity().unwrap(),
+        region::Region::Hk
+    );
+    assert_eq!(request.region, region::Region::Hk);
+    // Canonical snapshots and every re-serialized record use hk only.
+    let canonical = legacy_snapshot.replace(r#""tw""#, r#""hk""#);
+    assert!(sonic_rs::from_str::<SnapshotResponse>(&canonical)
+        .unwrap()
+        .catalog_url(&cfg, Utc::now())
+        .is_ok());
+    for json in [
+        sonic_rs::to_string(&snapshot).unwrap(),
+        sonic_rs::to_string(&receipt).unwrap(),
+        sonic_rs::to_string(&request).unwrap(),
+    ] {
+        assert!(json.contains(r#""region":"hk""#), "{json}");
+        assert!(!json.contains(r#""tw""#), "{json}");
+    }
+    // An hk snapshot never satisfies another Global region.
+    let mut en = cfg.clone();
+    en.region = region::Region::En;
+    assert!(snapshot.catalog_url(&en, Utc::now()).is_err());
+}
+
+#[test]
 fn regional_snapshots_require_explicit_identity_and_keep_cdn_prefixes() {
     let mut cfg = config();
     cfg.region = region::Region::En;
@@ -1422,7 +1504,7 @@ fn regional_snapshots_require_explicit_identity_and_keep_cdn_prefixes() {
     for region in [
         None,
         Some(region::Region::Jp),
-        Some(region::Region::Tw),
+        Some(region::Region::Hk),
         Some(region::Region::Kr),
         Some(region::Region::Cn),
     ] {

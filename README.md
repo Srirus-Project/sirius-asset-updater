@@ -20,7 +20,7 @@ Use an external scheduler for recurring downloads; the updater does not manage g
 
 ## Regions
 
-Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejected before
+Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. CLI configurations select one region; the job service accepts regional profiles. JP retains its existing functionality; Global
 currently supports verified server discovery/version queries and region-aware asset transport,
 not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
