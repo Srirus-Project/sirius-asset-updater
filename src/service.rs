@@ -177,6 +177,7 @@ impl Service {
                 for key in std::iter::once(&c.internal_token_env)
                     .chain(c.refresh_token_env.iter())
                     .chain(c.cdn_roots.values().map(|auth| &auth.credential_env))
+                    .chain(c.cdn_roots.values().map(|auth| &auth.username_env))
                 {
                     if let Ok(secret) = std::env::var(key) {
                         forbidden_tokens.push(secret);

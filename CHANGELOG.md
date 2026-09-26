@@ -1,6 +1,8 @@
 # Changelog
 
 ## 1.2.1 (unreleased)
+- Global assets are live-verified: full hk catalog export (13,429 resources, 953,052 files, incl. 27,741 WAV from CRI) and en/kr selections against the production CDNs, with a fully cache-hit incremental rerun.
+- dry-run readiness checks the split-ACB secret whenever a job would read it; the CDN username is included in the notification-token overlap check.
 - Shader exports raise only the total array element budget to 32,000,000 (unity-rs 0.5.2 `read_shader_text_with_limits`): a Global Unity 6000.3 URP shader has 4,010,378 elements, above the library default of 4,000,000.
 
 - Global (HK/EN/KR) asset download, verification and export. The updater accepts schema-3

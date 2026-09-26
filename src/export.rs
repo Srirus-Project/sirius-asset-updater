@@ -255,8 +255,19 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
 impl ExportConfig {
     /// Whether the CRI key a decoding export reads at start is present and parseable.
     /// Offline: reads only this process's environment and never returns the value.
+    /// Mirrors what a job reads: the CRI key for decoded media, and the split-ACB XOR secret
+    /// whenever it is configured and either media is decoded or the export cache is enabled
+    /// (the cache scope fingerprint always includes it).
     pub(crate) fn secrets_ready(&self) -> bool {
-        self.raw_only() || std::env::var(&self.cri_key_env).is_ok_and(|v| v.parse::<u64>().is_ok())
+        let cri = self.raw_only()
+            || std::env::var(&self.cri_key_env).is_ok_and(|v| v.parse::<u64>().is_ok());
+        let split = match &self.split_acb_xor_env {
+            Some(name) if self.cache_directory.is_some() || !self.raw_only() => {
+                std::env::var(name).is_ok()
+            }
+            _ => true,
+        };
+        cri && split
     }
     fn raw_only(&self) -> bool {
         self.raw_bundles
@@ -2321,6 +2332,28 @@ fn is_moc_object(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn secrets_ready_requires_the_split_acb_secret_a_job_would_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        let cri = format!("SIRIUS_TEST_CRI_{}", std::process::id());
+        let split = format!("SIRIUS_TEST_SPLIT_{}", std::process::id());
+        std::env::set_var(&cri, "1234567");
+        std::env::remove_var(&split);
+        cfg.cri_key_env = cri.clone();
+        cfg.split_acb_xor_env = None;
+        assert!(cfg.secrets_ready());
+        // Configured but unset: decoded media (and the cache fingerprint) would fail the job.
+        cfg.split_acb_xor_env = Some(split.clone());
+        assert!(!cfg.secrets_ready());
+        cfg.cache_directory = Some(root.path().join("cache"));
+        assert!(!cfg.secrets_ready());
+        std::env::set_var(&split, "90");
+        assert!(cfg.secrets_ready());
+        std::env::remove_var(&cri);
+        assert!(!cfg.secrets_ready());
+        std::env::remove_var(&split);
+    }
     #[test]
     fn shader_exports_raise_only_the_total_array_budget() {
         let defaults = unity_rs_core::shader::ShaderReadLimits::default();

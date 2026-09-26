@@ -199,3 +199,15 @@ region, `.hash` pinning before and after, in-place replacement, malformed hashes
 `dummy.net`-only mapping with rejection of other absolute hosts, receipt tampering, legacy JP
 receipts, and schema-2/JP compatibility. SplitAcb on a live Global song bundle is still
 unverified.
+
+Global live acceptance (production CDNs, user-approved): an hk service job downloaded the full
+1.0.0.104 catalog anonymously (13,429 assets, 8,237,205,585 bytes, verified; no cache hits on
+the first run). After the unity-rs 0.5.2 shader limit change, the full export completed with
+full_catalog/full_export: 13,429 resources, 953,052 files, 34,710,107,784 bytes, each file
+independently re-hashed and inventoried; 2,037 CRI resources produced 27,741 WAV outputs, which
+exercises the live ACB/SplitAcb path. A restart kept the ledger, and an incremental run reused
+13,429 of 13,429 downloads and decoded cache entries with identical output. en and kr selection
+jobs (3 assets, 19 files) passed the same audit. This supersedes the earlier note that SplitAcb
+on a live Global song bundle was unverified. dry-run readiness now also requires the split-ACB
+secret whenever a job would read it, and the CDN username joins the notification-token
+overlap check.
