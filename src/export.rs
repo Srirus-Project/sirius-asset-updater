@@ -4603,13 +4603,19 @@ pub(crate) mod tests {
             }
             assert!(worker.join().unwrap().is_err());
             assert!(started.elapsed() < Duration::from_secs(10));
-            let pid = fs::read_to_string(pid_file).unwrap();
-            assert!(!Command::new("/bin/kill")
-                .args(["-0", pid.trim()])
-                .stderr(Stdio::null())
-                .status()
+            let pid: libc::pid_t = fs::read_to_string(pid_file)
                 .unwrap()
-                .success());
+                .trim()
+                .parse()
+                .unwrap();
+            // Signal 0 probes existence without an external `kill` (absent in slim images);
+            // a zombie would still exist, so this also proves the child was reaped.
+            // SAFETY: signal 0 delivers nothing; it only checks the PID.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
         }
     }
     // Synthesized 440 Hz PCM, encoded by cridecoder. No game bytes or real keys.
