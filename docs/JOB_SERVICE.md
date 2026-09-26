@@ -121,8 +121,9 @@ The publication UUID identifies a receipt; it does not provide a public download
 Outputs are separated under `output_directory/<region>/<job-id>/`. Download output and export
 input/output paths are set by the service; other pipeline options come from the configured files.
 The `output` of a profile's download document and the `input`/`output` of its export document are
-still required and validated, then replaced for each job without a warning; the profile's own
-`input` is used only by `export`/`verify` and ignored by `update`.
+still required (the download `output` must be non-empty; the export paths are not otherwise
+checked), then replaced for each job without a warning; the profile's own `input` is used only by
+`export`/`verify` and ignored, unvalidated, by `update`.
 Use `assets` in the download configuration to request all remote resources. Omitting it remains
 catalog-only; a catalog-only result cannot pass a requested full export.
 

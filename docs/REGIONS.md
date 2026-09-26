@@ -8,9 +8,9 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy and verified download/export pipeline |
-| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots) |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); full catalog verified live |
+| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); selection verified live |
+| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); selection verified live |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 `global` is not a region. HK, EN and KR have distinct API roots and Master versions. EN and KR
@@ -43,19 +43,22 @@ Global automatic Master storage is rejected until that pipeline is verified.
 Configure the same region, platform, client version and protocol version as the proxy.
 `protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR; it can be pinned explicitly
 when deploying a new verified bundle. `cdn_roots` matches the entire HTTPS base URL, including
-its path. Username/password environment references belong only to that configured base URL.
-Redirects remain disabled and unknown roots/references are rejected before CDN requests.
+its path. Each root states its `authorization`: `basic` (the default, required for JP) with
+username/password environment references that belong only to that base URL, or `none` (HK/EN/KR
+only, see [Global assets](#global-assets-hkenkr)). Redirects remain disabled and unknown
+roots/references are rejected before CDN requests.
 
-New snapshots use schema version 2 and require explicit region identity. A regionless schema-1
-snapshot is accepted only for legacy JP/iOS/protocol-1.0.3. A mismatched or missing schema-2
-region, platform, environment, client or protocol version fails before any CDN request.
+JP snapshots use schema version 2 (a schema-3 snapshot with `catalog_layout: jp` is also
+accepted) and Global snapshots schema version 3; both require explicit region identity. A regionless schema-1 snapshot is accepted only for legacy
+JP/iOS/protocol-1.0.3. A mismatched or missing region, platform, environment, client or protocol
+version fails before any CDN request.
 Publication names contain region and platform; receipts and export summaries retain identity.
 Cache keys additionally include region, environment and platform, even for shared CDN URLs.
 Old ciphertext caches are not deleted but use a different namespace and may be downloaded again.
 
 The updater refuses to manufacture hashes or substitute an iOS/JP snapshot. Keep separate
 output, cache and export directories for each region. Real credentials and keys are never
-shipped; do not reuse JP credentials for Global.
+shipped; do not reuse JP API tokens or CDN credentials for Global.
 
 ## Global assets (HK/EN/KR)
 
@@ -68,7 +71,9 @@ snapshots unchanged.
 Schema 3 states `catalog_url`, `bundle_base_url` and `cdn_authorization` explicitly. The
 updater derives both URLs itself from the layout, the configured root, platform and resource
 version, and fails before any CDN request if they differ. A snapshot therefore cannot point
-downloads anywhere else. The Global client layout, verified live, is:
+downloads anywhere else. Download, verification and export on this layout were verified live
+against the production CDNs with a full `hk` catalog and `en`/`kr` selections. The Global
+client layout is:
 
 | Item | URL |
 | --- | --- |

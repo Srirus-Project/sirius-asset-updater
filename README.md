@@ -23,9 +23,9 @@ Use an external scheduler for recurring downloads; the updater does not manage g
 Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. CLI configurations select one region; the job service accepts regional profiles. JP retains its existing functionality; Global
 supports verified server discovery/version queries and asset download, verification and export
-from schema-3 snapshots, with anonymous CDN roots and optional localized catalogs. The CDN
-layout and access were verified live; a production end-to-end Global acceptance run is still
-pending. SDK login is not implemented. See [region support and upgrade
+from schema-3 snapshots, with anonymous CDN roots and optional localized catalogs. Global
+download, verification and export were verified live against the production CDNs: a full `hk`
+catalog and `en`/`kr` selections. SDK login is not implemented. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start
@@ -51,6 +51,7 @@ credentials (see [REMOTE_CONFIG.md](docs/REMOTE_CONFIG.md); setting both is an e
 [configuration audit](docs/HARUKI_CONFIG_AUDIT.md). `check` validates configuration
 and secret presence offline. `probe` refreshes/reads the API snapshot without contacting the CDN.
 API, internal and CDN credentials have separate scopes; API and internal tokens must differ.
+JP CDN roots use Basic credentials; Global roots are anonymous (`authorization: none`).
 `refresh_token_env` lets the updater renew version observations before and during a download.
 
 The default example downloads only the catalog. Enable `assets` to download all remote resources.

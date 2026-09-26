@@ -12,6 +12,20 @@ internal to the original, evidence given). No original field is classified as mi
 row below is either mapped or has a recorded reason. The audit covers configuration surfaces;
 production acceptance of the mapped features remains a separate release gate.
 
+**Revision for 1.2.1.** Re-verified against the 1.2.1 tree (`audit-1.2.1`, based on `e613380`),
+after `media_retry`, the `tw`→`hk` rename, Global (HK/EN/KR) assets, the shader limit raise,
+Windows fixes, remote configuration, log directives, access templates, `dry_run` and
+environment overrides. Every row was re-checked and moved line references were corrected. The
+region rows were reclassified now that Global downloads run: Sekai provider mechanics
+(URL templates, Nuverse version lookup, cookie bootstrap, manifest AES) stay not applicable,
+while the generic parts (CDN base, per-root access mode, per-region download settings) map to
+`cdn_roots` with `authorization: basic|none`, `catalog_locale` and one document per region.
+[Sirius fields with limited effect](#sirius-fields-with-limited-effect) is the reverse check. It
+covers every field in the `deny_unknown_fields` configuration structures. Every shipped example
+document is parsed, and validated where that needs no files or secrets, by
+`src/tests.rs::shipped_root_examples_parse_and_validate` and
+`global_examples_are_anonymous_and_accept_their_catalog_locale`.
+
 Every Sirius configuration struct uses `deny_unknown_fields` (for example `src/lib.rs:111`,
 `src/export.rs:22`, `src/service.rs:33`, `src/storage.rs:26`), so an original key copied
 unchanged fails loading instead of being ignored. The original enforced this only for
@@ -32,10 +46,10 @@ Sirius splits the single original file into document kinds:
 | Original | Class | Sirius |
 | --- | --- | --- |
 | `config_version` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:21`, checked at `Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:119`) | not applicable | No legacy Sirius schema to migrate; unknown shapes fail through `deny_unknown_fields` |
-| `HARUKI_CONFIG_PATH` plus search of `./`, `../`, `../../` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:241-249`) | adapted | `SIRIUS_ASSET_CONFIG_PATH`, default `sirius-asset-config.yaml`, no parent search (`src/config_source.rs:22-26`, `:100-118`). Other commands take an explicit path argument |
+| `HARUKI_CONFIG_PATH` plus search of `./`, `../`, `../../` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:241-249`) | adapted | `SIRIUS_ASSET_CONFIG_PATH`, default `sirius-asset-config.yaml`, no parent search (`src/config_source.rs:22-26`, `:97-118`). Other commands take an explicit path argument |
 | `HARUKI_CONFIG_URI=opendal://…`, `HARUKI_CONFIG_OPENDAL_SCHEME/ROOT/OPTION_*` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:24-30`, `:201-239`) | adapted | `SIRIUS_ASSET_CONFIG_URI=opendal://fs/KEY` or `opendal://s3/KEY` with typed `SIRIUS_ASSET_CONFIG_SOURCE__*`; download document only; URI plus path is an error instead of silent precedence. See [REMOTE_CONFIG.md](REMOTE_CONFIG.md) |
-| `HARUKI__A__B=value` path overrides (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/env.rs:204-260`) | reused | One prefix per document kind, same path/value rules, applied before typed decoding (`src/config_env.rs:30-40`, `:77-103`). See [CONFIG_OVERRIDES.md](CONFIG_OVERRIDES.md) |
-| `${env:VAR}` in any YAML string (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/env.rs:140-199`, `Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:105`) | not restored | Decision: secrets are typed `*_env` references (e.g. `src/lib.rs:127-141`, `src/assets.rs:37-38`, `src/storage.rs:97-101`) so values never enter parsed configuration, receipts or summaries; non-secret values use path overrides |
+| `HARUKI__A__B=value` path overrides (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/env.rs:204-260`) | reused | One prefix per document kind, same path/value rules, applied before typed decoding (`src/config_env.rs:30-40`, `:76-102`). See [CONFIG_OVERRIDES.md](CONFIG_OVERRIDES.md) |
+| `${env:VAR}` in any YAML string (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/env.rs:140-199`, `Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/load.rs:105`) | not restored | Decision: secrets are typed `*_env` references (e.g. `src/lib.rs:127-133`, `:158-167`, `src/assets.rs:37-38`, `src/storage.rs:97-101`) so values never enter parsed configuration, receipts or summaries; non-secret values use path overrides |
 | 16 targeted `HARUKI_*` overrides (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/env.rs:17-83`) | adapted | Mapped to path overrides; see the table below |
 | `RUST_LOG` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/service/logging.rs:97`) | not restored | Ignored by decision; `logging.level` accepts the original directive syntax instead ([APPLICATION_LOG.md](APPLICATION_LOG.md)) |
 | `HARUKI_FLAT_PIPELINE` (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/export/payload.rs:239-248`) | not applicable | The source documents it as a benchmark switch, "Not a supported production mode" |
@@ -91,11 +105,11 @@ certificates. Developer-feature-unified tests alone do not prove production HTTP
 
 | Original | Class | Sirius |
 | --- | --- | --- |
-| `logging.level` (default `INFO`, case-insensitive, `warning` alias, EnvFilter directives: `Haruki-Sekai-Asset-Updater@3d33ed03:src/service/logging.rs:138-156`) | adapted | `logging.level` accepts the six lowercase levels and `default[,target=level...]` (`src/application_log.rs:56-104`). Targets outside `sirius_asset_updater` (e.g. `hyper=warn`) are rejected because dependency events are never emitted. See [APPLICATION_LOG.md](APPLICATION_LOG.md) |
+| `logging.level` (default `INFO`, case-insensitive, `warning` alias, EnvFilter directives: `Haruki-Sekai-Asset-Updater@3d33ed03:src/service/logging.rs:138-156`) | adapted | `logging.level` accepts the six lowercase levels and `default[,target=level...]` (`src/application_log.rs:54-104`). Targets outside `sirius_asset_updater` (e.g. `hyper=warn`) are rejected because dependency events are never emitted. See [APPLICATION_LOG.md](APPLICATION_LOG.md) |
 | `logging.format: pretty/json` | adapted | `format: text/json` |
 | `logging.file` (in addition to stdout) | adapted | One sink: `output: stderr/stdout/file` with rotation and retention; default stderr |
 | `logging.access.enabled` (default true) | adapted | Presence of service `access_log` (`src/service.rs:45`); default off |
-| `logging.access.format` (`${time}` template) | reused | `format: template` plus `template` (`src/access_log.rs:66-73`, `:199-228`). Differences: `${path}` is the route template, `${time}` is UTC RFC 3339, unknown placeholders fail. See [ACCESS_LOG.md](ACCESS_LOG.md) |
+| `logging.access.format` (`${time}` template) | reused | `format: template` plus `template` (`src/access_log.rs:64-73`, `:199-228`). Differences: `${path}` is the route template, `${time}` is UTC RFC 3339, unknown placeholders fail. See [ACCESS_LOG.md](ACCESS_LOG.md) |
 | `logging.access.file` | reused | `access_log.output: {type: file, ...}` |
 
 ## Execution and retry (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:341-397`)
@@ -169,13 +183,14 @@ The original compiled OpenDAL `fs` and `s3`; Sirius has `local` and `s3` backend
 
 | Original | Class | Sirius |
 | --- | --- | --- |
-| `regions.<name>` map, `enabled` | adapted | Fixed `Region` enum (`src/region.rs:5`), `cn` rejected (`src/service.rs:167`); a service profile per enabled region |
-| `provider.kind: colorful_palette/nuverse` and URL templates, `profile`, `profile_hashes`, `asset_version_url`, `app_version` | not applicable | Sekai CDN URL schemes (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/regions.rs:25-120`). Sirius discovers versions from its Game API snapshot (`game_api_root`, `environment`, `client_version`, `protocol_version`, `platform`: `src/lib.rs:116-131`) and authenticated `cdn_roots` (`src/lib.rs:133`) |
-| `provider.required_cookies` / `cookie_bootstrap_url` | not applicable | Sekai cookie bootstrap (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/provider.rs:22-57`). Sirius CDN uses Basic credentials from `cdn_roots.*.username_env/credential_env`, or none for Global roots with `authorization: none` (`CdnAuth`, `src/lib.rs`) |
-| `crypto.aes_key_hex/aes_iv_hex` | not applicable | Decrypt Sekai's AES-CBC asset manifest (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/provider.rs:94-111`). Sirius bundle-prefix decryption is `assets.decrypt.{key_hex_env, nonce_seed_hex_env}` (`src/assets.rs:35-39`); CRI keys are export `cri_key_env`/`split_acb_xor_env` |
+| `regions.<name>` map, `enabled` | adapted | One download document per region with `region: jp/hk/en/kr` (`src/lib.rs:116`, `src/region.rs:13-21`) and one service profile per enabled region; `cn` is recognized but rejected (`src/lib.rs:332-334`, `src/service.rs:167`). The original keys name Sekai servers (`jp/en/tw/kr/cn`). Sirius accepts `tw` only as a deprecated input alias for its own `hk` region (`src/region.rs:25-43`), so a copied Sekai `tw` key does not select the same service |
+| `provider.kind: colorful_palette/nuverse` and URL templates, `profile`, `profile_hashes`, `asset_version_url`, `app_version` | not applicable | Sekai CDN URL schemes and version lookups (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/regions.rs:25-120`). Sirius has no URL templates for either family: `CatalogLayout::Jp/Global` (`src/lib.rs:169-186`) derives the catalog, `.hash` and bundle URLs from a validated snapshot. JP uses schema 1/2 and Global schema 3 (`src/lib.rs:423-530`), and schema 3 also states `catalog_layout`, `catalog_url`, `bundle_base_url` and `cdn_authorization`, which must equal the derived values. The version comes from the Game API snapshot (`game_api_root`, `environment`, `client_version`, `protocol_version`, `platform`: `src/lib.rs:116-131`), not from a CDN lookup such as Nuverse `asset_version_url`. Global adds a `.hash` pin before and after the run. The generic part, the CDN base URL, is a `cdn_roots` key (`src/lib.rs:133`) checked against known region hosts (`src/region.rs:75-96`) |
+| `provider.required_cookies: true` / `cookie_bootstrap_url` | not applicable | Sekai signed-cookie bootstrap, a `POST` to `issue.sekai.colorfulpalette.org/api/signature` by default (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/provider.rs:22-57`, `Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-client/src/client.rs:17`, `:113-132`). Neither Sirius family issues cookies |
+| Per-region CDN access mode (`required_cookies: false` = no credential) | adapted | Per-root `cdn_roots.*.authorization` (`src/lib.rs:147-167`): `basic` (default, required for JP) with `username_env`/`credential_env`, or `none` (HK/EN/KR only, both references omitted) with no Authorization header (`src/lib.rs:356-369`, `:710-729`). The snapshot's `cdn_authorization` and `credential_ref` must match the configured root, so a snapshot cannot turn a Basic root anonymous or the reverse (`src/lib.rs:471-479`) |
+| `crypto.aes_key_hex/aes_iv_hex` | not applicable | Decrypt Sekai's AES-CBC asset manifest (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/provider.rs:94-111`). Sirius catalogs are plain Addressables binaries in both families. Bundle-prefix decryption is `assets.decrypt.{key_hex_env, nonce_seed_hex_env}` (`src/assets.rs:35-39`), with the same values for JP and Global; CRI keys are export `cri_key_env`/`split_acb_xor_env` |
 | `runtime.unity_version` | not applicable | See [X-Unity-Version](#x-unity-version) |
-| `paths.asset_save_dir` | adapted | Download `output` (`src/lib.rs:132`); replaced by the service per job |
-| `paths.downloaded_asset_record_file` | adapted | Receipts and the verified per-resource cache |
+| `paths.asset_save_dir` | adapted | Download `output` (`src/lib.rs:132`), one per region document; replaced by the service per job |
+| `paths.downloaded_asset_record_file` | adapted | Receipts and the verified per-resource cache. Since 1.2.1, receipts also record `catalog_layout`, `bundle_base_url`, `catalog_locale` and `catalog_hash` (`src/lib.rs:234-256`) |
 | `filters.start_app` / `on_demand` | not applicable / adapted | Category split follows Sekai `AssetCategory::StartApp/OnDemand/LivePv` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/planning.rs:25-41`). Include patterns map to `assets.selection.include` and native `keys` (`src/catalog.rs:30-39`; [SELECTION.md](SELECTION.md)); no fabricated category mapping |
 | `filters.skip` | adapted | `assets.selection.exclude` (roots only; dependencies of selected roots are still downloaded) |
 | `filters.priority` | reused | `assets.selection.priority` |
@@ -183,15 +198,20 @@ The original compiled OpenDAL `fs` and `s3`; Sirius has `local` and `s3` backend
 | `export.asset_studio_types` (default `all`) | adapted | `selection.providers/unity_class_ids/embedded_audio` (`src/export_options.rs:12-16`); empty means all |
 | `export.raw_bundles.{output_dir, include, exclude}` | adapted | Export `raw_bundles` (`src/raw_bundles.rs:13-18`); see [Raw bundles](#raw-bundles) |
 | `export.haruki_3d.*` (18 fields, `Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:772-791`) | not applicable | Sekai 3D model/FBX exporter, `role_character3d_ids`, master data; removed by policy |
-| `export.usm.export/decode`, `export.acb.export/decode` | adapted | `selection.providers`, `selection.embedded_audio`, `cri.acb/usm: decode/preserve` (`src/export_options.rs:413-416`); see [CRI stage evidence](#cri-stage-evidence) |
+| `export.usm.export/decode`, `export.acb.export/decode` | adapted | `selection.providers`, `selection.embedded_audio`, `cri.acb/usm: decode/preserve` (`src/export_options.rs:414-418`); see [CRI stage evidence](#cri-stage-evidence) |
 | `export.hca.decode` | not restored | Destructive in the original; see [CRI stage evidence](#cri-stage-evidence) |
-| `export.images.formats` (default `[png]`) | adapted | `image:` single rendition or list of 1..5 (`src/export_options.rs:155-204`); `jpg` becomes `{format: jpeg, quality, background}`; BMP/TGA added |
+| `export.images.formats` (default `[png]`) | adapted | `image:` single rendition or list of 1..5 (`src/export_options.rs:155-213`); `jpg` becomes `{format: jpeg, quality, background}`; BMP/TGA added |
 | `export.video.formats` (default `[mp4]`) | adapted | `video: source/mkv/mp4/mkv_and_mp4` (`src/export_options.rs:228-234`), default `mkv`; native M2V/IVF always retained |
 | `export.video.direct_mp4` | not restored | See [direct_mp4](#videodirect_mp4) |
-| `export.audio.formats` (default `[mp3]`) | adapted | `audio:` scalar or list (`src/export_options.rs:218-222`), default `wav`; MP3 without FLAC keeps WAV |
+| `export.audio.formats` (default `[mp3]`) | adapted | `audio:` scalar or list (`src/export_options.rs:218-223`, `:238-286`), default `wav`; MP3 without FLAC keeps WAV |
 | `upload.enabled` / `providers` | adapted | Service profile `storage_config` (`src/service.rs:92`), or the `publish` command |
 | `upload.public_read.include/exclude` | adapted | Per-S3-provider `public_read_include/exclude` (`src/storage.rs:91-93`) |
 | `upload.remove_local_after_upload` | reused | Storage `remove_local_after_upload` (`src/storage.rs:40`) |
+
+Sirius region additions without an original field: `platform`, `protocol_version`,
+`regional_routes`, `refresh_token_env`, and, for Global, `catalog_locale: en/zh-Hant/zh-Hans/ko`,
+which selects `catalog_{version}_{locale}.bin` and is rejected for JP (`src/lib.rs:136-142`,
+`:348-355`; [REGIONS.md](REGIONS.md#global-assets-hkenkr)).
 
 ## Git sync (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:605-630`)
 
@@ -211,12 +231,12 @@ hashes (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/git_sync.rs`). Sirius has 
 
 | Original | Class | Sirius |
 | --- | --- | --- |
-| `region` | reused | Submission `region` (`src/service.rs:824-830`) |
+| `region` | reused | Submission `region` (`src/service.rs:824-830`), one of `jp/hk/en/kr`; `tw` is accepted only as the deprecated alias of `hk`, and job records emit `hk` |
 | (region config implied) | adapted | `profile` selects a configured profile; callers never supply paths |
 | `mode: update` | reused | `operation: update`; `export`, `verify` and `POST /api/v1/jobs/{id}/retry` added |
 | `mode: prefetch_raw_bundles` | adapted | A profile with `download_config` and no `export_config` downloads and verifies only; `raw_bundles.mode: only` publishes bundles |
 | `asset_version` / `asset_hash` | not applicable | Fill Colorful Palette URL templates; Nuverse ignores them (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/regions.rs:47-70`, `:98-101`). Sirius takes versions from the verified snapshot; caller-pinned versions are not supported |
-| `dry_run` | adapted | Optional `dry_run` returns a synchronous plan and creates no job (`src/service.rs:1021-1029`); the original queued a job that stopped after planning (`Haruki-Sekai-Asset-Updater@3d33ed03:src/service/jobs/runner.rs:128`). See [JOB_SERVICE.md](JOB_SERVICE.md) |
+| `dry_run` | adapted | Optional `dry_run` returns a synchronous plan and creates no job (`src/service.rs:1025-1033`); the original queued a job that stopped after planning (`Haruki-Sekai-Asset-Updater@3d33ed03:src/service/jobs/runner.rs:128`). See [JOB_SERVICE.md](JOB_SERVICE.md) |
 
 ## Recorded decisions
 
@@ -236,37 +256,71 @@ select, so the switch is not exposed; copying it fails as an unknown field.
 The original sends `runtime.unity_version` only as an `X-Unity-Version` request header
 (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-client/src/client.rs:70-73`, set from `Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/pipeline.rs:69`), which
 is part of its Sekai CDN client. The Sirius catalog/resource client sends its own User-Agent,
-Basic origin credentials and no Unity header (`src/proxy.rs:56-87`). Production download runs
-recorded in [RESTORATION_1_2.md](RESTORATION_1_2.md) used this client. Whether the Sirius CDN
-behaves differently when the header is present was not investigated; no field is exposed.
+Basic origin credentials only for `basic` roots, and no Unity header (`src/proxy.rs:56-87`,
+`src/lib.rs:710-729`). The JP production runs recorded in
+[RESTORATION_1_2.md](RESTORATION_1_2.md) used this client, and so did the live Global runs
+against anonymous roots (a Unity 6000.3 client, see the shader limit in `src/export.rs:103-114`).
+Whether either CDN behaves differently when the header is present was not investigated; no
+field is exposed.
 
 ### Paths replaced by the service
 
 Service jobs replace the download document's `output` and the export document's
 `input`/`output` with per-job directories under `output_directory/<region>/<job-id>/`
-(`src/service.rs:523`, `:590-591`). The fields are still required and validated when the
-service starts; the replacement is documented in [JOB_SERVICE.md](JOB_SERVICE.md) and emits
-no warning. Profile `input` is used only by `export`/`verify`; `update` ignores it and uses its
-own download (`src/service.rs:93`, `:514-546`).
+(`src/service.rs:523`, `:590-591`). The fields are still required. At service start the
+download `output` must be non-empty (`src/lib.rs:374`). The export `input`/`output` are only
+required keys: `ExportConfig::validate` does not inspect them (`src/export.rs:269-311`), so any
+value passes, including an empty one. The replacement is documented in
+[JOB_SERVICE.md](JOB_SERVICE.md) and emits no warning. Profile `input` is used only by
+`export`/`verify`. `update` ignores it without validating it and uses its own download
+(`src/service.rs:94`, `:97-103`, `:514-546`).
 
 ### Raw-only exports
 
 With `raw_bundles.mode: only`, the exporter copies matching Unity bundles and returns before any
-decoder runs (`src/export.rs:652-659`). The following settings are still parsed and validated
+decoder runs (`src/export.rs:660-667`). The following settings are still parsed and validated
 but have no effect in that mode: `read_kinds`, `cri`, `image`, `audio`, `video`, `media_backend`
 (an `ffi` value still requires an FFI-capable build), `stage_limits` caps, `media_concurrency`,
 `media_timeout_seconds`, `media_retry`, `split_acb_xor_env`, `selection.unity_class_ids` and
-`selection.embedded_audio`. `cri_key_env` and `ffmpeg` may be omitted (`src/export.rs:260`).
+`selection.embedded_audio`. `cri_key_env` and `ffmpeg` may be omitted (`src/export.rs:273`).
 `selection.providers`, `paths`, `concurrency`, `cpu` and byte limits still apply. The inert
-output-affecting values are recorded in the summary (`src/export.rs:456-470`) and in the
+output-affecting values are recorded in the summary (`src/export.rs:465-488`) and in the
 decoded-cache scope (`src/export_cache.rs:77-105`), so changing them invalidates cached entries;
 the scheduling-only `stage_limits`, `media_concurrency`, `media_timeout_seconds` and `media_retry`
 are in neither. The summary always
-reports `full_export: false`. No warning is emitted.
+reports `full_export: false`. No warning is emitted. One exception to "no effect": when
+`cache_directory` is set, the cache scope resolves `split_acb_xor_env` if it is configured
+(`src/export_cache.rs:71-75`), so a raw-only export with a configured but unset variable fails
+with `secret_unavailable`. The dry-run `secrets_ready` still reports `true` for raw-only
+(`src/export.rs:258-260`).
 
 ### Media command retry
 
 See the `execution.retry` rows: FFmpeg command retry is restored as opt-in `media_retry` (default one attempt).
+
+## Sirius fields with limited effect
+
+Reverse check. Every field of the `deny_unknown_fields` configuration structures was traced to
+a read outside tests. The structures are: download `Config` and `CdnAuth`,
+`network::{Network, Retry}`, `proxy::ProxyConfig`, `assets::{AssetConfig, DecryptConfig}`,
+`catalog::Selection`, `ExportConfig`, `export_options::{Selection, ImageExport, CriExport,
+MediaRetry}`, `read_policy::Policy`, `raw_bundles::Config`, `cpu_policy::Config`,
+`cpu_throttle::Config`, `stage_limits::Config`, `storage::{Config, Provider, Backend,
+S3WriteOptions, Command}`, `storage_credentials::Config`, `storage_sts::Config`,
+`config_source::{Source, FsSource, S3Source}`, `service::{ServiceConfig, Profile}`,
+`server::TlsConfig`, `access_log::{Config, Output}`, `application_log::Config`,
+`completion_notify::Config`, and the HTTP `Submission`/`jobs::Request`. No field is read and then
+discarded in every mode. The cases where an accepted field has no effect or only a partial one:
+
+| Field | Behavior | Documented in |
+| --- | --- | --- |
+| Download `output`, export `input`/`output` of a service profile | Replaced per job, no warning; export paths are not validated | [Paths replaced by the service](#paths-replaced-by-the-service), [JOB_SERVICE.md](JOB_SERVICE.md) |
+| Profile `input` on `update` | Ignored and not validated; used by `export`/`verify` | Same |
+| Decoder/media settings with `raw_bundles.mode: only` | Parsed and validated, no effect; output-affecting ones still change cache identity | [Raw-only exports](#raw-only-exports) (the full list is only here; [EXPORT_OPTIONS.md](EXPORT_OPTIONS.md#raw-unity-bundles) names only the omittable `cri_key_env`/`ffmpeg`) |
+| `split_acb_xor_env` with `cache_directory` | Resolved when the cache opens, also for raw-only exports; the dry-run `secrets_ready` checks only `cri_key_env` | This section and [Raw-only exports](#raw-only-exports) |
+| `logging` in a service profile's download/export document | Rejected at start and per job, not ignored (`src/service.rs:173`, `:190`, `:520`, `:576`) | [APPLICATION_LOG.md](APPLICATION_LOG.md) |
+| `SIRIUS_ASSET__*` / `SIRIUS_ASSET_EXPORT__*` overrides under `serve` | Apply to every profile's document of that kind; a Global-only value such as `catalog_locale` then fails JP profiles | [CONFIG_OVERRIDES.md](CONFIG_OVERRIDES.md) |
+| `catalog_locale` | The localized `.hash` is pinned for stability only; only the base catalog's hash is compared with `platform_hash` (`src/lib.rs:826`) | [REGIONS.md](REGIONS.md#global-assets-hkenkr) |
 
 ## Changed defaults and limits
 
@@ -289,6 +343,7 @@ See the `execution.retry` rows: FFmpeg command retry is restored as opt-in `medi
 | Log level | `INFO`, case-insensitive, `warning` | lowercase only |
 | Log output | stdout, plus optional file | one sink, default stderr |
 | Access log | on, stdout | off unless `access_log` is present |
+| CDN access | optional per-region cookie bootstrap | per-root `authorization`, default `basic`; `none` only for HK/EN/KR |
 | `asset_http_version` env aliases | accepted | only `auto`/`http1` |
 | Environment booleans | `1/0/yes/no/on/off` | YAML `true`/`false` |
 | Unknown keys | ignored in most sections | rejected everywhere |
@@ -349,7 +404,7 @@ only selects those classes. `animator_bundle_fbx` appears in payload naming and 
 handling (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/export/payload/manifest.rs:85`) and tests, with no
 producer at this baseline. Conclusion: no FBX animation requirement follows from the selector or
 payload label. Sirius `auto` writes type-tree JSON for classes without an adapter
-(`src/export.rs:1087-1093`); an operator wanting the original's raw fallback selects
+(`src/export.rs:1096-1102`); an operator wanting the original's raw fallback selects
 `object_raw` for class 95/91. This does not prove every animation payload decodes, nor parity
 with external AssetStudio tools.
 
