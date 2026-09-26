@@ -100,6 +100,19 @@ pub struct ExportConfig {
     #[serde(default = "max_output")]
     pub max_resource_output_bytes: u64,
 }
+/// Shader read budgets for exports. Output stays bounded by the resource output limit; the
+/// total array element budget is raised over unity-rs' 4,000,000 default because a Global
+/// Unity 6000.3 URP gacha-animation shader carries 4,010,378 elements (live hk catalog
+/// 1.0.0.104). Individual arrays, strings, blobs and decompressed bytes keep the defaults.
+pub(crate) const SHADER_MAX_TOTAL_ARRAY_ELEMENTS: usize = 32_000_000;
+fn shader_limits(maximum_output_bytes: u64) -> unity_rs_core::shader::ShaderReadLimits {
+    unity_rs_core::shader::ShaderReadLimits {
+        maximum_output_bytes,
+        maximum_total_array_elements: SHADER_MAX_TOTAL_ARRAY_ELEMENTS,
+        ..unity_rs_core::shader::ShaderReadLimits::default()
+    }
+}
+
 fn default_media_concurrency() -> usize {
     2
 }
@@ -1057,7 +1070,7 @@ impl ExportConfig {
                             Err(error) => return Err(err(error)),
                         }
                     }
-                    48 => match object.read_shader_text(limit) {
+                    48 => match object.read_shader_text_with_limits(shader_limits(limit)) {
                         Ok(bytes) => (bytes, "shader", "shader_text"),
                         Err(unity_rs_core::Error::Unsupported(_)) if read_kind == Kind::Auto => (
                             object
@@ -2308,6 +2321,22 @@ fn is_moc_object(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn shader_exports_raise_only_the_total_array_budget() {
+        let defaults = unity_rs_core::shader::ShaderReadLimits::default();
+        let limits = super::shader_limits(1234);
+        assert_eq!(limits.maximum_output_bytes, 1234);
+        assert_eq!(limits.maximum_total_array_elements, 32_000_000);
+        assert!(limits.maximum_total_array_elements > 4_010_378);
+        assert_eq!(
+            unity_rs_core::shader::ShaderReadLimits {
+                maximum_output_bytes: defaults.maximum_output_bytes,
+                maximum_total_array_elements: defaults.maximum_total_array_elements,
+                ..limits
+            },
+            defaults
+        );
+    }
     use super::*;
     fn config(root: &Path) -> ExportConfig {
         ExportConfig {

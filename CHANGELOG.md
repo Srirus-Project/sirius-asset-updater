@@ -1,6 +1,7 @@
 # Changelog
 
 ## 1.2.1 (unreleased)
+- Shader exports raise only the total array element budget to 32,000,000 (unity-rs 0.5.2 `read_shader_text_with_limits`): a Global Unity 6000.3 URP shader has 4,010,378 elements, above the library default of 4,000,000.
 
 - Global (HK/EN/KR) asset download, verification and export. The updater accepts schema-3
   snapshots with an explicit `catalog_layout`, `catalog_url`, `bundle_base_url` and

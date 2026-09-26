@@ -3133,9 +3133,9 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unity-rs-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff714b06b733bbc085c77c60165ab482500c81d2b2ff0b69e9e3292cba012b33"
+checksum = "dc7c9499ffbb44ff3a257633c8e94aa11dec4571b27b0bb8693f02186fcf7251"
 dependencies = [
  "brotli",
  "crc32fast",
