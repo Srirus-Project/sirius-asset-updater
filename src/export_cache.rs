@@ -299,6 +299,8 @@ impl Cache {
         let mut metadata = fs::File::create(work.path().join("entry.json")).map_err(err)?;
         metadata.write_all(&bytes).map_err(err)?;
         metadata.sync_all().map_err(err)?;
+        // Windows refuses to rename a directory while any file inside it is open.
+        drop(metadata);
         self.check_cancel()?;
         let target = self.root.join(id);
         if let Ok(meta) = fs::symlink_metadata(&target) {
