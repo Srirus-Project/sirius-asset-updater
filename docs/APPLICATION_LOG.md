@@ -26,10 +26,10 @@ the level of the longest configured target equal to its target or a `::`-separat
 prefix of it (`sirius_asset_updater::exp` does not cover `sirius_asset_updater::export`),
 otherwise the default. Levels are the six lowercase names above; case variants, `warning`,
 bare targets, empty items and whitespace are rejected rather than normalized. Directives are
-bounded to 1024 bytes and 64 targets; targets are non-empty ASCII `[A-Za-z0-9_:]` and must not
-repeat. Invalid values fail configuration loading. Directives only lower or raise application
-targets: dependency targets such as `hyper=warn` are accepted for configuration portability but
-remain disabled, and `RUST_LOG` is still ignored.
+bounded to 1024 bytes (and at most 64 targets); targets are ASCII `[A-Za-z0-9_:]`, must not repeat and
+must be `sirius_asset_updater` or one of its `::` modules. Dependency targets such as the
+original's `hyper=warn` are rejected: dependency events are never emitted, so such a directive
+could not take effect. Invalid values fail configuration loading. `RUST_LOG` is still ignored.
 Output is `{type: stderr}`, `{type: stdout}`, or a file as shown above. Stdout output is
 explicitly opt-in because it interleaves logs with CLI JSON/command output; prefer stderr
 or files for scripting. Existing CLI usage/error diagnostics and failures before logger

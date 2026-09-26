@@ -85,7 +85,9 @@ impl std::str::FromStr for Levels {
         for item in items {
             let (target, level) = item.split_once('=').ok_or_else(invalid)?;
             let level = Level::parse(level).ok_or_else(invalid)?;
-            if target.is_empty()
+            // Only application targets are ever emitted; a dependency target such as
+            // `hyper` could never match, so accepting it would be a silently ignored setting.
+            if !(target == APP_TARGET || target.starts_with(APP_PREFIX))
                 || !target
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')

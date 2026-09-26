@@ -2892,14 +2892,26 @@ fn application_log_level_directives_parse_strictly() {
         "level: off",
         "level: trace",
         "level: 'warn,sirius_asset_updater::export=debug'",
-        "level: 'info,hyper=warn,sirius_asset_updater=error,sirius_asset_updater::jobs=off'",
+        "level: 'info,sirius_asset_updater=error,sirius_asset_updater::jobs=off'",
     ] {
         assert!(parse(text), "{text}");
     }
-    let many = (0..64).map(|i| format!(",t{i}=debug")).collect::<String>();
+    // Dependency targets can never match the application-only layer, so they are refused.
+    for text in [
+        "level: 'info,hyper=warn'",
+        "level: 'info,sirius_asset_updater_x=warn'",
+    ] {
+        assert!(!parse(text), "{text}");
+    }
+    // Application-prefixed targets make the 1024-byte bound the binding limit
+    // (the 64-target cap stays as a second guard).
+    let many = (0..30)
+        .map(|i| format!(",sirius_asset_updater::t{i}=debug"))
+        .collect::<String>();
+    assert!(many.len() < 1020);
     assert!(format!("info{many}").parse::<Levels>().is_ok());
     let wide = (0..9)
-        .map(|i| format!(",t{i}_{}=debug", "x".repeat(110)))
+        .map(|i| format!(",sirius_asset_updater::t{i}_{}=debug", "x".repeat(110)))
         .collect::<String>();
     for text in [
         String::new(),
@@ -2907,20 +2919,19 @@ fn application_log_level_directives_parse_strictly() {
         "warning".into(),
         "info,".into(),
         ",info".into(),
-        "info,,a=debug".into(),
+        "info,,sirius_asset_updater::a=debug".into(),
         "info,debug".into(),
-        "info,a".into(),
+        "info,sirius_asset_updater::a".into(),
         "info,=debug".into(),
-        "info,a=verbose".into(),
-        "info,a=".into(),
-        "info,a b=debug".into(),
-        "info, a=debug".into(),
-        "info,a-b=debug".into(),
-        "info,a.b=debug".into(),
-        "info,a=debug=trace".into(),
-        "info,a=debug,a=trace".into(),
+        "info,sirius_asset_updater::a=verbose".into(),
+        "info,sirius_asset_updater::a=".into(),
+        "info,sirius_asset_updater::a b=debug".into(),
+        "info, sirius_asset_updater::a=debug".into(),
+        "info,sirius_asset_updater::a-b=debug".into(),
+        "info,sirius_asset_updater::a.b=debug".into(),
+        "info,sirius_asset_updater::a=debug=trace".into(),
+        "info,sirius_asset_updater::a=debug,sirius_asset_updater::a=trace".into(),
         "sirius_asset_updater=debug".into(),
-        format!("info{many},t64=debug"),
         format!("info{wide}"),
     ] {
         assert!(text.parse::<Levels>().is_err(), "{text}");
@@ -2943,7 +2954,7 @@ fn application_log_level_directives_filter_emitted_events_by_target() {
     let path = directory.path().join("application.log");
     let config = application_log::Config {
         level: "warn,sirius_asset_updater::export=debug,sirius_asset_updater::export::cache=off,\
-                sirius_asset_updater::exp=trace,hyper=trace"
+                sirius_asset_updater::exp=trace"
             .parse()
             .unwrap(),
         format: Format::Json,
