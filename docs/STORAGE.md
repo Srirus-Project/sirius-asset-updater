@@ -40,8 +40,16 @@ omits the field. For example, base `https://cdn.example/storage/` with prefix `a
 This URL is configured routing information, not proof of anonymous availability. No CDN probe
 or public-access change is performed; configure matching CDN paths and ACL/bucket policies.
 Sirius profiles may use the region templates described below. The region is always added to
-the immutable publication key by the updater. Mutable publication
-registries and notifications remain separate restoration work.
+the immutable publication key by the updater. The original updater has no publication
+registry, `latest` pointer or publication notification: it overwrites exported files at stable
+`prefix/relative-path` keys (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/storage.rs:96-181`,
+`:234-245`), and its only other mutable state object is the incremental download record
+(`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/download_records.rs:96-130`; see
+[HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md)). Its chart-hash Git sync is Sekai-specific and
+not applicable. There is therefore nothing to restore here. Sirius adds its own
+[completion notifications](JOB_SERVICE.md#completion-notifications) for verified jobs; a
+consumer-facing master registry belongs to the API requirements in
+[RESTORATION_1_2.md](RESTORATION_1_2.md), not to the updater.
 
 ## S3 public-read policy
 
@@ -251,7 +259,7 @@ implemented mappings from operations the immutable publication pipeline does not
 | skip_signature / allow_anonymous | Not exposed: publication and read-back require configured authenticated storage; public-read ACLs do not disable signing |
 
 General AWS SDK provider-chain parity is not claimed: process/SSO/metadata discovery is not
-exposed. Notifications/registry integration and production acceptance are also not completed by this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
+exposed. Production acceptance is not completed by this mapping. Do not pass original options unchanged or assume unsupported keys are ignored.
 
 
 ### Default S3 object ACL
