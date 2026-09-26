@@ -120,6 +120,9 @@ The publication UUID identifies a receipt; it does not provide a public download
 
 Outputs are separated under `output_directory/<region>/<job-id>/`. Download output and export
 input/output paths are set by the service; other pipeline options come from the configured files.
+The `output` of a profile's download document and the `input`/`output` of its export document are
+still required and validated, then replaced for each job without a warning; the profile's own
+`input` is used only by `export`/`verify` and ignored by `update`.
 Use `assets` in the download configuration to request all remote resources. Omitting it remains
 catalog-only; a catalog-only result cannot pass a requested full export.
 
@@ -174,7 +177,9 @@ already-held local slot. Auto backend fallback releases the FFI slot before reac
 Standalone CLI exports retain their existing per-export limit without a service-level cap.
 
 This controls simultaneous operations, not FFmpeg's internal thread count or total process RSS.
-Apply deployment CPU/memory limits separately. The remaining original CPU/stage tuning controls are separate restoration work. The service budget
+Apply deployment CPU/memory limits separately. Per-export CPU sizing, stage limits and throttling are
+configured in export profiles (`cpu`, `stage_limits`; see [EXPORT.md](EXPORT.md) and
+[EXPORT_OPTIONS.md](EXPORT_OPTIONS.md)); `max_cpu_stages` is the service-wide pool. The service budget
 does not change cache identity or output formats.
 
 ## Shared upload budget

@@ -45,7 +45,8 @@ cp sirius-asset-config.example.yaml sirius-asset-config.yaml
 backend described by typed `SIRIUS_ASSET_CONFIG_SOURCE__*` variables with environment-referenced
 credentials (see [REMOTE_CONFIG.md](docs/REMOTE_CONFIG.md); setting both is an error).
 `SIRIUS_ASSET__A__B=value` style variables override individual fields, also after a remote fetch
-(see [CONFIG_OVERRIDES.md](docs/CONFIG_OVERRIDES.md)). `check` validates configuration
+(see [CONFIG_OVERRIDES.md](docs/CONFIG_OVERRIDES.md)); migrating original Haruki settings is covered by the
+[configuration audit](docs/HARUKI_CONFIG_AUDIT.md). `check` validates configuration
 and secret presence offline. `probe` refreshes/reads the API snapshot without contacting the CDN.
 API, internal and CDN credentials have separate scopes; API and internal tokens must differ.
 `refresh_token_env` lets the updater renew version observations before and during a download.

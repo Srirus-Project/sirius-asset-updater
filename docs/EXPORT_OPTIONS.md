@@ -76,9 +76,11 @@ policy or a non-auto policy claiming full native export. Legacy summaries withou
 the default auto policy. Every output still carries object identity and participates in hashes,
 resource limits, staging and publication verification.
 
-This restores general representation control and the native modes listed above. Animator
-and other original dispatch modes still require separate adapter/fixture audits. Unknown modes are rejected; no setting is
-accepted as an unimplemented placeholder.
+This restores general representation control and the native modes listed above. The original
+had no Animator-specific reader: Animator/AnimatorController used its generic type-tree JSON path
+(with raw fallback), which `auto`/`typetree_json`/`object_raw` and exact class overrides cover; see
+[HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md#unity-object-representation-and-animator). Unknown
+modes are rejected; no setting is accepted as an unimplemented placeholder.
 
 ## Texture arrays
 
@@ -231,9 +233,15 @@ and its alpha rendition is also lossy. Native alpha streams remain intact.
 
 Video mode is recorded in schema-4 summaries and participates in decoded-cache identity.
 Existing configurations keep MKV behavior; existing summaries without `video` read as MKV.
-The active backend remains the configured FFmpeg executable for media and native Rust for
-Unity/CRI parsing. FFI/backend-choice restoration remains a separate audit item; no ignored
-backend setting is exposed.
+Unity/CRI parsing is native Rust. FLAC/MP3/MP4 encoding uses the configured `media_backend`
+(`cli` default, `ffi`, `auto`; see [MEDIA_FFI.md](MEDIA_FFI.md)); stream-copy muxing, ADX decoding
+and independent verification always use the configured FFmpeg executable.
+
+The original `video.direct_mp4` switch is intentionally not restored. In the original it only
+applied when MP4 was the sole video format and made FFmpeg read the USM container directly,
+producing MP4 without an M2V. Sirius demuxes USM natively, always retains the elementary stream
+as the preservation output and verifies every container's frame count against USM metadata, so
+there is no MP4-only output shape to select. See [HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md).
 
 ## Receipts and completeness
 
@@ -277,7 +285,7 @@ is opt-in through [CPU worker sizing](EXPORT.md#cpu-worker-sizing). Each worker 
 `max_in_flight_bundle_bytes` and OS memory limits before increasing the worker count for large
 assets. Media admission remains separately bounded by `media_concurrency` and the service's
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
-can multiply resource workers across regions. Sampled CPU throttling is described in [CPU policy](EXPORT.md#sampled-cpu-throttling); automatic sizing of individual stages remains restoration work.
+can multiply resource workers across regions. Sampled CPU throttling is described in [CPU policy](EXPORT.md#sampled-cpu-throttling); automatic sizing of individual stages is described under [Automatic stage widths](#automatic-stage-widths).
 
 ## Independent decoder stages
 

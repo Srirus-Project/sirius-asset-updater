@@ -22,6 +22,10 @@ SIRIUS_ASSET_EXPORT__IMAGE__0__FORMAT=webp
 SIRIUS_ASSET__LOGGING__LEVEL=debug
 ```
 
+The original's targeted variables (`HARUKI_MEDIA_BACKEND`, `HARUKI_CPU_BUDGET_RATIO`, ...) have no
+separate names; their path equivalents are listed in
+[HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md#loading-environment-and-remote-configuration).
+
 Overrides are applied to the parsed YAML before typed decoding, so they are subject to the same
 `deny_unknown_fields` rules and validation as file contents: a misspelled path or wrong type is a
 configuration error, not a silently ignored setting. Descending through a scalar or indexing a

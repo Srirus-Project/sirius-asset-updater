@@ -144,7 +144,7 @@ and complete a multipart publication against a local fixture; cloud bucket/KMS a
 remains a deployment test.
 
 This restores specific generic options, not arbitrary OpenDAL option passthrough. Endpoint,
-credentials, addressing and ACLs retain their explicit typed fields. Other scalar options remain under audit; unsupported fields fail instead of being silently
+credentials, addressing and ACLs retain their explicit typed fields. Other original scalar options are mapped or ruled out in the option table below; unsupported fields fail instead of being silently
 ignored. Supported region-template migration is described below.
 
 
