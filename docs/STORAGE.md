@@ -17,7 +17,9 @@ mode requires a DNS endpoint and a bucket without dots, matching the backend/TLS
 disables implicit AWS configuration/metadata credentials and proxy discovery, and never follows
 redirects. No credentials, endpoints or signed requests appear in publication receipts or errors.
 Local destination roots must not overlap the export tree. Both trees must be owned by the updater
-and immutable to other writers; these checks are not a filesystem security boundary.
+and immutable to other writers; these checks are not a filesystem security boundary. A local
+destination stages each object under `<directory>/.staging` before moving it into place; object
+keys and publication prefixes are `/`-separated on every platform, including Windows.
 
 ## Target preview and public URLs
 

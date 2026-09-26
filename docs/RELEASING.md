@@ -26,7 +26,8 @@ Never include real configuration, credentials, game assets or private research.
 ## Publication gate
 
 The release workflow tests and smoke-tests every advertised host archive before creating a
-GitHub Release. A failed target prevents publication. The API archive must include protocol/;
+GitHub Release. CI also runs the default-feature test suite on `windows-latest` for every change,
+so Windows regressions surface before a release build. A failed target prevents publication. The API archive must include protocol/;
 the updater archive includes export configuration and documents the external FFmpeg dependency.
 Both include examples, documentation, licenses, a per-file manifest and archive checksums.
 
