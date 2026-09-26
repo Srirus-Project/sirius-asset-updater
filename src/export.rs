@@ -191,6 +191,11 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
 impl ExportConfig {
+    /// Whether the CRI key a decoding export reads at start is present and parseable.
+    /// Offline: reads only this process's environment and never returns the value.
+    pub(crate) fn secrets_ready(&self) -> bool {
+        self.raw_only() || std::env::var(&self.cri_key_env).is_ok_and(|v| v.parse::<u64>().is_ok())
+    }
     fn raw_only(&self) -> bool {
         self.raw_bundles
             .as_ref()

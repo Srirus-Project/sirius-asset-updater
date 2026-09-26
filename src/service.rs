@@ -116,11 +116,19 @@ struct Inner {
     completion_targets: Vec<crate::completion_notify::Target>,
     completion_states: Mutex<Vec<crate::completion_notify::DeliveryState>>,
     accepting: AtomicBool,
+    /// Raised with `accepting` so in-flight dry-run planning stops on shutdown.
+    closing: watch::Sender<bool>,
     media_gate: Arc<crate::media_gate::Gate>,
     cpu_gate: Arc<crate::media_gate::Gate>,
     upload_gate: Arc<tokio::sync::Semaphore>,
     download_gate: Arc<tokio::sync::Semaphore>,
     resource_budget: Option<Arc<crate::resource_budget::Budget>>,
+}
+impl Inner {
+    fn stop_accepting(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.closing.send_replace(true);
+    }
 }
 impl Service {
     pub fn open(config: ServiceConfig) -> Result<Self, Error> {
@@ -254,6 +262,7 @@ impl Service {
                 completion_targets,
                 completion_states,
                 accepting: AtomicBool::new(true),
+                closing: watch::Sender::new(false),
                 media_gate: Arc::default(),
                 cpu_gate: Arc::default(),
             }),
@@ -367,7 +376,7 @@ impl Service {
         loop {
             if *shutdown.borrow() {
                 stopping = true;
-                self.inner.accepting.store(false, Ordering::Release);
+                self.inner.stop_accepting();
             }
             if stopping {
                 for control in controls.values() {
@@ -409,7 +418,7 @@ impl Service {
                         Err(_) => {
                             storage_error = true;
                             stopping = true;
-                            self.inner.accepting.store(false, Ordering::Release);
+                            self.inner.stop_accepting();
                             break;
                         }
                     }
@@ -434,10 +443,10 @@ impl Service {
                 }
                 _=self.inner.wake.notified()=>{},
                 _=tokio::time::sleep(Duration::from_millis(250))=>{},
-                _=shutdown.changed(),if !stopping=>{stopping=true;self.inner.accepting.store(false,Ordering::Release);},
+                _=shutdown.changed(),if !stopping=>{stopping=true;self.inner.stop_accepting();},
             }
         }
-        self.inner.accepting.store(false, Ordering::Release);
+        self.inner.stop_accepting();
         if storage_error {
             Err(Error::Io)
         } else {
@@ -809,6 +818,179 @@ async fn detail(State(service): State<Service>, HttpPath(id): HttpPath<String>) 
         None => failure(JobError::NotFound),
     }
 }
+/// HTTP submission body. `dry_run` is transport-only and never reaches the persisted [`Request`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Submission {
+    region: Region,
+    profile: String,
+    operation: Operation,
+    #[serde(default)]
+    dry_run: bool,
+}
+/// Offline preview of what a submission would run. It deliberately omits filesystem paths,
+/// URLs, environment variable names and storage prefixes, matching the job status contract.
+#[derive(Serialize)]
+struct DryRunPlan {
+    dry_run: bool,
+    ready: bool,
+    issues: Vec<&'static str>,
+    request: Request,
+    steps: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download: Option<DownloadPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export: Option<ExportPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<StoragePlan>,
+}
+#[derive(Serialize)]
+struct DownloadPlan {
+    environment: String,
+    platform: crate::region::Platform,
+    client_version: String,
+    protocol_version: String,
+    refresh_enabled: bool,
+    catalog_only: bool,
+    decryption_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: Option<SelectionPlan>,
+    missing_secrets: usize,
+    invalid_secret_fields: Vec<&'static str>,
+}
+#[derive(Serialize)]
+struct SelectionPlan {
+    entire_catalog: bool,
+    keys: Vec<String>,
+    include_patterns: usize,
+    exclude_patterns: usize,
+    priority_patterns: usize,
+}
+#[derive(Serialize)]
+struct ExportPlan {
+    retain_outputs: bool,
+    incremental_cache: bool,
+    secrets_ready: bool,
+}
+#[derive(Serialize)]
+struct StoragePlan {
+    providers: Vec<String>,
+}
+/// Re-reads the profile documents (with environment overrides) exactly as a worker would at
+/// execution time, without contacting the Game API/CDN, creating outputs or touching the ledger.
+fn dry_run_plan(profile: &Profile, request: Request) -> DryRunPlan {
+    let mut plan = DryRunPlan {
+        dry_run: true,
+        ready: false,
+        issues: vec![],
+        steps: vec![],
+        download: None,
+        export: None,
+        storage: None,
+        request,
+    };
+    let op = plan.request.operation;
+    if op == Operation::Update {
+        plan.steps.push("download");
+        let loaded = profile
+            .download_config
+            .as_deref()
+            .ok_or(Error::Config)
+            .and_then(|path| {
+                read_yaml::<crate::Config>(path, crate::config_env::Document::Download)
+            })
+            .and_then(|c| {
+                if c.region != profile.region || c.logging.is_some() {
+                    return Err(Error::Config);
+                }
+                let report = c.check()?;
+                Ok((c, report))
+            });
+        match loaded {
+            Ok((c, report)) => {
+                if !report.ready {
+                    plan.issues.push("download_secrets_not_ready");
+                }
+                let selection = c.assets.as_ref().map(|a| &a.selection);
+                plan.download = Some(DownloadPlan {
+                    platform: c.platform(),
+                    protocol_version: c.protocol_version().into(),
+                    environment: c.environment,
+                    client_version: c.client_version,
+                    refresh_enabled: report.refresh_enabled,
+                    catalog_only: !report.assets_enabled,
+                    decryption_enabled: report.decryption_enabled,
+                    selection: selection.map(|s| SelectionPlan {
+                        entire_catalog: s.keys.is_empty()
+                            && s.include.is_empty()
+                            && s.exclude.is_empty(),
+                        keys: s.keys.clone(),
+                        include_patterns: s.include.len(),
+                        exclude_patterns: s.exclude.len(),
+                        priority_patterns: s.priority.len(),
+                    }),
+                    missing_secrets: report.missing_env.len(),
+                    invalid_secret_fields: report.invalid_fields,
+                });
+            }
+            Err(_) => plan.issues.push("download_config_invalid"),
+        }
+    }
+    plan.steps.push("verify");
+    if op != Operation::Verify {
+        if let Some(path) = &profile.export_config {
+            plan.steps.push("export");
+            let loaded =
+                read_yaml::<crate::export::ExportConfig>(path, crate::config_env::Document::Export)
+                    .and_then(|e| {
+                        e.validate()?;
+                        if e.logging.is_some()
+                            || (profile.storage_config.is_some() && !e.retain_outputs)
+                        {
+                            return Err(Error::Config);
+                        }
+                        Ok(e)
+                    });
+            match loaded {
+                Ok(e) => {
+                    if !e.secrets_ready() {
+                        plan.issues.push("export_secrets_not_ready");
+                    }
+                    if e.retain_outputs {
+                        plan.steps.push("verify_export");
+                    }
+                    plan.export = Some(ExportPlan {
+                        retain_outputs: e.retain_outputs,
+                        incremental_cache: e.cache_directory.is_some(),
+                        secrets_ready: e.secrets_ready(),
+                    });
+                }
+                Err(_) => plan.issues.push("export_config_invalid"),
+            }
+            if let Some(path) = &profile.storage_config {
+                plan.steps.push("publish");
+                // Same preview as `plan-storage`: resolves and validates providers, no I/O.
+                match read_yaml::<crate::storage::Config>(
+                    path,
+                    crate::config_env::Document::Storage,
+                )
+                .and_then(|s| {
+                    s.validate()?;
+                    s.plan(profile.region)
+                }) {
+                    Ok(preview) => {
+                        plan.storage = Some(StoragePlan {
+                            providers: preview.providers.into_iter().map(|t| t.name).collect(),
+                        })
+                    }
+                    Err(_) => plan.issues.push("storage_config_invalid"),
+                }
+            }
+        }
+    }
+    plan.ready = plan.issues.is_empty();
+    plan
+}
 async fn submit(
     State(service): State<Service>,
     headers: HeaderMap,
@@ -817,19 +999,35 @@ async fn submit(
     if !service.inner.accepting.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let Ok(request) = sonic_rs::from_slice::<Request>(&body) else {
+    let Ok(submission) = sonic_rs::from_slice::<Submission>(&body) else {
         return failure(JobError::Invalid);
     };
-    if !service
+    let request = Request {
+        region: submission.region,
+        profile: submission.profile,
+        operation: submission.operation,
+    };
+    let Some(profile) = service
         .inner
         .config
         .profiles
         .get(&request.profile)
-        .is_some_and(|p| p.region == request.region && p.supports(request.operation))
-    {
+        .filter(|p| p.region == request.region && p.supports(request.operation))
+        .cloned()
+    else {
         return failure(JobError::Invalid);
-    }
+    };
     let mut keys = headers.get_all("idempotency-key").iter();
+    if submission.dry_run {
+        // A preview never reserves or replays a key; reject rather than silently ignore it.
+        if keys.next().is_some() {
+            return json(
+                StatusCode::BAD_REQUEST,
+                &BTreeMap::from([("error", "Idempotency-Key is not accepted with dry_run")]),
+            );
+        }
+        return dry_run(&service, profile, request).await;
+    }
     let key = match keys.next() {
         Some(value) => match value.to_str() {
             Ok(key) if keys.next().is_none() => Some(key),
@@ -849,6 +1047,31 @@ async fn submit(
             json(StatusCode::ACCEPTED, &job)
         }
         Err(e) => failure(e),
+    }
+}
+/// Bounded by the job deadline and abandoned on shutdown. Only small configuration documents
+/// are read on the blocking pool; an abandoned read has no side effects to roll back.
+async fn dry_run(service: &Service, profile: Profile, request: Request) -> Response {
+    let mut closing = service.inner.closing.subscribe();
+    let deadline = Duration::from_secs(service.inner.config.timeout_seconds);
+    let work = tokio::task::spawn_blocking(move || dry_run_plan(&profile, request));
+    let unavailable = |error: &'static str| {
+        json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &BTreeMap::from([("error", error)]),
+        )
+    };
+    tokio::select! {
+        result = work => match result {
+            Ok(plan) => {
+                tracing::info!(region = plan.request.region.name(), operation = ?plan.request.operation, ready = plan.ready, "Dry-run plan");
+                let status = if plan.ready { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY };
+                json(status, &plan)
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        _ = cancelled(&mut closing) => unavailable("service is shutting down"),
+        _ = tokio::time::sleep(deadline) => unavailable("dry-run planning deadline exceeded"),
     }
 }
 async fn cancel(State(service): State<Service>, HttpPath(id): HttpPath<String>) -> Response {
@@ -960,7 +1183,7 @@ pub async fn run_file(path: &Path) -> Result<(), Error> {
     tokio::select! {
         result=&mut http=>{let _=tx.send(true);workers.await.map_err(|_|Error::Io)??;result.map_err(|_|Error::Io)},
         result=&mut workers=>{let _=tx.send(true);http.await.map_err(|_|Error::Io)?;result.map_err(|_|Error::Io)?},
-        _=shutdown_signal()=>{service.inner.accepting.store(false,Ordering::Release);let _=tx.send(true);http.await.map_err(|_|Error::Io)?;workers.await.map_err(|_|Error::Io)?}
+        _=shutdown_signal()=>{service.inner.stop_accepting();let _=tx.send(true);http.await.map_err(|_|Error::Io)?;workers.await.map_err(|_|Error::Io)?}
     }
 }
 async fn shutdown_signal() {
@@ -1423,5 +1646,299 @@ mod lifecycle_tests {
         assert_eq!(interrupted.status, Status::Failed);
         assert_eq!(interrupted.failure.as_deref(), Some("service_interrupted"));
         assert_eq!(status(&restarted, &queued.id).await.status, Status::Queued);
+    }
+
+    async fn post_job(
+        service: &Service,
+        body: &str,
+        authenticated: bool,
+        keys: &[&str],
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/jobs")
+            .header(header::CONTENT_TYPE, "application/json");
+        if authenticated {
+            request = request.header(header::AUTHORIZATION, "Bearer synthetic-service-token");
+        }
+        for key in keys {
+            request = request.header("Idempotency-Key", *key);
+        }
+        let response = service
+            .router()
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    out.push((path.clone(), vec![]));
+                    pending.push(path);
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    /// Adds an update profile with export and local storage to the download fixture.
+    fn publishing_profile(f: &Fixture, cri_key_env: &str) -> ServiceConfig {
+        let root = f.config.state_directory.parent().unwrap();
+        let export = root.join("export.yaml");
+        std::fs::write(
+            &export,
+            format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {cri_key_env}\nffmpeg: /nonexistent/ffmpeg\ncache_directory: {:?}\n", root.join("cache")),
+        )
+        .unwrap();
+        let storage = root.join("storage.yaml");
+        std::fs::write(
+            &storage,
+            format!(
+                "providers:\n  - name: local\n    backend: {{type: local, directory: {:?}}}\n",
+                root.join("published")
+            ),
+        )
+        .unwrap();
+        let mut config = f.config.clone();
+        let mut profile = config.profiles["download"].clone();
+        profile.export_config = Some(export);
+        profile.storage_config = Some(storage);
+        config.profiles.insert("publish".into(), profile);
+        config
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_offline_plan_without_jobs_state_or_network() {
+        use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+        let (f, service) = fixture(30).await;
+        drop(service);
+        let cri = format!("SIRIUS_DRY_RUN_CRI_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&cri, "305419896");
+        let config = publishing_profile(&f, &cri);
+        let service = Service::open(config.clone()).unwrap();
+        let root = f.config.state_directory.parent().unwrap().to_path_buf();
+        let state = tree(&config.state_directory);
+        let outputs = tree(&config.output_directory);
+        let update = r#"{"region":"jp","profile":"download","operation":"update","dry_run":true}"#;
+
+        assert_eq!(
+            post_job(&service, update, false, &[]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        for invalid in [
+            r#"{"region":"jp","profile":"missing","operation":"update","dry_run":true}"#,
+            r#"{"region":"en","profile":"download","operation":"update","dry_run":true}"#,
+            r#"{"region":"jp","profile":"download","operation":"verify","dry_run":true}"#,
+            r#"{"region":"jp","profile":"download","operation":"update","dry_run":"yes"}"#,
+            r#"{"region":"jp","profile":"download","operation":"update","dry_run":true,"input":"/etc"}"#,
+        ] {
+            assert_eq!(
+                post_job(&service, invalid, true, &[]).await.0,
+                StatusCode::BAD_REQUEST,
+                "{invalid}"
+            );
+        }
+
+        let (status, body) = post_job(&service, update, true, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let plan: sonic_rs::Value = sonic_rs::from_str(&body).unwrap();
+        assert_eq!(plan["dry_run"].as_bool(), Some(true));
+        assert_eq!(plan["ready"].as_bool(), Some(true));
+        assert_eq!(plan["issues"].as_array().unwrap().len(), 0);
+        assert_eq!(plan["request"]["profile"].as_str(), Some("download"));
+        assert_eq!(plan["request"]["operation"].as_str(), Some("update"));
+        let steps: Vec<&str> = plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(steps, ["download", "verify"]);
+        assert_eq!(plan["download"]["environment"].as_str(), Some("release"));
+        assert_eq!(plan["download"]["client_version"].as_str(), Some("1.0.3"));
+        assert_eq!(plan["download"]["catalog_only"].as_bool(), Some(true));
+        assert_eq!(plan["download"]["missing_secrets"].as_u64(), Some(0));
+        assert!(plan.get("export").is_none() && plan.get("storage").is_none());
+        assert!(plan.get("id").is_none() && plan.get("status").is_none());
+
+        // Storage overrides are applied exactly as a worker would read them.
+        let rename = "SIRIUS_ASSET_STORAGE__PROVIDERS__0__NAME";
+        std::env::set_var(rename, "overridden");
+        let (status, body) = post_job(
+            &service,
+            &update.replace("\"download\"", "\"publish\""),
+            true,
+            &[],
+        )
+        .await;
+        std::env::remove_var(rename);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let plan: sonic_rs::Value = sonic_rs::from_str(&body).unwrap();
+        let steps: Vec<&str> = plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            steps,
+            ["download", "verify", "export", "verify_export", "publish"]
+        );
+        assert_eq!(plan["export"]["retain_outputs"].as_bool(), Some(true));
+        assert_eq!(plan["export"]["incremental_cache"].as_bool(), Some(true));
+        assert_eq!(plan["storage"]["providers"][0].as_str(), Some("overridden"));
+        for secret in [
+            "synthetic-service-token",
+            "305419896",
+            cri.as_str(),
+            &config.token_env,
+            "static.example",
+            "127.0.0.1",
+            "publications",
+            root.to_str().unwrap(),
+        ] {
+            assert!(!body.contains(secret), "{secret} leaked: {body}");
+        }
+
+        // A key is rejected, never reserved: the same key can still create real work later.
+        for keys in [&["dry-1"][..], &["bad key"], &["dry-1", "dry-1"]] {
+            let (status, body) = post_job(&service, update, true, keys).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("dry_run"), "{body}");
+        }
+        assert!(service.inner.store.lock().await.list().is_empty());
+        assert_eq!(tree(&config.state_directory), state);
+        assert_eq!(tree(&config.output_directory), outputs);
+        assert!(!root.join("published").exists() && !root.join("cache").exists());
+        assert_eq!(f.hits.load(Ordering::SeqCst), 0);
+
+        // Prerequisites a worker would fail on are reported with stable codes and 422.
+        std::env::remove_var(&cri);
+        let publish = update.replace("\"download\"", "\"publish\"");
+        let (status, body) = post_job(&service, &publish, true, &[]).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let plan: sonic_rs::Value = sonic_rs::from_str(&body).unwrap();
+        assert_eq!(plan["ready"].as_bool(), Some(false));
+        assert_eq!(plan["issues"][0].as_str(), Some("export_secrets_not_ready"));
+        std::fs::write(root.join("storage.yaml"), "providers: []\n").unwrap();
+        std::fs::write(
+            config.profiles["download"]
+                .download_config
+                .as_ref()
+                .unwrap(),
+            "unknown_field: true\n",
+        )
+        .unwrap();
+        let (status, body) = post_job(&service, &publish, true, &[]).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let plan: sonic_rs::Value = sonic_rs::from_str(&body).unwrap();
+        let issues: Vec<&str> = plan["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            issues,
+            [
+                "download_config_invalid",
+                "export_secrets_not_ready",
+                "storage_config_invalid"
+            ]
+        );
+        assert!(plan.get("download").is_none() && plan.get("storage").is_none());
+        assert!(service.inner.store.lock().await.list().is_empty());
+        assert_eq!(tree(&config.state_directory), state);
+
+        // Dry runs never consumed the key or a queue slot.
+        let real = r#"{"region":"jp","profile":"download","operation":"update"}"#;
+        let (status, body) = post_job(&service, real, true, &["dry-1"]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let job: Job = sonic_rs::from_str(&body).unwrap();
+        assert!(job.idempotency_sha256.is_some());
+        assert_eq!(service.inner.store.lock().await.list().len(), 1);
+        let explicit =
+            r#"{"region":"jp","profile":"download","operation":"update","dry_run":false}"#;
+        assert_eq!(
+            post_job(&service, explicit, true, &[]).await.0,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(service.inner.store.lock().await.list().len(), 2);
+        assert_eq!(f.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_run_is_bounded_by_deadline_and_abandoned_on_shutdown() {
+        let (f, service) = fixture(1).await;
+        let download = f.config.profiles["download"]
+            .download_config
+            .clone()
+            .unwrap();
+        // A FIFO blocks the configuration read until a writer appears.
+        std::fs::remove_file(&download).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&download)
+            .status()
+            .unwrap()
+            .success());
+        let update = r#"{"region":"jp","profile":"download","operation":"update","dry_run":true}"#;
+        let started = std::time::Instant::now();
+        let (status, body) = post_job(&service, update, true, &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("deadline"), "{body}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let blocked = {
+            let service = service.clone();
+            tokio::spawn(async move { post_job(&service, update, true, &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        service.inner.stop_accepting();
+        let (status, body) = tokio::time::timeout(Duration::from_millis(900), blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("shutting down"), "{body}");
+        assert_eq!(
+            post_job(&service, update, true, &[]).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Release the abandoned blocking readers; a nonblocking writer never waits for one.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            use std::os::unix::fs::OpenOptionsExt;
+            // ENXIO means no reader remains blocked on the FIFO.
+            while std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&download)
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.inner.store.lock().await.list().is_empty());
+        assert_eq!(f.hits.load(Ordering::SeqCst), 0);
     }
 }

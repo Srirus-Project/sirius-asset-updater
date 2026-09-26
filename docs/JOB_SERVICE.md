@@ -6,7 +6,7 @@ All job routes require that token; `/health` is unauthenticated process liveness
 
 | Method | Route | Operation |
 | --- | --- | --- |
-| POST | `/api/v1/jobs` | Submit configured work; 202 with persisted job |
+| POST | `/api/v1/jobs` | Submit configured work; 202 with persisted job (or a dry-run plan) |
 | GET | `/api/v1/jobs` | List retained jobs |
 | GET | `/api/v1/jobs/{id}` | Get status/progress |
 | POST | `/api/v1/jobs/{id}/cancel` | Request cancellation |
@@ -42,6 +42,58 @@ job on replay; use the explicit retry route to request new execution. The retry 
 new work each time and does not inherit or accept this submission idempotency contract.
 A submission key does not pin a catalog version: `update` still obtains and validates the current
 snapshot when it executes. An owner integration must reconcile the resulting receipt identity.
+
+## Dry-run planning
+
+Add `"dry_run": true` to a submission to preview it without creating work (restored from the
+original Haruki `dry_run` request field; `false` or omitted keeps normal submission):
+
+```json
+{"region":"jp","profile":"jp-full","operation":"update","dry_run":true}
+```
+
+Authentication, the optional User-Agent filter, shutdown admission (503), strict body parsing
+and profile/region/operation validation (400) are identical to a real submission. The service
+then re-reads the profile's documents on the blocking pool, applying `SIRIUS_ASSET__*`,
+`SIRIUS_ASSET_EXPORT__*` and `SIRIUS_ASSET_STORAGE__*` overrides, exactly as a worker would at
+execution time, so edits made after startup are reflected. `update` loads the download document
+(region/logging checks, offline `check` validation and secret presence); `update`/`export` with
+`export_config` validate the export document and CRI key presence; `storage_config` resolves the
+`plan-storage` provider preview. `verify` reads no documents.
+
+A dry run never creates or persists a job, never consumes a queue slot or completion reservation,
+never creates output/cache/storage directories and never contacts the Game API, CDN, STS or
+storage. Like the original, it stops after planning: catalog selection is **not** resolved (that
+requires the live snapshot/catalog), so `selection` describes configured keys and pattern counts,
+not selected files. FFmpeg availability, standalone `input` contents and storage permissions are
+not probed; a ready plan is not a guarantee that execution succeeds.
+
+The response is 200 when `ready` is true and 422 when a prerequisite would fail the job; both use
+the same shape. It has no job `id` and cannot be polled:
+
+```json
+{"dry_run":true,"ready":true,"issues":[],
+ "request":{"region":"jp","profile":"jp-full","operation":"update"},
+ "steps":["download","verify","export","verify_export","publish"],
+ "download":{"environment":"release","platform":"iOS","client_version":"1.0.3",
+   "protocol_version":"...","refresh_enabled":true,"catalog_only":false,"decryption_enabled":true,
+   "selection":{"entire_catalog":false,"keys":["InitialDownload"],"include_patterns":0,
+     "exclude_patterns":0,"priority_patterns":1},
+   "missing_secrets":0,"invalid_secret_fields":[]},
+ "export":{"retain_outputs":true,"incremental_cache":true,"secrets_ready":true},
+ "storage":{"providers":["primary"]}}
+```
+
+`issues` uses stable codes: `download_config_invalid`, `download_secrets_not_ready`,
+`export_config_invalid`, `export_secrets_not_ready` and `storage_config_invalid`; a section
+whose document is invalid is omitted. Like job status, the plan contains no filesystem paths,
+URLs, storage prefixes, environment variable names or secret values (only counts and static
+field names). Use the operator-side `check` and `plan-storage` commands for full detail.
+
+`Idempotency-Key` is rejected with 400 on a dry run (including malformed or duplicate headers):
+a preview neither looks up, reserves nor replays a key, so the same key remains available for
+the real submission. Planning is bounded by `timeout_seconds` and abandoned when shutdown
+begins; both return 503. An abandoned configuration read has no side effects.
 
 Successful new jobs include an `outcome` saved in the same ledger transaction as `completed`:
 
