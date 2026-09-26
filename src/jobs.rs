@@ -139,10 +139,18 @@ pub struct Limits {
     pub max_queued: usize,
     pub retain_terminal: usize,
 }
+/// Ownership must end when the store is dropped even if a concurrently forked child (for
+/// example an FFmpeg spawn) still shares the open description until it execs.
+struct OwnerLock(File);
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 pub struct JobStore {
     completion_targets: Vec<CompletionTarget>,
     directory: PathBuf,
-    _owner: File,
+    _owner: OwnerLock,
     ledger: Ledger,
     limits: Limits,
 }
@@ -160,6 +168,7 @@ impl JobStore {
             .open(directory.join("owner.lock"))
             .map_err(|_| JobError::Storage)?;
         owner.try_lock().map_err(|_| JobError::Locked)?;
+        let owner = OwnerLock(owner);
         let path = directory.join("jobs.json");
         let mut ledger: Ledger = match fs::read(&path) {
             Ok(bytes) => sonic_rs::from_slice(&bytes).map_err(|_| JobError::Storage)?,
@@ -810,6 +819,16 @@ mod tests {
         assert_eq!(s.finish(&first.id, None).unwrap().status, Status::Cancelled);
         assert_eq!(s.claim().unwrap().unwrap().request.region, Region::Jp);
         assert!(matches!(s.finish(&first.id, None), Err(JobError::Conflict)));
+    }
+    #[test]
+    fn dropping_the_store_releases_ownership_despite_a_duplicated_descriptor() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobStore::open(d.path(), limits()).unwrap();
+        // Models a child forked while the store is open and not yet exec'd.
+        let inherited = s._owner.0.try_clone().unwrap();
+        drop(s);
+        JobStore::open(d.path(), limits()).unwrap();
+        drop(inherited);
     }
     #[test]
     fn restart_marks_inflight_failed_but_preserves_queue_and_enforces_single_owner() {
