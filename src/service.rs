@@ -161,7 +161,7 @@ impl Service {
                 return Err(Error::Config);
             }
             if let Some(path) = &p.download_config {
-                let c: crate::Config = read_yaml(path)?;
+                let c: crate::Config = read_yaml(path, crate::config_env::Document::Download)?;
                 if c.region != p.region || c.logging.is_some() {
                     return Err(Error::Config);
                 }
@@ -176,7 +176,8 @@ impl Service {
                 }
             }
             if let Some(path) = &p.export_config {
-                let export: crate::export::ExportConfig = read_yaml(path)?;
+                let export: crate::export::ExportConfig =
+                    read_yaml(path, crate::config_env::Document::Export)?;
                 export.validate()?;
                 if export.logging.is_some() {
                     return Err(Error::Config);
@@ -189,7 +190,8 @@ impl Service {
                 if p.export_config.is_none() {
                     return Err(Error::Config);
                 }
-                let storage: crate::storage::Config = read_yaml(path)?;
+                let storage: crate::storage::Config =
+                    read_yaml(path, crate::config_env::Document::Storage)?;
                 storage.validate()?;
             }
         }
@@ -502,8 +504,10 @@ impl Service {
             .map_err(|_| Error::Io)?;
         let input = if job.request.operation == Operation::Update {
             self.phase(&job.id, "download").await?;
-            let mut config: crate::Config =
-                read_yaml(profile.download_config.as_ref().ok_or(Error::Config)?)?;
+            let mut config: crate::Config = read_yaml(
+                profile.download_config.as_ref().ok_or(Error::Config)?,
+                crate::config_env::Document::Download,
+            )?;
             if config.region != profile.region || config.logging.is_some() {
                 return Err(Error::Config);
             }
@@ -558,7 +562,8 @@ impl Service {
         if job.request.operation != Operation::Verify {
             if let Some(path) = &profile.export_config {
                 self.phase(&job.id, "export").await?;
-                let mut export: crate::export::ExportConfig = read_yaml(path)?;
+                let mut export: crate::export::ExportConfig =
+                    read_yaml(path, crate::config_env::Document::Export)?;
                 if export.logging.is_some()
                     || (profile.storage_config.is_some() && !export.retain_outputs)
                 {
@@ -657,7 +662,8 @@ impl Service {
                     };
                     if let Some(path) = &profile.storage_config {
                         self.phase(&job.id, "publish").await?;
-                        let mut storage: crate::storage::Config = read_yaml(path)?;
+                        let mut storage: crate::storage::Config =
+                            read_yaml(path, crate::config_env::Document::Storage)?;
                         storage.service_upload_gate = Some(self.inner.upload_gate.clone());
                         let (progress_tx, progress_rx) =
                             watch::channel(crate::storage::UploadProgress::default());
@@ -728,9 +734,11 @@ impl Service {
         Ok(outcome)
     }
 }
-fn read_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    yaml_serde::from_str(&std::fs::read_to_string(path).map_err(|_| Error::Config)?)
-        .map_err(|_| Error::Config)
+fn read_yaml<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    document: crate::config_env::Document,
+) -> Result<T, Error> {
+    crate::config_env::load(path, document)
 }
 pub(crate) async fn cancelled(stop: &mut watch::Receiver<bool>) {
     loop {
@@ -928,7 +936,7 @@ async fn completion_status(State(service): State<Service>) -> Response {
     json(StatusCode::OK, &report)
 }
 pub async fn run_file(path: &Path) -> Result<(), Error> {
-    let config: ServiceConfig = read_yaml(path)?;
+    let config: ServiceConfig = read_yaml(path, crate::config_env::Document::Service)?;
     let listen = config.listen;
     let tls = config
         .tls

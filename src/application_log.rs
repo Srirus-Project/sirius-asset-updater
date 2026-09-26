@@ -76,13 +76,17 @@ impl Config {
         .map_err(|_| invalid())
     }
     /// CLI bootstrap reads only the root logging section; the command validates the full config.
-    pub fn from_file(path: Option<&Path>) -> io::Result<Self> {
+    /// Reads only the `logging` section of `path` after applying `document` overrides,
+    /// so an environment-supplied log setting takes effect before the command starts.
+    pub fn from_file(
+        path: Option<&Path>,
+        document: crate::config_env::Document,
+    ) -> io::Result<Self> {
         let Some(path) = path else {
             return Ok(Self::default());
         };
         let value: yaml_serde::Value =
-            yaml_serde::from_str(&std::fs::read_to_string(path).map_err(|_| invalid())?)
-                .map_err(|_| invalid())?;
+            crate::config_env::load(path, document).map_err(|_| invalid())?;
         let config = match value.get("logging") {
             Some(value) if !value.is_null() => {
                 yaml_serde::from_value(value.clone()).map_err(|_| invalid())?

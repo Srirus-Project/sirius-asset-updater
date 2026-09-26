@@ -40,7 +40,8 @@ cp sirius-asset-config.example.yaml sirius-asset-config.yaml
 # Release archive: ./sirius-asset-updater (sirius-asset-updater.exe on Windows)
 ```
 
-`SIRIUS_ASSET_CONFIG_PATH` overrides the configuration path. `check` validates configuration
+`SIRIUS_ASSET_CONFIG_PATH` overrides the configuration path; `SIRIUS_ASSET__A__B=value` style
+variables override individual fields (see [CONFIG_OVERRIDES.md](docs/CONFIG_OVERRIDES.md)). `check` validates configuration
 and secret presence offline. `probe` refreshes/reads the API snapshot without contacting the CDN.
 API, internal and CDN credentials have separate scopes; API and internal tokens must differ.
 `refresh_token_env` lets the updater renew version observations before and during a download.

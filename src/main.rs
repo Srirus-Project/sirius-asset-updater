@@ -2,29 +2,35 @@ use sirius_asset_updater::{CatalogClient, Config, Error};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let path = if args.len() == 2
-        && matches!(
-            args[0].as_str(),
-            "serve" | "export" | "publish" | "plan-storage"
-        ) {
-        Some(std::path::PathBuf::from(&args[1]))
-    } else if args.is_empty() || args == ["check"] || args == ["probe"] {
-        Some(std::path::PathBuf::from(
-            std::env::var("SIRIUS_ASSET_CONFIG_PATH")
-                .unwrap_or_else(|_| "sirius-asset-config.yaml".into()),
-        ))
-    } else {
-        None
+    use sirius_asset_updater::config_env::Document;
+    let (path, document) = match args.first().map(String::as_str) {
+        Some(kind @ ("serve" | "export" | "publish" | "plan-storage")) if args.len() == 2 => (
+            Some(std::path::PathBuf::from(&args[1])),
+            match kind {
+                "serve" => Document::Service,
+                "export" => Document::Export,
+                _ => Document::Publish,
+            },
+        ),
+        _ if args.is_empty() || args == ["check"] || args == ["probe"] => (
+            Some(std::path::PathBuf::from(
+                std::env::var("SIRIUS_ASSET_CONFIG_PATH")
+                    .unwrap_or_else(|_| "sirius-asset-config.yaml".into()),
+            )),
+            Document::Download,
+        ),
+        _ => (None, Document::Download),
     };
-    let _logging = match sirius_asset_updater::application_log::Config::from_file(path.as_deref())
-        .and_then(|c| c.init())
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("{error}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let _logging =
+        match sirius_asset_updater::application_log::Config::from_file(path.as_deref(), document)
+            .and_then(|c| c.init())
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("{error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -49,8 +55,10 @@ async fn run() -> Result<(), Error> {
     }
     if args.len() == 2 && matches!(args[0].as_str(), "publish" | "plan-storage") {
         let config: sirius_asset_updater::storage::Command =
-            yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
-                .map_err(|_| Error::Config)?;
+            sirius_asset_updater::config_env::load(
+                std::path::Path::new(&args[1]),
+                sirius_asset_updater::config_env::Document::Publish,
+            )?;
         if args[0] == "plan-storage" {
             println!(
                 "{}",
@@ -68,8 +76,10 @@ async fn run() -> Result<(), Error> {
     }
     if args.len() == 2 && args[0] == "export" {
         let config: sirius_asset_updater::export::ExportConfig =
-            yaml_serde::from_str(&std::fs::read_to_string(&args[1]).map_err(|_| Error::Config)?)
-                .map_err(|_| Error::Config)?;
+            sirius_asset_updater::config_env::load(
+                std::path::Path::new(&args[1]),
+                sirius_asset_updater::config_env::Document::Export,
+            )?;
         let summary = config.run().await?;
         println!(
             "{}",
@@ -138,9 +148,10 @@ async fn run() -> Result<(), Error> {
     }
     let path = std::env::var("SIRIUS_ASSET_CONFIG_PATH")
         .unwrap_or_else(|_| "sirius-asset-config.yaml".into());
-    let config: Config =
-        yaml_serde::from_str(&std::fs::read_to_string(path).map_err(|_| Error::Config)?)
-            .map_err(|_| Error::Config)?;
+    let config: Config = sirius_asset_updater::config_env::load(
+        std::path::Path::new(&path),
+        sirius_asset_updater::config_env::Document::Download,
+    )?;
     let check = config.check()?;
     if args == ["check"] || !check.ready {
         println!(
