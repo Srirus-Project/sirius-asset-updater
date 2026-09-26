@@ -2,7 +2,8 @@
 
 Audited against Haruki-Sekai-Asset-Updater commit
 `3d33ed037f0ef5009e361e0535b3b19f8c239947` (local checkout HEAD verified).
-This is a capability inventory, not completion of the 1.2.0 release gate.
+This is the original capability inventory; the final field-by-field status is in
+[HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md).
 
 ## Storage
 
@@ -63,6 +64,7 @@ requirements. A CLI fallback must be explicit and tested, not a successful no-op
 ## Consequence for the restoration ledger
 
 The previously broad “other OpenDAL backends” audit is resolved at the service-family level:
-FS and S3 cover the original compiled baseline. Storage **configuration and publication** parity
-is still incomplete. Media FFI/backend choice is implemented; its real-fixture and package acceptance remain release-blocking.
-Neither finding relaxes the full yhm01 acceptance, public artifact audit or 1.2.0 release gates.
+FS and S3 cover the original compiled baseline; storage configuration and publication parity is
+recorded in [HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md). Media FFI/backend choice is
+implemented and its real-fixture exports run in the FFmpeg 7 CI job; release packages use the CLI
+backend by default.

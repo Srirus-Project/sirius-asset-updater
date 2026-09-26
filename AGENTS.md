@@ -11,7 +11,7 @@ Keep Haruki MIT attribution and Sirius attribution in LICENSE; sources are in do
 - Test locally; no live game availability is required for tests.
 - Run `cargo fmt --all -- --check`, `cargo check --locked --all-targets`,
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, and `cargo test --locked`.
-- The user authorized restoration, yhm01 full acceptance and release 1.2.0. Publish only after the restoration ledger and full acceptance gates pass. Preserve existing Actions settings; CI/Release/Docker target this project's binaries.
+- The user authorized restoration, yhm01 full acceptance and releases 1.2.0 and 1.2.1. Publish only after the restoration ledger and full acceptance gates pass. Preserve existing Actions settings; CI/Release/Docker target this project's binaries.
 - Commit subjects use `[Feat]`, `[Fix]`, `[Chore]` or `[Docs]` and an imperative description.
 - Include `Co-authored-by: Codex <noreply@openai.com>` in Codex commit bodies.
 

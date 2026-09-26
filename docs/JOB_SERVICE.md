@@ -1,4 +1,4 @@
-# Job service (1.2.0 development)
+# Job service
 
 Run `sirius-asset-updater serve sirius-service-config.yaml`. The existing one-shot CLI remains
 available. Set the environment variable named by `token_env` to a distinct service bearer token.
@@ -163,9 +163,8 @@ survive job retries and service restarts while each job retains independent outp
 Profiles can set `storage_config` to publish retained exports to configured [local/S3 storage](STORAGE.md).
 All destinations must pass upload/read-back before optional local export cleanup.
 
-This is an implementation milestone, not the complete 1.2.0 platform restoration. Additional publication,
-stage tuning, version-trigger integration and remaining acceptance requirements
-are tracked separately in RESTORATION_1_2.md. Do not publish 1.2.0 from this milestone alone.
+Production acceptance of the service (full and incremental JP and Global HK runs, restart,
+cancellation, independent per-file audit) is recorded in [RESTORATION_1_2.md](RESTORATION_1_2.md).
 
 ## Shared media budget
 
