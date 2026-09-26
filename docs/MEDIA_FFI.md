@@ -9,8 +9,9 @@ independent output verification still require the configured FFmpeg executable.
 `ffi` requires a feature-enabled build and fails explicitly on unavailable codecs or unsupported
 input. `auto` tries FFI when compiled in, removes a failed attempt's partial output and retries
 with CLI using the original remaining deadline. Feature-disabled Auto uses CLI. Cancellation
-and timeout never trigger a retry. Both backends share the configured media admission gate.
-The export summary records the requested backend, completed FFI encodings and fallback attempts;
+and timeout never trigger a retry. FFI attempts are not repeated; `media_retry` applies only to
+FFmpeg child processes ([EXPORT_OPTIONS.md](EXPORT_OPTIONS.md#media-process-retry)). Both backends share the configured media admission gate.
+The export summary records the requested backend, completed FFI encodings, fallback attempts and media retries;
 these counters do not replace verification results. Cache hits do not count as new encodings.
 Backend policy and the linked library version/build digest participate in decoded-cache identity.
 

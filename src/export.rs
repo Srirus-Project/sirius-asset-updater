@@ -85,6 +85,10 @@ pub struct ExportConfig {
     service_media_gate: Option<(std::sync::Arc<crate::media_gate::Gate>, usize)>,
     #[serde(default = "media_timeout")]
     pub media_timeout_seconds: u64,
+    #[serde(default)]
+    pub media_retry: crate::export_options::MediaRetry,
+    #[serde(skip)]
+    media_retries: std::sync::atomic::AtomicUsize,
     #[serde(skip)]
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[serde(skip)]
@@ -114,6 +118,8 @@ pub struct ExportSummary {
     pub ffi_conversions: usize,
     #[serde(default)]
     pub media_fallbacks: usize,
+    #[serde(default)]
+    pub media_retries: usize,
     pub full_catalog: bool,
     #[serde(default)]
     pub full_export: bool,
@@ -187,6 +193,49 @@ pub(crate) struct ResourceReport {
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Export(e.to_string())
 }
+/// Outcome of one FFmpeg attempt: only `Transient` failures are eligible for `media_retry`.
+enum MediaFailure {
+    Transient(Error),
+    Final(Error),
+}
+/// Spawn errors the original updater retried (`sekai-asset-pipeline/src/media.rs:517-535`).
+fn transient_spawn_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    #[cfg(unix)]
+    let executable_busy = error.raw_os_error() == Some(libc::ETXTBSY);
+    #[cfg(not(unix))]
+    let executable_busy = false;
+    executable_busy
+        || matches!(
+            error.kind(),
+            ErrorKind::Interrupted
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionRefused
+        )
+}
+/// Exit status or diagnostic markers the original treated as transient
+/// (`sekai-asset-pipeline/src/media.rs:537-555`); deterministic decode/codec errors fail at once.
+fn transient_media_failure(status: &str, diagnostic: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "temporarily unavailable",
+        "broken pipe",
+        "i/o error",
+        "input/output error",
+        "signal",
+        "killed",
+    ];
+    let haystack = format!("{status} {diagnostic}").to_lowercase();
+    MARKERS.iter().any(|marker| haystack.contains(marker))
+}
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
@@ -216,6 +265,7 @@ impl ExportConfig {
         self.selection.validate()?;
         self.read_kinds.validate()?;
         self.media_backend.validate()?;
+        self.media_retry.validate()?;
         self.image.validate()?;
         if let Some(raw) = &self.raw_bundles {
             raw.validate()?;
@@ -535,6 +585,9 @@ impl ExportConfig {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 summary.media_fallbacks = self
                     .media_fallbacks
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                summary.media_retries = self
+                    .media_retries
                     .load(std::sync::atomic::Ordering::Relaxed);
                 write_json(&root.join("summary.json"), &summary)?;
             }
@@ -1522,7 +1575,7 @@ impl ExportConfig {
             args.extend(["-map".into(), "0:v:0".into()]);
         }
         args.extend(["-c".into(), "copy".into(), movie.as_os_str().to_owned()]);
-        self.ffmpeg(&args)?;
+        self.ffmpeg_to(&args, &[&movie])?;
         self.check_video_frames(&movie, expected_frames)?;
         self.video_formats(&movie, expected_frames, report_root, report)?;
         let target = output.join("usm.json");
@@ -1556,21 +1609,24 @@ impl ExportConfig {
             .tempfile_in(target.parent().ok_or(Error::Io)?)
             .map_err(err)?;
         source.write_all(&bytes[..end]).map_err(err)?;
-        self.ffmpeg(&[
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-err_detect".into(),
-            "explode".into(),
-            "-i".into(),
-            source.path().as_os_str().to_owned(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-af".into(),
-            format!("atrim=end_sample={samples}").into(),
-            "-c:a".into(),
-            "pcm_s16le".into(),
-            target.as_os_str().to_owned(),
-        ])?;
+        self.ffmpeg_to(
+            &[
+                "-protocol_whitelist".into(),
+                "file,pipe".into(),
+                "-err_detect".into(),
+                "explode".into(),
+                "-i".into(),
+                source.path().as_os_str().to_owned(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-af".into(),
+                format!("atrim=end_sample={samples}").into(),
+                "-c:a".into(),
+                "pcm_s16le".into(),
+                target.as_os_str().to_owned(),
+            ],
+            &[target],
+        )?;
         let wav = fs::read(target).map_err(err)?;
         validate_wav(&wav)?;
         let mut pos = 12;
@@ -1725,7 +1781,7 @@ impl ExportConfig {
             deadline,
         )?;
         if self.media_backend == Backend::Cli {
-            return self.ffmpeg_deadline(cli_args, deadline);
+            return self.ffmpeg_deadline(cli_args, deadline, &[output]);
         }
         self.media_backend.validate()?;
         match fs::symlink_metadata(output) {
@@ -1783,7 +1839,7 @@ impl ExportConfig {
             stage = "media_cli_fallback",
             "Media encoding fell back to CLI"
         );
-        self.ffmpeg_deadline(cli_args, deadline)
+        self.ffmpeg_deadline(cli_args, deadline, &[output])
     }
     fn cpu_deadline(&self) -> std::time::Instant {
         std::time::Instant::now()
@@ -1861,29 +1917,96 @@ impl ExportConfig {
         Ok((local, shared))
     }
     fn ffmpeg(&self, args: &[std::ffi::OsString]) -> Result<(), Error> {
+        self.ffmpeg_to(args, &[])
+    }
+    /// `outputs` are files the command creates without `-y`; they are removed before a retry so
+    /// every attempt starts from a fresh output rather than a partial one.
+    fn ffmpeg_to(&self, args: &[std::ffi::OsString], outputs: &[&Path]) -> Result<(), Error> {
         self.ffmpeg_deadline(
             args,
             std::time::Instant::now() + std::time::Duration::from_secs(self.media_timeout_seconds),
+            outputs,
         )
     }
+    /// Runs one FFmpeg command under `media_retry`. All attempts, admission waits and backoff
+    /// share `deadline`; a retry that could not start before it is not attempted.
     fn ffmpeg_deadline(
         &self,
         args: &[std::ffi::OsString],
         deadline: std::time::Instant,
+        outputs: &[&Path],
     ) -> Result<(), Error> {
-        let _permit = self.acquire_media(deadline)?;
-        let _cpu = self.acquire_cpu(deadline)?;
-        let stderr = tempfile::tempfile().map_err(err)?;
+        use std::sync::atomic::Ordering;
+        let mut retry = 0;
+        loop {
+            let error = match self.ffmpeg_attempt(args, deadline) {
+                Ok(()) => return Ok(()),
+                Err(MediaFailure::Final(error)) => return Err(error),
+                Err(MediaFailure::Transient(error)) => error,
+            };
+            if retry + 1 >= self.media_retry.attempts || self.cancel.load(Ordering::Relaxed) {
+                return Err(error);
+            }
+            let delay = self.media_retry.delay(retry);
+            let resume = match std::time::Instant::now().checked_add(delay) {
+                Some(resume) if resume < deadline => resume,
+                _ => return Err(error),
+            };
+            for output in outputs {
+                match fs::remove_file(output) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            retry += 1;
+            self.media_retries.fetch_add(1, Ordering::Relaxed);
+            // Paths and stderr are deliberately not logged here.
+            tracing::warn!(
+                stage = "media_retry",
+                attempt = retry,
+                max_attempts = self.media_retry.attempts,
+                delay_ms = delay.as_millis() as u64,
+                "Media process failed transiently; retrying"
+            );
+            // Backoff holds no media or CPU permit and observes cancellation every 20 ms.
+            loop {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                let now = std::time::Instant::now();
+                if now >= resume {
+                    break;
+                }
+                std::thread::sleep((resume - now).min(std::time::Duration::from_millis(20)));
+            }
+        }
+    }
+    fn ffmpeg_attempt(
+        &self,
+        args: &[std::ffi::OsString],
+        deadline: std::time::Instant,
+    ) -> Result<(), MediaFailure> {
+        let _permit = self.acquire_media(deadline).map_err(MediaFailure::Final)?;
+        let _cpu = self.acquire_cpu(deadline).map_err(MediaFailure::Final)?;
+        let fatal = |e: std::io::Error| MediaFailure::Final(err(e));
+        let stderr = tempfile::tempfile().map_err(fatal)?;
         let mut child = Command::new(&self.ffmpeg)
             .env_remove(&self.cri_key_env)
             .args(["-v", "error", "-nostdin"])
             .args(args)
             .stdout(Stdio::null())
-            .stderr(stderr.try_clone().map_err(err)?)
+            .stderr(stderr.try_clone().map_err(fatal)?)
             .spawn()
-            .map_err(err)?;
+            .map_err(|e| {
+                if transient_spawn_error(&e) {
+                    MediaFailure::Transient(err(e))
+                } else {
+                    MediaFailure::Final(err(e))
+                }
+            })?;
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(err)? {
+            if let Some(status) = child.try_wait().map_err(fatal)? {
                 break status;
             }
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -1891,20 +2014,28 @@ impl ExportConfig {
             {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(err("media decoder cancelled or timed out"));
+                return Err(MediaFailure::Final(err(
+                    "media decoder cancelled or timed out",
+                )));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         use std::io::{Read, Seek, SeekFrom};
         let mut stderr = stderr;
-        stderr.seek(SeekFrom::Start(0)).map_err(err)?;
+        stderr.seek(SeekFrom::Start(0)).map_err(fatal)?;
         let mut diagnostic = String::new();
         stderr
             .take(8192)
             .read_to_string(&mut diagnostic)
-            .map_err(err)?;
+            .map_err(fatal)?;
         if !status.success() || !diagnostic.is_empty() {
-            return Err(err(format!("media decode: {status}: {diagnostic}")));
+            let transient = transient_media_failure(&status.to_string(), &diagnostic);
+            let error = err(format!("media decode: {status}: {diagnostic}"));
+            return Err(if transient {
+                MediaFailure::Transient(error)
+            } else {
+                MediaFailure::Final(error)
+            });
         }
         Ok(())
     }
@@ -2219,6 +2350,8 @@ pub(crate) mod tests {
             media_gate: Default::default(),
             service_media_gate: None,
             media_timeout_seconds: 120,
+            media_retry: Default::default(),
+            media_retries: Default::default(),
             cancel: Default::default(),
             ffmpeg: "unused".into(),
             max_resource_output_bytes: 16 * 1024 * 1024,
@@ -2785,7 +2918,8 @@ pub(crate) mod tests {
         assert!(configs[1]
             .ffmpeg_deadline(
                 &[],
-                std::time::Instant::now() + std::time::Duration::from_millis(30)
+                std::time::Instant::now() + std::time::Duration::from_millis(30),
+                &[]
             )
             .is_err());
         assert!(!log.exists());
@@ -2794,6 +2928,243 @@ pub(crate) mod tests {
         assert_eq!(fs::read_to_string(log).unwrap(), "start\nend\n");
     }
 
+    /// Fake FFmpeg: counts invocations, fails the first `fails` with `failure` on stderr after
+    /// writing a partial output, refuses to overwrite an existing output, then succeeds.
+    #[cfg(unix)]
+    fn flaky_media_tool(directory: &Path, fails: usize, failure: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join(format!("flaky-media-{fails}"));
+        let count = directory.join(format!("flaky-count-{fails}"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nn=$(cat '{count}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{count}'\nfor target do :; done\nif [ -e \"$target\" ]; then echo 'output already exists' >&2; exit 1; fi\nif [ $n -le {fails} ]; then printf partial > \"$target\"; {failure}; fi\nprintf complete > \"$target\"\n",
+                count = count.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        (script, count)
+    }
+    #[cfg(unix)]
+    fn invocations(count: &Path) -> usize {
+        fs::read_to_string(count)
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+    #[test]
+    fn media_retry_config_defaults_to_single_attempt_and_is_bounded() {
+        use crate::export_options::MediaRetry;
+        let base = "input: in\noutput: out\ncri_key_env: KEY\nffmpeg: ffmpeg\n";
+        let cfg: ExportConfig = yaml_serde::from_str(base).unwrap();
+        assert_eq!(cfg.media_retry, MediaRetry::default());
+        assert_eq!(cfg.media_retry.attempts, 1);
+        cfg.validate().unwrap();
+        for valid in [
+            "{attempts: 8, delay_ms: 0, max_delay_ms: 0}",
+            "{attempts: 4, delay_ms: 1000, max_delay_ms: 4000}",
+            "{attempts: 2, delay_ms: 60000, max_delay_ms: 60000}",
+            "{attempts: 3}",
+        ] {
+            let cfg: ExportConfig =
+                yaml_serde::from_str(&format!("{base}media_retry: {valid}\n")).unwrap();
+            assert!(cfg.validate().is_ok(), "rejected {valid}");
+        }
+        for invalid in [
+            "{attempts: 0}",
+            "{attempts: 9}",
+            "{attempts: 2, delay_ms: 60001, max_delay_ms: 60001}",
+            "{attempts: 2, max_delay_ms: 60001}",
+            "{attempts: 2, delay_ms: 5000, max_delay_ms: 4000}",
+        ] {
+            let cfg: ExportConfig =
+                yaml_serde::from_str(&format!("{base}media_retry: {invalid}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "accepted {invalid}");
+        }
+        for unknown in [
+            "{attempts: 2, initial_backoff_ms: 10}",
+            "{attempts: 2, jitter: true}",
+        ] {
+            assert!(
+                yaml_serde::from_str::<ExportConfig>(&format!("{base}media_retry: {unknown}\n"))
+                    .is_err(),
+                "accepted {unknown}"
+            );
+        }
+        let retry = MediaRetry {
+            attempts: 8,
+            delay_ms: 1000,
+            max_delay_ms: 4000,
+        };
+        let delays: Vec<_> = (0..4).map(|n| retry.delay(n).as_millis()).collect();
+        assert_eq!(delays, [1000, 2000, 4000, 4000]);
+        assert_eq!(retry.delay(200).as_millis(), 4000);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn media_retry_recovers_transient_failures_with_fresh_output() {
+        use std::sync::atomic::Ordering;
+        let transient = "echo 'Resource temporarily unavailable' >&2; exit 1";
+        for (attempts, succeeds) in [(1, false), (2, false), (3, true), (5, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let (script, count) = flaky_media_tool(directory.path(), 2, transient);
+            let mut cfg = config(directory.path());
+            cfg.ffmpeg = script;
+            cfg.media_retry.attempts = attempts;
+            cfg.media_retry.delay_ms = 0;
+            cfg.media_retry.max_delay_ms = 0;
+            let output = directory.path().join("out.flac");
+            // Exercise the CLI encoding path, which holds its stage slot across attempts.
+            let result = cfg.encode_media(
+                crate::media_backend::Encoding::Flac,
+                &directory.path().join("in.wav"),
+                &output,
+                &[output.as_os_str().to_owned()],
+            );
+            assert_eq!(result.is_ok(), succeeds, "attempts {attempts}");
+            assert_eq!(invocations(&count), attempts.min(3));
+            assert_eq!(
+                cfg.media_retries.load(Ordering::Relaxed),
+                attempts.min(3) - 1
+            );
+            if succeeds {
+                // A partial output from a failed attempt is never reused.
+                assert_eq!(fs::read(&output).unwrap(), b"complete");
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Export(m)) if m.contains("temporarily unavailable"))
+                );
+            }
+        }
+        // A child killed by a signal is transient too; a deterministic failure is not retried.
+        let directory = tempfile::tempdir().unwrap();
+        let (script, count) = flaky_media_tool(directory.path(), 1, "kill -9 $$");
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = script;
+        cfg.media_retry.attempts = 2;
+        cfg.media_retry.delay_ms = 1;
+        let output = directory.path().join("signal.wav");
+        cfg.ffmpeg_to(&[output.as_os_str().to_owned()], &[&output])
+            .unwrap();
+        assert_eq!(invocations(&count), 2);
+        for failure in [
+            "echo 'Invalid data found when processing input' >&2; exit 1",
+            "exit 1",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (script, count) = flaky_media_tool(directory.path(), 1, failure);
+            let mut cfg = config(directory.path());
+            cfg.ffmpeg = script;
+            cfg.media_retry.attempts = 8;
+            cfg.media_retry.delay_ms = 0;
+            cfg.media_retry.max_delay_ms = 0;
+            let output = directory.path().join("x.mp3");
+            assert!(cfg
+                .ffmpeg_to(&[output.as_os_str().to_owned()], &[&output])
+                .is_err());
+            assert_eq!(invocations(&count), 1);
+            assert_eq!(cfg.media_retries.load(Ordering::Relaxed), 0);
+        }
+        // A missing executable is a permanent spawn failure.
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = directory.path().join("missing-executable");
+        cfg.media_retry.attempts = 8;
+        cfg.media_retry.delay_ms = 0;
+        cfg.media_retry.max_delay_ms = 0;
+        assert!(cfg.ffmpeg(&[]).is_err());
+        assert_eq!(cfg.media_retries.load(Ordering::Relaxed), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn media_retry_backoff_releases_permits_and_stops_on_cancel_or_deadline() {
+        use std::sync::{atomic::Ordering, Arc};
+        let transient = "echo 'Connection reset by peer' >&2; exit 1";
+        let directory = tempfile::tempdir().unwrap();
+        let (script, count) = flaky_media_tool(directory.path(), 8, transient);
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = script.clone();
+        cfg.media_concurrency = 1;
+        cfg.media_retry.attempts = 3;
+        cfg.media_retry.delay_ms = 10_000;
+        cfg.media_retry.max_delay_ms = 10_000;
+        let cfg = Arc::new(cfg);
+        let worker_cfg = cfg.clone();
+        let output = directory.path().join("backoff.mp4");
+        let worker_output = output.clone();
+        let worker = std::thread::spawn(move || {
+            worker_cfg.ffmpeg_to(&[worker_output.as_os_str().to_owned()], &[&worker_output])
+        });
+        let started = std::time::Instant::now();
+        while cfg.media_retries.load(Ordering::Relaxed) == 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // During backoff the media slot is free for other work and the partial output is gone.
+        let other = std::sync::atomic::AtomicBool::new(false);
+        let permit = cfg
+            .media_gate
+            .acquire(
+                1,
+                &other,
+                std::time::Instant::now() + std::time::Duration::from_millis(500),
+            )
+            .unwrap();
+        drop(permit);
+        assert!(!output.exists());
+        let cancelled = std::time::Instant::now();
+        cfg.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
+        assert!(cancelled.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(invocations(&count), 1);
+
+        // Cancellation while a child runs kills it and is never retried.
+        let directory = tempfile::tempdir().unwrap();
+        let (script, count) = flaky_media_tool(
+            directory.path(),
+            8,
+            "sleep 3; echo 'Resource temporarily unavailable' >&2; exit 1",
+        );
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = script;
+        cfg.media_retry.attempts = 8;
+        cfg.media_retry.delay_ms = 0;
+        cfg.media_retry.max_delay_ms = 0;
+        let cfg = Arc::new(cfg);
+        let worker_cfg = cfg.clone();
+        let output = directory.path().join("running.mp4");
+        let worker = std::thread::spawn(move || {
+            worker_cfg.ffmpeg_to(&[output.as_os_str().to_owned()], &[&output])
+        });
+        let started = std::time::Instant::now();
+        while invocations(&count) == 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cfg.cancel.store(true, Ordering::Relaxed);
+        assert!(worker.join().unwrap().is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(invocations(&count), 1);
+        assert_eq!(cfg.media_retries.load(Ordering::Relaxed), 0);
+
+        // A retry whose backoff would pass media_timeout_seconds is not attempted or waited for.
+        let directory = tempfile::tempdir().unwrap();
+        let (script, count) = flaky_media_tool(directory.path(), 8, transient);
+        let mut cfg = config(directory.path());
+        cfg.ffmpeg = script;
+        cfg.media_timeout_seconds = 1;
+        cfg.media_retry.attempts = 8;
+        cfg.media_retry.delay_ms = 5_000;
+        cfg.media_retry.max_delay_ms = 5_000;
+        let output = directory.path().join("deadline.mp4");
+        let started = std::time::Instant::now();
+        assert!(cfg
+            .ffmpeg_to(&[output.as_os_str().to_owned()], &[&output])
+            .is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(900));
+        assert_eq!(invocations(&count), 1);
+        assert_eq!(cfg.media_retries.load(Ordering::Relaxed), 0);
+    }
     #[cfg(unix)]
     #[test]
     fn media_process_gate_bounds_children_and_cancels_or_times_out_before_spawn() {
@@ -4578,7 +4949,7 @@ pub(crate) mod tests {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // The nonexistent executable must never be reached while another job owns the CPU slot.
         assert!(
-            matches!(configs[1].0.ffmpeg_deadline(&[], std::time::Instant::now() + std::time::Duration::from_millis(30)), Err(Error::Export(message)) if message == "CPU stage admission timed out")
+            matches!(configs[1].0.ffmpeg_deadline(&[], std::time::Instant::now() + std::time::Duration::from_millis(30), &[]), Err(Error::Export(message)) if message == "CPU stage admission timed out")
         );
         drop(held);
         for (cfg, path) in configs {

@@ -111,7 +111,7 @@ certificates. Developer-feature-unified tests alone do not prove production HTTP
 | `execution.retain_terminal_jobs` | reused | Service `retain_terminal_jobs` (`src/service.rs:66`), `0` keeps all (`src/jobs.rs:553`) |
 | `execution.retry.*` for catalog/bundle downloads (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/asset_execution/runner.rs:157-160`) | adapted | `network.snapshot_retry`/`catalog_retry`/`asset_retry {attempts, delay_ms, max_delay_ms}` (`src/network.rs:7-37`), attempts 1..8 |
 | `execution.retry.*` for uploads (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/storage.rs:267-294`) | adapted | Storage `attempts`/`retry_delay_ms` (`src/storage.rs:34-38`) |
-| `execution.retry.*` for FFmpeg commands (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/media.rs:59`, `:171`, `:504`) | not restored | A failed media stage fails that resource; `auto` falls back from FFI to CLI once ([MEDIA_FFI.md](MEDIA_FFI.md)). Recovery is job retry, which reuses verified cache entries. The original retried only spawn or stderr-classified transient failures |
+| `execution.retry.*` for FFmpeg commands (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/media.rs:59`, `:171`, `:247`, `:335`, `:504-555`) | adapted | Export `media_retry {attempts, delay_ms, max_delay_ms}` (`src/export_options.rs` `MediaRetry`, `src/export.rs` `ffmpeg_deadline`): same spawn-kind/stderr-marker transient classification, attempts 1..8 default 1 (no retry; original 4), delays 0..60000 ms without jitter (`initial_backoff_ms`→`delay_ms`, `max_backoff_ms`→`max_delay_ms`). Applies to every FFmpeg child including remux and verification decodes; never after cancellation or past `media_timeout_seconds`; partial outputs removed first; output verification and FFI are not retried (original FFI `Media` errors were non-retryable). See [EXPORT_OPTIONS.md](EXPORT_OPTIONS.md#media-process-retry) |
 | `execution.retry.*` for chart-hash Git (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/git_sync.rs:286`) | not applicable | See Git sync |
 
 ## Backends (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:162-190`)
@@ -122,7 +122,7 @@ certificates. Developer-feature-unified tests alone do not prove production HTTP
 | `asset_studio.image_format` | not applicable | Single legal value `raw_rgba` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/validate.rs:187-196`) |
 | `asset_studio.read_kinds` (type name → kind) | adapted | Export `read_kinds: {default, classes}` keyed by Unity class ID (`src/read_policy.rs:44-60`); see [Unity object representation](#unity-object-representation-and-animator) |
 | `media.backend` (default `ffi`) | reused | Export `media_backend` (`src/export.rs:44`, `src/media_backend.rs:6-11`), default `cli` |
-| `media.ffmpeg_path` | reused | Export `ffmpeg` (`src/export.rs:95`), required unless raw-only |
+| `media.ffmpeg_path` | reused | Export `ffmpeg` (`src/export.rs:99`), required unless raw-only |
 | `image.backend` | not applicable | Single-valued enum `rust` (`Haruki-Sekai-Asset-Updater@3d33ed03:src/core/config/schema.rs:194-197`) |
 | `image.png_compression` | adapted | Per-rendition `{format: png, compression}` (`src/export_options.rs:86-90`) |
 | `image.webp_lossless` | not applicable | Ignored by the original encoder; see [WebP](#webp-lossless) |
@@ -252,19 +252,21 @@ own download (`src/service.rs:93`, `:514-546`).
 ### Raw-only exports
 
 With `raw_bundles.mode: only`, the exporter copies matching Unity bundles and returns before any
-decoder runs (`src/export.rs:599-606`). The following settings are still parsed and validated
+decoder runs (`src/export.rs:652-659`). The following settings are still parsed and validated
 but have no effect in that mode: `read_kinds`, `cri`, `image`, `audio`, `video`, `media_backend`
 (an `ffi` value still requires an FFI-capable build), `stage_limits` caps, `media_concurrency`,
-`media_timeout_seconds`, `split_acb_xor_env`, `selection.unity_class_ids` and
-`selection.embedded_audio`. `cri_key_env` and `ffmpeg` may be omitted (`src/export.rs:211`).
+`media_timeout_seconds`, `media_retry`, `split_acb_xor_env`, `selection.unity_class_ids` and
+`selection.embedded_audio`. `cri_key_env` and `ffmpeg` may be omitted (`src/export.rs:260`).
 `selection.providers`, `paths`, `concurrency`, `cpu` and byte limits still apply. The inert
-values are recorded in the summary (`src/export.rs:406-420`) and in the decoded-cache scope
-(`src/export_cache.rs:77-105`), so changing them invalidates cached entries; the summary always
+output-affecting values are recorded in the summary (`src/export.rs:456-470`) and in the
+decoded-cache scope (`src/export_cache.rs:77-105`), so changing them invalidates cached entries;
+the scheduling-only `stage_limits`, `media_concurrency`, `media_timeout_seconds` and `media_retry`
+are in neither. The summary always
 reports `full_export: false`. No warning is emitted.
 
 ### Media command retry
 
-See the `execution.retry` rows: FFmpeg command retry is not restored.
+See the `execution.retry` rows: FFmpeg command retry is restored as opt-in `media_retry` (default one attempt).
 
 ## Changed defaults and limits
 
@@ -280,6 +282,7 @@ See the `execution.retry` rows: FFmpeg command retry is not restored.
 | Audio/video encode caps | 12/4 | none unless configured; `media_concurrency` 2; service `max_media_processes` 4 |
 | Download retry | 4 attempts, 1000-4000 ms | 3 attempts, 250-5000 ms (snapshot 500 ms), 1..8 |
 | Upload retry | 4 attempts, 1000-4000 ms | 3 attempts (1..8), 500 ms doubling, capped at 30 s |
+| FFmpeg command retry | 4 attempts, 1000-4000 ms, jittered | `media_retry` 1 attempt (1..8), 1000-4000 ms doubling, no jitter |
 | Media backend | `ffi` | `cli` |
 | Image / video / audio formats | `png` / `mp4` / `mp3` | `png` / `mkv` / `wav` |
 | JPEG | `jpg`, global quality 95 | `jpeg` with required `quality` and `background` |
@@ -346,7 +349,7 @@ only selects those classes. `animator_bundle_fbx` appears in payload naming and 
 handling (`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/export/payload/manifest.rs:85`) and tests, with no
 producer at this baseline. Conclusion: no FBX animation requirement follows from the selector or
 payload label. Sirius `auto` writes type-tree JSON for classes without an adapter
-(`src/export.rs:1034-1040`); an operator wanting the original's raw fallback selects
+(`src/export.rs:1087-1093`); an operator wanting the original's raw fallback selects
 `object_raw` for class 95/91. This does not prove every animation payload decodes, nor parity
 with external AssetStudio tools.
 

@@ -419,3 +419,42 @@ impl CriExport {
         self.acb == ContainerMode::Decode && self.usm == ContainerMode::Decode
     }
 }
+
+/// Bounded retry of individual FFmpeg child processes after a failure classified as transient.
+/// Scheduling only: it never changes an accepted output, so it is excluded from cache identity.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaRetry {
+    pub attempts: usize,
+    pub delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+impl Default for MediaRetry {
+    fn default() -> Self {
+        Self {
+            attempts: 1,
+            delay_ms: 1000,
+            max_delay_ms: 4000,
+        }
+    }
+}
+impl MediaRetry {
+    pub fn validate(&self) -> Result<(), Error> {
+        if !(1..=8).contains(&self.attempts)
+            || self.delay_ms > 60_000
+            || self.max_delay_ms > 60_000
+            || self.delay_ms > self.max_delay_ms
+        {
+            return Err(Error::Config);
+        }
+        Ok(())
+    }
+    /// Delay before retry number `retry` (0-based): doubling, capped, without jitter.
+    pub fn delay(&self, retry: usize) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.delay_ms
+                .saturating_mul(1u64.checked_shl(retry as u32).unwrap_or(u64::MAX))
+                .min(self.max_delay_ms),
+        )
+    }
+}

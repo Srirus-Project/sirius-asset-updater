@@ -287,6 +287,47 @@ assets. Media admission remains separately bounded by `media_concurrency` and th
 `max_media_processes`; increasing resource workers does not bypass those limits. Job concurrency
 can multiply resource workers across regions. Sampled CPU throttling is described in [CPU policy](EXPORT.md#sampled-cpu-throttling); automatic sizing of individual stages is described under [Automatic stage widths](#automatic-stage-widths).
 
+## Media process retry
+
+```yaml
+media_retry:
+  attempts: 1        # 1..8; 1 (default) = no retry
+  delay_ms: 1000     # 0..60000, first backoff
+  max_delay_ms: 4000 # 0..60000, >= delay_ms
+```
+
+This restores the original `execution.retry` for FFmpeg commands. Each FFmpeg child launched
+by the exporter (CLI FLAC/MP3/MP4 encoding including the Auto CLI fallback, USM remux, ADX
+decoding and the independent decode checks) is retried only after a failure classified as
+transient by the original's rules: a spawn error of kind interrupted, timed out, would block,
+broken pipe or connection reset/aborted/refused, or `ETXTBSY`; or a failed exit/diagnostic whose
+status or stderr contains `timed out`, `timeout`, `connection reset|refused|aborted`,
+`temporarily unavailable`, `broken pipe`, `i/o error`, `input/output error`, `signal` or
+`killed` (for example a child killed by a signal). Other nonzero exits and missing executables
+fail at once. The backoff doubles from `delay_ms` up to `max_delay_ms`, without the original's
+jitter because these are local processes rather than a shared remote endpoint.
+
+Semantics:
+
+- Cancellation and the media deadline are never retried. All attempts, admission waits and
+  backoff share the one `media_timeout_seconds` deadline of the operation (for encoding, the
+  same deadline that covers stage admission and Auto fallback); a retry whose backoff would end
+  at or after it is not attempted, so retry never extends the media timeout or the job deadline.
+- Backoff checks cancellation at least every 20 ms and holds no local/shared media slot or CPU
+  permit; each attempt reacquires them within the deadline. An `audio_encode`/`video_encode`
+  stage slot and the resource's byte budget stay held across attempts, as for Auto fallback.
+- A file the command writes without `-y` is removed before the next attempt, so no attempt sees
+  a partial output; commands using `-y` or `-progress` truncate their target.
+- Only the process is retried. Verification of a produced output (frame count, PCM roundtrip,
+  WAV length/format, MP3 duration) is not: the original never retried beyond the command, and a
+  mismatch of deterministic input would recur. FFI conversions are not retried either; the
+  original classified FFI errors as non-retryable, and Auto still falls back to CLI once.
+- `summary.json` records `media_retries`, the number of retries started. Retry log events carry
+  only attempt counts and the delay, never paths or FFmpeg stderr.
+
+The policy is scheduling only: an accepted output passes the same verification regardless of how
+many attempts it took, so `media_retry` is not part of decoded-cache identity.
+
 ## Independent decoder stages
 
 Each export profile may constrain specific processing stages independently:
