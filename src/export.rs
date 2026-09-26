@@ -3508,7 +3508,9 @@ pub(crate) mod tests {
                     let info = decoder.next_frame(&mut decoded).unwrap();
                     assert_eq!((info.width, info.height), (2, 2));
                     let expected: Vec<u8> = layers[index]
-                        .chunks_exact(8)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
                         .rev()
                         .flatten()
                         .copied()
@@ -3566,7 +3568,14 @@ pub(crate) mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.outputs.len(), 4);
         for (layer, pixels) in layers.iter().enumerate() {
-            let expected: Vec<u8> = pixels.chunks_exact(8).rev().flatten().copied().collect();
+            let expected: Vec<u8> = pixels
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .rev()
+                .flatten()
+                .copied()
+                .collect();
             for extension in ["png", "webp"] {
                 let name = format!("0_41_layer_{layer:04}.{extension}");
                 let record = report.outputs.iter().find(|r| r.path == name).unwrap();
@@ -4248,7 +4257,9 @@ pub(crate) mod tests {
         let mut decoded = vec![0; decoder.output_buffer_size().unwrap()];
         let info = decoder.next_frame(&mut decoded).unwrap();
         let expected: Vec<u8> = pixels
-            .chunks_exact(16 * 4)
+            .as_chunks::<{ 16 * 4 }>()
+            .0
+            .iter()
             .rev()
             .flatten()
             .copied()
@@ -4293,7 +4304,9 @@ pub(crate) mod tests {
             "{format: jpeg, quality: 100, background: [255,255,255]}",
         ];
         let flipped: Vec<u8> = pixels
-            .chunks_exact(16 * 4)
+            .as_chunks::<{ 16 * 4 }>()
+            .0
+            .iter()
             .rev()
             .flatten()
             .copied()
@@ -4338,7 +4351,12 @@ pub(crate) mod tests {
                 let actual = fs::read(raw).unwrap();
                 assert_eq!(actual.len(), flipped.len());
                 if record.kind == "image_jpeg" {
-                    for (pixel, source) in actual.chunks_exact(4).zip(flipped.chunks_exact(4)) {
+                    for (pixel, source) in actual
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(flipped.as_chunks::<4>().0.iter())
+                    {
                         assert_eq!(pixel[3], 255);
                         for c in 0..3 {
                             let expected = ((source[c] as u32 * source[3] as u32
@@ -4486,7 +4504,7 @@ pub(crate) mod tests {
             raw.as_os_str().to_owned(),
         ])
         .unwrap();
-        for pixel in fs::read(raw).unwrap().chunks_exact(4) {
+        for pixel in fs::read(raw).unwrap().as_chunks::<4>().0.iter() {
             for (actual, expected) in pixel.iter().zip([255u8, 127, 127, 255]) {
                 assert!(actual.abs_diff(expected) <= 3);
             }

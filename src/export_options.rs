@@ -359,7 +359,9 @@ mod png_tests {
                 );
                 let expected: Vec<u8> = if flipped {
                     pixels
-                        .chunks_exact(128 * 4)
+                        .as_chunks::<{ 128 * 4 }>()
+                        .0
+                        .iter()
                         .rev()
                         .flatten()
                         .copied()
