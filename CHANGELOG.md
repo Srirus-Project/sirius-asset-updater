@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.0
+
+Restores the reusable service capabilities of the original Haruki asset updater for Sirius.
+Sekai chart-hash, character-ID and 3D model adapters are not copied; see
+`docs/HARUKI_CONFIG_AUDIT.md` for the field-by-field audit and `docs/RESTORATION_1_2.md` for the ledger.
+
+- Authenticated long-running job service: durable queue, idempotent submission, status and
+  progress, cancel/retry, retention, safe restart and shutdown, and offline dry-run planning.
+- Service jobs run the real Sirius catalog, download, verification, decryption and export
+  pipeline; downloads and decoded exports are reused by verified content identity.
+- Native catalog selection with include/exclude filters, priorities and exact Unity types;
+  partial selections are never reported as full exports.
+- Image, audio and video formats with CLI or FFI media backends, CRI ACB/USM decode or
+  preserve policies, raw Unity bundle export, and bounded retry of transient FFmpeg failures.
+- Local and S3 publication with verified read-back before cleanup, credential references,
+  STS/credential files and public-read policies.
+- Separate stage concurrency, resource budgets and CPU policy; TLS, proxies, application logs
+  with per-target levels, and access logs with optional templates.
+- Durable completion notifications.
+- Environment path overrides for every configuration document and optional remote loading of
+  the download configuration; all configuration structures reject unknown fields.
+
 ## 1.1.0
 
 - Add explicit JP/TW/EN/KR identities and reserve CN without enabling unverified networking.

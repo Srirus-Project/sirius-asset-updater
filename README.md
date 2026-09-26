@@ -14,7 +14,7 @@ is retained in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an un
 - Export Unity objects, sprites, Live2D MOC3, inline/SplitAcb audio and USM color/alpha video offline.
 - Validate decoded outputs, exact ADX sample counts and complete video frame counts.
 
-Application version **1.1.0** is independent of the JP iOS 1.0.3 game/protocol baseline.
+Application version **1.2.0** is independent of the JP iOS 1.0.3 game/protocol baseline.
 The restoration branch also provides an [authenticated job service](docs/JOB_SERVICE.md).
 Use an external scheduler for recurring downloads; the updater does not manage game accounts.
 
@@ -24,7 +24,7 @@ Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejec
 network activity. CLI configurations select one region; the job service accepts regional profiles. JP retains its existing functionality; Global
 currently supports verified server discovery/version queries and region-aware asset transport,
 not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
-instructions](docs/REGIONS.md) before deploying paired v1.1.0 services.
+instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start
 

@@ -1,4 +1,4 @@
-# Region support in v1.1.0
+# Region support
 
 Region is distinct from deployment environment and UI language. Run one proxy instance per
 region, with separate configuration, tokens, game credentials, session locks and storage.
