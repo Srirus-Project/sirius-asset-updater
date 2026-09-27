@@ -14,7 +14,7 @@ is retained in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an un
 - Export Unity objects, sprites, Live2D MOC3, inline/SplitAcb audio and USM color/alpha video offline.
 - Validate decoded outputs, exact ADX sample counts and complete video frame counts.
 
-Application version **1.2.2** is independent of the JP iOS 1.0.3 game/protocol baseline.
+Application version **1.2.3** is independent of the JP iOS 1.0.3 game/protocol baseline.
 The restoration branch also provides an [authenticated job service](docs/JOB_SERVICE.md).
 Use an external scheduler for recurring downloads; the updater does not manage game accounts.
 
