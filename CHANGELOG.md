@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3
+
+- Storage `layout: {type: stable}` publishes readable keys in place, restoring the original
+  updater's by-category output: `hk/adv/chat/data/003_rana/data/back.png` instead of
+  `PREFIX/REGION/publications/UUID/00002/0_-8311370764686020398.png`. Unity outputs follow their
+  container path (without `Assets/AddressableResources`, lowercase) with the original's
+  `<stem>.assets/<type>/` sub-object rules; CRI ACB tracks are named by cue and USM outputs by the
+  movie name. Only new or changed files are uploaded; `_sirius/files.jsonl` maps every key to its
+  source asset and SHA-256, and `_sirius/version.json` records the resource version. `prune`
+  (default off) deletes keys a newer export no longer produces. The default versioned layout is
+  unchanged.
+
 ## 1.2.2
 
 - cridecoder 0.3.6. USM files that carry audio metadata (an audio seek table) before the metadata

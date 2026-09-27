@@ -16,6 +16,7 @@ fn local(directory: PathBuf) -> Provider {
         name: "local".into(),
         prefix: "assets".into(),
         public_base_url: None,
+        layout: Layout::Publication,
         backend: Backend::Local { directory },
     }
 }
@@ -28,6 +29,7 @@ fn config(provider: Provider) -> Config {
         object_timeout_seconds: 5,
         retry_delay_ms: 1,
         remove_local_after_upload: false,
+        release: None,
     }
 }
 fn fixture() -> tempfile::TempDir {
@@ -315,6 +317,7 @@ async fn server() -> Server {
         name: "s3".into(),
         prefix: "assets".into(),
         public_base_url: None,
+        layout: Layout::Publication,
         backend: Backend::S3 {
             credentials_file: None,
             assume_role: None,
@@ -1497,4 +1500,282 @@ async fn s3_shared_file_publication_selects_explicit_profile_and_rejects_mixed_s
         *access_key_id_env = server.env[0].clone();
     }
     assert!(server.config.validate().is_err());
+}
+
+type FixtureFile = (
+    &'static str,
+    &'static str,
+    &'static [u8],
+    &'static str,
+    Option<(i32, &'static str, &'static str)>,
+);
+/// A synthetic export with Unity objects and one CRI ACB. `files` are (resource dir, file name,
+/// bytes, kind, object: (class_id, name, container)). No game data is used.
+fn stable_fixture(files: &[FixtureFile]) -> tempfile::TempDir {
+    use crate::export::ExportSummary;
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = Vec::new();
+    let mut dirs: Vec<&str> = files.iter().map(|f| f.0).collect();
+    dirs.dedup();
+    let (mut total, mut bytes, mut objects) = (0, 0u64, 0);
+    let mut payloads = BTreeMap::new();
+    for dir in dirs {
+        std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        let mut outputs = Vec::new();
+        let mut source = format!("bundle_{dir}");
+        for (d, name, data, kind, object) in files.iter().filter(|f| f.0 == dir) {
+            std::fs::write(root.path().join(d).join(name), data).unwrap();
+            let mut output = sonic_rs::json!({"path": name, "kind": kind, "bytes": data.len(),
+                "sha256": hex::encode(Sha256::digest(data))});
+            if let Some((class_id, object_name, container)) = object {
+                objects += 1;
+                output["object"] = sonic_rs::json!({"source_file": "b.bundle::CAB", "path_id": objects,
+                    "class_id": class_id, "name": object_name, "container": container});
+            } else {
+                source = format!(
+                    "cri_assets_cri/sound/voice_{}",
+                    "0123456789abcdef".repeat(2)
+                );
+            }
+            total += 1;
+            bytes += data.len() as u64;
+            *payloads.entry(kind.to_string()).or_insert(0) += 1;
+            outputs.push(output);
+        }
+        let unity = outputs.iter().filter(|o| o.get("object").is_some()).count();
+        let report = sonic_rs::json!({"source": source, "source_sha256": "a".repeat(64),
+            "output_directory": dir, "objects": unity, "selected_objects": unity,
+            "skipped_objects": 0, "errors": [], "outputs": outputs});
+        journal.extend(sonic_rs::to_vec(&report).unwrap());
+        journal.push(b'\n');
+    }
+    std::fs::write(root.path().join("resources.jsonl"), journal).unwrap();
+    let resources = files.iter().map(|f| f.0).collect::<HashSet<_>>().len();
+    let summary = ExportSummary {
+        schema_version: 4,
+        region: Region::Hk,
+        platform: "Android".into(),
+        complete: true,
+        retained: true,
+        input_files: resources,
+        catalog_files: resources,
+        succeeded: resources,
+        output_files: total,
+        output_bytes: bytes,
+        unity_objects: objects,
+        selected_unity_objects: objects,
+        catalog_sha256: "c".repeat(64),
+        full_catalog: true,
+        full_export: true,
+        payloads,
+        ..Default::default()
+    };
+    std::fs::write(
+        root.path().join("summary.json"),
+        sonic_rs::to_vec(&summary).unwrap(),
+    )
+    .unwrap();
+    root
+}
+fn stable_files(back: &'static [u8], with_extra: bool) -> Vec<FixtureFile> {
+    const C: &str = "Assets/AddressableResources/Adv/Chat/back.png";
+    let mut files = vec![
+        ("00000", "0_1.png", back, "image_png", Some((28, "back", C))),
+        (
+            "00000",
+            "0_2.png",
+            b"sprite" as &[u8],
+            "image_png",
+            Some((213, "back", C)),
+        ),
+        ("00001", "00000.wav", b"RIFF-voice-1", "hca_wav", None),
+        (
+            "00001",
+            "00000.cues.json",
+            br#"[["voice_001",0,0]]"#,
+            "cue_metadata",
+            None,
+        ),
+    ];
+    if with_extra {
+        files.push((
+            "00002",
+            "0_3.json",
+            b"{}",
+            "typetree_json",
+            Some((1, "Extra", "Assets/AddressableResources/Ui/Extra.prefab")),
+        ));
+    }
+    files
+}
+use sonic_rs::JsonValueTrait as _;
+fn stable(provider: Provider, prune: bool) -> Provider {
+    Provider {
+        prefix: "hk".into(),
+        layout: Layout::Stable {
+            strip_prefixes: stable_strip_prefixes(),
+            lowercase: true,
+            prune,
+        },
+        ..provider
+    }
+}
+#[tokio::test]
+async fn stable_layout_publishes_readable_keys_and_uploads_only_changes() {
+    let destination = tempfile::tempdir().unwrap();
+    let root = destination.path().join("hk");
+    let mut config = config(stable(local(destination.path().into()), false));
+    config.release = Some(ReleaseInfo {
+        resource_version: "1.0.0.104".into(),
+        platform_hash: "d".repeat(32),
+        catalog_sha256: "c".repeat(64),
+    });
+    let (_tx, rx) = watch::channel(false);
+    let first = stable_fixture(&stable_files(b"texture-v1", true));
+    let result = config
+        .publish(first.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    let target = &result.providers[0];
+    assert_eq!((target.prefix.as_str(), target.layout), ("hk", "stable"));
+    let counts = target.stable.unwrap();
+    assert_eq!(
+        (
+            counts.files,
+            counts.uploaded,
+            counts.unchanged,
+            counts.pruned
+        ),
+        (5, 5, 0, 0)
+    );
+    assert_eq!(
+        std::fs::read(root.join("adv/chat/back.png")).unwrap(),
+        b"texture-v1"
+    );
+    assert_eq!(
+        std::fs::read(root.join("adv/chat/back.assets/sprite/back.png")).unwrap(),
+        b"sprite"
+    );
+    assert_eq!(
+        std::fs::read(root.join("cri/sound/voice/voice_001.wav")).unwrap(),
+        b"RIFF-voice-1"
+    );
+    assert!(root.join("cri/sound/voice/voice_001.cues.json").is_file());
+    assert!(root.join("ui/extra.assets/gameobject/extra.json").is_file());
+    // No numbered directories, publication UUIDs or completion marker in the stable tree.
+    assert!(!root.join("00000").exists() && !root.join("complete.json").exists());
+    let manifest = std::fs::read_to_string(root.join("_sirius/files.jsonl")).unwrap();
+    assert_eq!(manifest.lines().count(), 5);
+    assert!(!manifest.contains("\"local\"") && manifest.contains("\"source\""));
+    let version: sonic_rs::Value =
+        sonic_rs::from_slice(&std::fs::read(root.join("_sirius/version.json")).unwrap()).unwrap();
+    assert_eq!(version["layout"].as_str(), Some("stable"));
+    assert_eq!(
+        version["release"]["resource_version"].as_str(),
+        Some("1.0.0.104")
+    );
+    assert_eq!(version["publication_id"].as_str(), Some(result.id.as_str()));
+    assert!(root.join("_sirius/summary.json").is_file());
+
+    // Unchanged rerun uploads nothing; a changed texture uploads exactly that file.
+    let result = config
+        .publish(first.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    let counts = result.providers[0].stable.unwrap();
+    assert_eq!((counts.uploaded, counts.unchanged), (0, 5));
+    let second = stable_fixture(&stable_files(b"texture-v2", false));
+    let result = config
+        .publish(second.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    let counts = result.providers[0].stable.unwrap();
+    assert_eq!(
+        (
+            counts.files,
+            counts.uploaded,
+            counts.unchanged,
+            counts.pruned
+        ),
+        (4, 1, 3, 0)
+    );
+    assert_eq!(
+        std::fs::read(root.join("adv/chat/back.png")).unwrap(),
+        b"texture-v2"
+    );
+    // Without pruning a removed resource stays published but leaves the manifest.
+    assert!(root.join("ui/extra.assets/gameobject/extra.json").is_file());
+    assert_eq!(
+        std::fs::read_to_string(root.join("_sirius/files.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+
+    // With pruning, keys from the previous manifest that are no longer produced are deleted.
+    let third = stable_fixture(&stable_files(b"texture-v2", true));
+    config
+        .publish(third.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    config.providers[0] = stable(local(destination.path().into()), true);
+    let result = config.publish(second.path(), Region::Hk, rx).await.unwrap();
+    let counts = result.providers[0].stable.unwrap();
+    assert_eq!((counts.uploaded, counts.pruned), (0, 1));
+    assert!(!root.join("ui/extra.assets/gameobject/extra.json").exists());
+    assert!(root.join("adv/chat/back.png").is_file());
+}
+#[tokio::test]
+async fn stable_layout_rejects_plans_outside_the_verified_inventory() {
+    let destination = tempfile::tempdir().unwrap();
+    let config = config(stable(local(destination.path().into()), false));
+    let source = stable_fixture(&stable_files(b"texture-v1", false));
+    // A journal that names a file the export does not contain fails verification.
+    let journal = std::fs::read_to_string(source.path().join("resources.jsonl")).unwrap();
+    std::fs::write(
+        source.path().join("resources.jsonl"),
+        journal.replace("0_2.png", "0_9.png"),
+    )
+    .unwrap();
+    let (_tx, rx) = watch::channel(false);
+    assert!(config.publish(source.path(), Region::Hk, rx).await.is_err());
+    assert!(!destination.path().join("hk/_sirius/version.json").exists());
+}
+#[tokio::test]
+async fn stable_layout_over_s3_treats_a_missing_manifest_as_first_publication() {
+    let mut server = server().await;
+    let provider = server.config.providers[0].clone();
+    server.config.providers[0] = stable(provider, false);
+    let source = stable_fixture(&stable_files(b"texture-v1", true));
+    let (_tx, rx) = watch::channel(false);
+    let result = server
+        .config
+        .publish(source.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.providers[0].stable.unwrap().uploaded, 5);
+    {
+        let objects = server.state.objects.lock().unwrap();
+        for key in [
+            "/synthetic-bucket/hk/adv/chat/back.png",
+            "/synthetic-bucket/hk/cri/sound/voice/voice_001.wav",
+            "/synthetic-bucket/hk/_sirius/files.jsonl",
+            "/synthetic-bucket/hk/_sirius/version.json",
+        ] {
+            assert!(objects.contains_key(key), "{key}");
+        }
+        assert!(!objects
+            .keys()
+            .any(|k| k.contains("/publications/") || k.ends_with("complete.json")));
+    }
+    let puts = server.state.puts.load(Ordering::SeqCst);
+    let result = server
+        .config
+        .publish(source.path(), Region::Hk, rx)
+        .await
+        .unwrap();
+    assert_eq!(result.providers[0].stable.unwrap().uploaded, 0);
+    // Only the manifest, summary and version objects are rewritten.
+    assert_eq!(server.state.puts.load(Ordering::SeqCst) - puts, 3);
 }

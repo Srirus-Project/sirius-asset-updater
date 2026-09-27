@@ -47,3 +47,8 @@ attempts: 3
 object_timeout_seconds: 300
 retry_delay_ms: 500
 remove_local_after_upload: false
+# Readable keys updated in place (see docs/STORAGE.md#stable-readable-layout):
+#   - name: assets
+#     prefix: "{region}"
+#     layout: {type: stable}
+#     backend: {type: local, directory: ./published-stable}

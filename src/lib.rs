@@ -11,6 +11,7 @@ pub mod network;
 pub mod proxy;
 pub mod raw_bundles;
 pub mod readiness;
+pub mod stable_layout;
 pub mod storage;
 mod update;
 pub mod verify;

@@ -53,6 +53,54 @@ not applicable. There is therefore nothing to restore here. Sirius adds its own
 consumer-facing master registry belongs to the API requirements in
 [RESTORATION_1_2.md](RESTORATION_1_2.md), not to the updater.
 
+## Stable readable layout
+
+`layout: {type: stable}` on a provider publishes the same verified files under readable keys
+that are updated in place, like the original updater's `export.by_category` output
+(`Haruki-Sekai-Asset-Updater@3d33ed03:crates/sekai-asset-pipeline/src/export/paths.rs`). There
+are no `REGION/publications/UUID` segments and no numbered resource directories:
+
+```yaml
+providers:
+  - name: garage
+    prefix: hk            # keys are hk/<path>; {region} templates still work
+    layout:
+      type: stable
+      strip_prefixes: [Assets/AddressableResources]   # default
+      lowercase: true                                  # default
+      prune: false                                     # default
+    backend: {type: s3, ...}
+```
+
+Key rules (the export itself keeps numbered local directories; game names only become keys):
+
+| Output | Key |
+| --- | --- |
+| Unity object | container without the first matching `strip_prefixes` entry, output extension: `Assets/AddressableResources/Adv/Chat/back.png` → `adv/chat/back.png` |
+| Other objects of that container | `<container stem>.assets/<type dir>/<object name>.<ext>` (`sprite`, `gameobject`, `transform`, `recttransform`, `monobehaviour`, `mesh_renderer`, …) |
+| Flat exceptions | MonoBehaviour named like its container; the single Texture2D named like its container; fonts next to the container; AudioClip, VideoClip, SpriteAtlas |
+| TextAsset | container file name; `x.bytes` → `x`, `x.acb.bytes` → `x.acb` |
+| Unnamed object | `<Type>_<n>`, numbered per container and type in catalog order (the original's `_#` would start a URL fragment) |
+| Object without container | `_bundles/<bundle>/<type dir>/<name>.<ext>` |
+| CRI ACB (`x_assets_x/dir/name_<hash>`) | `x/dir/name/<cue>.wav` and `<cue>.cues.json`, named by the first cue of each track |
+| CRI USM | `x/dir/name/name.mkv`, `name.ivf`/`name.m2v`, `name.wav`, `name.usm.json`, `name.container-mask.json` |
+
+Object names are sanitized like the original (`<>:"/\|?*`, plus `#` and `%`, and control
+characters become `_`; repeated `(Clone)` becomes `__cloneN`; stems over 220 characters are
+truncated). Container components keep only normal path segments. Collisions resolve in catalog
+order: byte-identical content is written once, different content gets `__dup2`, `__dup3`, …
+Keys are compared case-insensitively.
+
+Each publication reads the previous `_sirius/files.jsonl`, uploads only new or changed files
+(same key, size and SHA-256 are skipped), and then writes `_sirius/files.jsonl` (one line per key:
+`path`, `bytes`, `sha256`, `source`, `kind` and the Unity `class_id`, `container`, `name`),
+`_sirius/summary.json` (the export summary) and finally `_sirius/version.json` (publication ID,
+the job's resource version, platform hash and catalog SHA-256, counts, completion time and the
+verification report). Consumers read `version.json` first. Files the export no longer produces
+stay published unless `prune: true`, which deletes only keys listed in the previous manifest.
+Unlike the versioned layout, a stable prefix changes in place: while a publication runs, readers
+can see a mix of old and new files, as with the original.
+
 ## S3 public-read policy
 
 S3 providers accept `public_read` (default false), `public_read_include` and

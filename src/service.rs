@@ -675,6 +675,11 @@ impl Service {
                         let mut storage: crate::storage::Config =
                             read_yaml(path, crate::config_env::Document::Storage)?;
                         storage.service_upload_gate = Some(self.inner.upload_gate.clone());
+                        storage.release = Some(crate::storage::ReleaseInfo {
+                            resource_version: outcome.verification.resource_version.clone(),
+                            platform_hash: outcome.verification.platform_hash.clone(),
+                            catalog_sha256: outcome.verification.catalog_sha256.clone(),
+                        });
                         let (progress_tx, progress_rx) =
                             watch::channel(crate::storage::UploadProgress::default());
                         let task = storage.publish_with_progress(

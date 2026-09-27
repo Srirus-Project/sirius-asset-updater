@@ -4,7 +4,7 @@ use crate::{
     region::Region,
     Error,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, FutureExt, StreamExt};
 use opendal::{services, HttpTransporter, OperationContext, Operator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +38,15 @@ pub struct Config {
     pub retry_delay_ms: u64,
     #[serde(default)]
     pub remove_local_after_upload: bool,
+    /// Catalog identity of the job, recorded in stable-layout `version.json` (set by the service).
+    #[serde(skip)]
+    pub(crate) release: Option<ReleaseInfo>,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReleaseInfo {
+    pub resource_version: String,
+    pub platform_hash: String,
+    pub catalog_sha256: String,
 }
 fn concurrency() -> usize {
     4
@@ -59,7 +68,47 @@ pub struct Provider {
     pub prefix: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// `publication` (default): immutable `PREFIX/REGION/publications/UUID/` trees with
+    /// numbered resource directories. `stable`: readable keys updated in place under `PREFIX/`.
+    #[serde(default)]
+    pub layout: Layout,
     pub backend: Backend,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Layout {
+    #[default]
+    Publication,
+    Stable {
+        #[serde(default = "stable_strip_prefixes")]
+        strip_prefixes: Vec<String>,
+        #[serde(default = "stable_lowercase")]
+        lowercase: bool,
+        #[serde(default)]
+        prune: bool,
+    },
+}
+fn stable_strip_prefixes() -> Vec<String> {
+    crate::stable_layout::Options::default().strip_prefixes
+}
+fn stable_lowercase() -> bool {
+    true
+}
+impl Layout {
+    fn stable(&self) -> Option<crate::stable_layout::Options> {
+        match self {
+            Layout::Publication => None,
+            Layout::Stable {
+                strip_prefixes,
+                lowercase,
+                prune,
+            } => Some(crate::stable_layout::Options {
+                strip_prefixes: strip_prefixes.clone(),
+                lowercase: *lowercase,
+                prune: *prune,
+            }),
+        }
+    }
 }
 fn path_style() -> bool {
     true
@@ -256,6 +305,55 @@ pub struct Target {
     pub prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    pub layout: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable: Option<StableCounts>,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StableCounts {
+    pub files: usize,
+    pub uploaded: usize,
+    pub unchanged: usize,
+    pub pruned: usize,
+    pub deduplicated: usize,
+    pub renamed: usize,
+}
+struct StableContext<'a> {
+    input: &'a Path,
+    region: Region,
+    id: &'a str,
+    report: &'a export_verify::Report,
+}
+#[derive(Serialize)]
+struct StableVersion<'a> {
+    schema_version: u8,
+    layout: &'static str,
+    region: Region,
+    publication_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release: Option<&'a ReleaseInfo>,
+    files: usize,
+    bytes: u64,
+    uploaded: usize,
+    unchanged: usize,
+    pruned: usize,
+    deduplicated: usize,
+    renamed: usize,
+    completed_at: String,
+    verification: &'a export_verify::Report,
+}
+/// `path -> (bytes, sha256)` of the verified export inventory.
+async fn verified_inventory(
+    path: &Path,
+) -> Result<std::collections::HashMap<String, (u64, String)>, Error> {
+    let file = tokio::fs::File::open(path).await.map_err(|_| Error::Io)?;
+    let mut lines = BufReader::new(file).lines();
+    let mut inventory = std::collections::HashMap::new();
+    while let Some(line) = lines.next_line().await.map_err(|_| Error::Io)? {
+        let object: Object = sonic_rs::from_str(&line).map_err(|_| Error::Verification)?;
+        inventory.insert(object.path, (object.bytes, object.sha256));
+    }
+    Ok(inventory)
 }
 #[derive(Serialize)]
 pub struct Plan {
@@ -341,6 +439,9 @@ impl Config {
                 return Err(Error::Config);
             }
             validate_backend(&p.backend)?;
+            if let Some(options) = p.layout.stable() {
+                options.validate()?;
+            }
         }
         Ok(())
     }
@@ -412,19 +513,80 @@ impl Config {
             let target = provider.target(region, &id)?;
             operators.push((op, public_op, policy, target));
         }
+        let operators_len = operators.len();
+        // Stable layouts need the readable key plan; every planned file must be a verified output.
+        let mut stable_plans = Vec::new();
+        for provider in &resolved.providers {
+            stable_plans.push(match provider.layout.stable() {
+                Some(options) => {
+                    let plan_input = input.clone();
+                    let plan_options = options.clone();
+                    let plan = tokio::task::spawn_blocking(move || {
+                        crate::stable_layout::plan(&plan_input, &plan_options)
+                    })
+                    .await
+                    .map_err(|_| Error::Io)??;
+                    Some((options, plan))
+                }
+                None => None,
+            });
+        }
+        if stable_plans.iter().any(Option::is_some) {
+            let inventory = verified_inventory(verified.inventory.path()).await?;
+            for (_, plan) in stable_plans.iter().flatten() {
+                for entry in &plan.entries {
+                    match inventory.get(&entry.local) {
+                        Some((bytes, sha)) if *bytes == entry.bytes && *sha == entry.sha256 => {}
+                        _ => return Err(Error::Verification),
+                    }
+                }
+            }
+        }
         let mut total_bytes = 0_u64;
         let mut total_files = 0_usize;
         let mut progress = UploadProgress {
             phase: "publish".into(),
-            total: (verified.report.files_verified as u64)
-                .checked_add(2)
-                .and_then(|n| n.checked_mul(operators.len() as u64))
+            total: stable_plans
+                .iter()
+                .map(|plan| match plan {
+                    Some((_, plan)) => (plan.entries.len() as u64).checked_add(3),
+                    None => (verified.report.files_verified as u64).checked_add(2),
+                })
+                .try_fold(0_u64, |sum, n| n.and_then(|n| sum.checked_add(n)))
                 .ok_or(Error::Size)?,
             ..UploadProgress::default()
         };
-        for (index, (op, public_op, policy, target)) in operators.iter().enumerate() {
-            progress.phase = format!("publish_upload_{}_of_{}", index + 1, operators.len());
+        for (index, ((op, public_op, policy, target), stable)) in
+            operators.iter_mut().zip(&stable_plans).enumerate()
+        {
+            progress.phase = format!("publish_upload_{}_of_{}", index + 1, operators_len);
             progress.emit(&progress_channel);
+            if let Some((options, plan)) = stable {
+                let context = StableContext {
+                    input: &input,
+                    region,
+                    id: &id,
+                    report: &verified.report,
+                };
+                let counts = self
+                    .publish_stable(
+                        op,
+                        public_op.as_ref(),
+                        policy,
+                        &target.prefix,
+                        options,
+                        plan,
+                        &context,
+                        stop.clone(),
+                        &mut progress,
+                        &progress_channel,
+                    )
+                    .await?;
+                total_files = counts.files;
+                total_bytes = plan.entries.iter().map(|e| e.bytes).sum();
+                target.stable = Some(counts);
+                continue;
+            }
             let inventory = tokio::fs::File::open(verified.inventory.path())
                 .await
                 .map_err(|_| Error::Io)?;
@@ -448,6 +610,7 @@ impl Config {
                     let failed = failed.clone();
                     let stop = stop.clone();
                     let input = &input;
+                    let (op, public_op, policy, target) = (&*op, &*public_op, &*policy, &*target);
                     async move {
                         if failed.load(Ordering::Acquire) {
                             return Err(Error::Cancelled);
@@ -459,8 +622,8 @@ impl Config {
                             } else {
                                 op
                             };
-                            self.upload(op, &target.prefix, input, &object, stop)
-                                .await?;
+                            let key = format!("{}/{}", target.prefix, object.path);
+                            self.upload(op, &key, input, &object, stop).await?;
                             Ok(object.bytes)
                         }
                         .await;
@@ -502,43 +665,20 @@ impl Config {
         progress.phase = "publish_markers".into();
         progress.emit(&progress_channel);
         // Consumers must ignore prefixes without this last, verified completion marker.
+        // (Stable layouts wrote `_sirius/version.json` as their last object above.)
         let marker = sonic_rs::to_vec(&verified.report).map_err(|_| Error::Verification)?;
-        for (op, public_op, policy, target) in &operators {
+        for ((op, public_op, policy, target), stable) in operators.iter().zip(&stable_plans) {
+            if stable.is_some() {
+                continue;
+            }
             let op = if policy.matches("complete.json") {
                 public_op.as_ref().unwrap_or(op)
             } else {
                 op
             };
             let key = format!("{}/complete.json", target.prefix);
-            let expected = hex::encode(Sha256::digest(&marker));
-            for attempt in 0..self.attempts {
-                let task = async {
-                    let _permit = self.acquire_upload().await?;
-                    op.write(&key, marker.clone())
-                        .await
-                        .map_err(storage_error)?;
-                    check_remote(op, &key, marker.len() as u64, &expected).await
-                };
-                match controlled(
-                    task,
-                    &mut stop,
-                    tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds),
-                )
-                .await
-                {
-                    Err(Error::Transport) if attempt + 1 < self.attempts => {
-                        let delay = (self.retry_delay_ms * (1 << attempt)).min(30_000);
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {},
-                            _ = crate::service::cancelled(&mut stop) => return Err(Error::Cancelled),
-                        }
-                    }
-                    result => {
-                        result?;
-                        break;
-                    }
-                }
-            }
+            self.write_small(op, &key, marker.clone(), &mut stop)
+                .await?;
         }
         if *stop.borrow() {
             return Err(Error::Cancelled);
@@ -576,16 +716,259 @@ impl Config {
             local_removed: self.remove_local_after_upload,
         })
     }
+    /// Write a small object, verify it by read-back and retry transient failures.
+    async fn write_small(
+        &self,
+        op: &Operator,
+        key: &str,
+        bytes: Vec<u8>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<(), Error> {
+        let expected = hex::encode(Sha256::digest(&bytes));
+        for attempt in 0..self.attempts {
+            let task = async {
+                let _permit = self.acquire_upload().await?;
+                op.write(key, bytes.clone()).await.map_err(storage_error)?;
+                check_remote(op, key, bytes.len() as u64, &expected).await
+            };
+            match controlled(
+                task,
+                stop,
+                tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds),
+            )
+            .await
+            {
+                Err(Error::Transport) if attempt + 1 < self.attempts => {
+                    let delay = (self.retry_delay_ms * (1 << attempt)).min(30_000);
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {},
+                        _ = crate::service::cancelled(stop) => return Err(Error::Cancelled),
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(Error::Storage)
+    }
+
+    /// The previous stable manifest (`key -> (bytes, sha256)`); empty when none was published.
+    async fn previous_manifest(
+        &self,
+        op: &Operator,
+        key: &str,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<std::collections::HashMap<String, (u64, String)>, Error> {
+        const MAX_MANIFEST: u64 = 1024 * 1024 * 1024;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.object_timeout_seconds.saturating_mul(4));
+        let bytes = controlled(
+            async {
+                match op.stat(key).await {
+                    Ok(meta) if meta.content_length() > MAX_MANIFEST => Err(Error::Verification),
+                    Ok(_) => Ok(Some(op.read(key).await.map_err(storage_error)?.to_vec())),
+                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(storage_error(e)),
+                }
+            },
+            stop,
+            deadline,
+        )
+        .await?;
+        let mut previous = std::collections::HashMap::new();
+        let Some(bytes) = bytes else {
+            return Ok(previous);
+        };
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            let entry: crate::stable_layout::Entry =
+                sonic_rs::from_slice(line).map_err(|_| Error::Verification)?;
+            previous.insert(entry.path, (entry.bytes, entry.sha256));
+        }
+        Ok(previous)
+    }
+
+    /// Publish readable keys in place under `prefix`: upload new or changed files (compared with
+    /// the previous manifest), optionally prune files the export no longer produces, then write
+    /// `_sirius/files.jsonl`, `_sirius/summary.json` and finally `_sirius/version.json`.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_stable(
+        &self,
+        op: &Operator,
+        public_op: Option<&Operator>,
+        policy: &PublicReadPolicy,
+        prefix: &str,
+        options: &crate::stable_layout::Options,
+        plan: &crate::stable_layout::Plan,
+        context: &StableContext<'_>,
+        mut stop: watch::Receiver<bool>,
+        progress: &mut UploadProgress,
+        progress_channel: &Option<watch::Sender<UploadProgress>>,
+    ) -> Result<StableCounts, Error> {
+        let manifest_key = format!("{prefix}/_sirius/files.jsonl");
+        let previous = self.previous_manifest(op, &manifest_key, &mut stop).await?;
+        let pending: Vec<&crate::stable_layout::Entry> = plan
+            .entries
+            .iter()
+            .filter(|e| previous.get(&e.path) != Some(&(e.bytes, e.sha256.clone())))
+            .collect();
+        let mut counts = StableCounts {
+            files: plan.entries.len(),
+            uploaded: pending.len(),
+            unchanged: plan.entries.len() - pending.len(),
+            deduplicated: plan.deduplicated,
+            renamed: plan.renamed,
+            ..StableCounts::default()
+        };
+        progress.completed = progress
+            .completed
+            .checked_add(counts.unchanged as u64)
+            .ok_or(Error::Size)?;
+        progress.emit(progress_channel);
+        let failed = Arc::new(AtomicBool::new(false));
+        let upload_stop = stop.clone();
+        let owned: Vec<(String, Object)> = pending
+            .into_iter()
+            .map(|e| {
+                (
+                    e.path.clone(),
+                    Object {
+                        path: e.local.clone(),
+                        bytes: e.bytes,
+                        sha256: e.sha256.clone(),
+                    },
+                )
+            })
+            .collect();
+        let input = context.input.to_path_buf();
+        let work = stream::iter(owned)
+            .map(|(path, object)| {
+                let failed = failed.clone();
+                let stop = upload_stop.clone();
+                let op = if policy.matches(&path) {
+                    public_op.unwrap_or(op)
+                } else {
+                    op
+                };
+                let key = format!("{prefix}/{path}");
+                let input = input.clone();
+                async move {
+                    if failed.load(Ordering::Acquire) {
+                        return Err(Error::Cancelled);
+                    }
+                    let result = self.upload(op, &key, &input, &object, stop).await;
+                    if result.is_err() {
+                        failed.store(true, Ordering::Release);
+                    }
+                    result.map(|_| object.bytes)
+                }
+                .boxed()
+            })
+            .buffer_unordered(self.concurrency);
+        tokio::pin!(work);
+        let mut error = None;
+        // Drain in-flight uploads, including their multipart aborts, before returning.
+        while let Some(result) = work.next().await {
+            match result {
+                Ok(size) => {
+                    progress.completed = progress.completed.checked_add(1).ok_or(Error::Size)?;
+                    progress.bytes = progress.bytes.checked_add(size).ok_or(Error::Size)?;
+                    progress.emit(progress_channel);
+                }
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if options.prune {
+            let current: HashSet<&str> = plan.entries.iter().map(|e| e.path.as_str()).collect();
+            for key in previous.keys().filter(|k| !current.contains(k.as_str())) {
+                // Only keys this layout published before are ever deleted.
+                let key = format!("{prefix}/{key}");
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds);
+                controlled(
+                    async { op.delete(&key).await.map_err(storage_error) },
+                    &mut stop,
+                    deadline,
+                )
+                .await?;
+                counts.pruned += 1;
+            }
+        }
+        let mut manifest = Vec::new();
+        for entry in &plan.entries {
+            let mut public = entry.clone();
+            public.local.clear();
+            manifest.extend(sonic_rs::to_vec(&public).map_err(|_| Error::Verification)?);
+            manifest.push(b'\n');
+        }
+        let pick = |key: &str| {
+            if policy.matches(key) {
+                public_op.unwrap_or(op)
+            } else {
+                op
+            }
+        };
+        self.write_small(
+            pick("_sirius/files.jsonl"),
+            &manifest_key,
+            manifest,
+            &mut stop,
+        )
+        .await?;
+        let summary = tokio::fs::read(context.input.join("summary.json"))
+            .await
+            .map_err(|_| Error::Io)?;
+        self.write_small(
+            pick("_sirius/summary.json"),
+            &format!("{prefix}/_sirius/summary.json"),
+            summary,
+            &mut stop,
+        )
+        .await?;
+        let version = StableVersion {
+            schema_version: 1,
+            layout: "stable",
+            region: context.region,
+            publication_id: context.id,
+            release: self.release.as_ref(),
+            files: counts.files,
+            bytes: plan.entries.iter().map(|e| e.bytes).sum(),
+            uploaded: counts.uploaded,
+            unchanged: counts.unchanged,
+            pruned: counts.pruned,
+            deduplicated: counts.deduplicated,
+            renamed: counts.renamed,
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            verification: context.report,
+        };
+        // Consumers read `version.json` last: it names the manifest that describes the tree.
+        self.write_small(
+            pick("_sirius/version.json"),
+            &format!("{prefix}/_sirius/version.json"),
+            sonic_rs::to_vec_pretty(&version).map_err(|_| Error::Verification)?,
+            &mut stop,
+        )
+        .await?;
+        progress.completed = progress.completed.checked_add(3).ok_or(Error::Size)?;
+        progress.emit(progress_channel);
+        Ok(counts)
+    }
+
     async fn upload(
         &self,
         op: &Operator,
-        prefix: &str,
+        key: &str,
         input: &Path,
         object: &Object,
         mut stop: watch::Receiver<bool>,
     ) -> Result<(), Error> {
         for attempt in 0..self.attempts {
-            match self.upload_once(op, prefix, input, object, &mut stop).await {
+            match self.upload_once(op, key, input, object, &mut stop).await {
                 Err(Error::Transport) if attempt + 1 < self.attempts => {
                     let delay = (self.retry_delay_ms * (1 << attempt)).min(30_000);
                     tokio::select! {
@@ -612,7 +995,7 @@ impl Config {
     async fn upload_once(
         &self,
         op: &Operator,
-        prefix: &str,
+        key: &str,
         input: &Path,
         object: &Object,
         stop: &mut watch::Receiver<bool>,
@@ -620,7 +1003,6 @@ impl Config {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds);
         let _permit = controlled(self.acquire_upload(), stop, deadline).await?;
-        let key = format!("{prefix}/{}", object.path);
         let source = input.join(&object.path);
         let meta = controlled(
             async {
@@ -637,7 +1019,7 @@ impl Config {
         }
         let mut writer = controlled(
             async {
-                op.writer_with(&key)
+                op.writer_with(key)
                     .chunk(8 * 1024 * 1024)
                     .concurrent(1)
                     .await
@@ -671,7 +1053,7 @@ impl Config {
                 return Err(Error::Verification);
             }
             writer.close().await.map_err(storage_error)?;
-            check_remote(op, &key, object.bytes, &object.sha256).await
+            check_remote(op, key, object.bytes, &object.sha256).await
         };
         let result = controlled(operation, stop, deadline).await;
         if result.is_err() {
@@ -791,7 +1173,12 @@ impl Provider {
         Ok(Some(url))
     }
     fn target(&self, region: Region, id: &str) -> Result<Target, Error> {
-        let prefix = format!("{}/{}/publications/{id}", self.prefix, region.name());
+        let stable = self.layout.stable().is_some();
+        let prefix = if stable {
+            self.prefix.clone()
+        } else {
+            format!("{}/{}/publications/{id}", self.prefix, region.name())
+        };
         let public_url = self.public_base()?.map(|mut url| {
             url.path_segments_mut()
                 .expect("validated HTTPS URL")
@@ -804,6 +1191,8 @@ impl Provider {
             name: self.name.clone(),
             prefix,
             public_url,
+            layout: if stable { "stable" } else { "publication" },
+            stable: None,
         })
     }
 
