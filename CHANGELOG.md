@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2
+
+- cridecoder 0.3.6. USM files that carry audio metadata (an audio seek table) before the metadata
+  end markers now export: the Global kr and en localized loading movies failed with
+  `expected @SFV signature`, which failed their full-export jobs. USMs without audio metadata take
+  the unchanged path and export byte-identically.
+
 ## 1.2.1
 - Global assets are live-verified: full hk catalog export (13,429 resources, 953,052 files, incl. 27,741 WAV from CRI) and en/kr selections against the production CDNs, with a fully cache-hit incremental rerun.
 - dry-run readiness checks the split-ACB secret whenever a job would read it; the CDN username is included in the notification-token overlap check.

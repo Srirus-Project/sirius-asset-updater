@@ -10,7 +10,7 @@ are excluded from this repository and its release archives. Synthetic fixtures d
 their origin. This project is not affiliated with or endorsed by the game's publishers.
 
 The exporter uses [unity-rs](https://github.com/seiunx-dev/unity-rs) (`unity-rs-core` 0.5.2)
-and [cridecoder](https://github.com/seiunx-dev/cridecoder) (0.3.5).
+and [cridecoder](https://github.com/seiunx-dev/cridecoder) (0.3.6).
 The legacy USM audio mask adapter is derived from cridecoder; its MIT notice is
 retained in [LICENSE-cridecoder](../LICENSE-cridecoder).
 [FFmpeg](https://ffmpeg.org/) is installed separately or through the Docker distribution's
