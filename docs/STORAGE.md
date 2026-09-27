@@ -79,10 +79,11 @@ Key rules (the export itself keeps numbered local directories; game names only b
 | Unity object | container without the first matching `strip_prefixes` entry, output extension: `Assets/AddressableResources/Adv/Chat/back.png` → `adv/chat/back.png` |
 | Other objects of that container | `<container stem>.assets/<type dir>/<object name>.<ext>` (`sprite`, `gameobject`, `transform`, `recttransform`, `monobehaviour`, `mesh_renderer`, …) |
 | Flat exceptions | MonoBehaviour named like its container; the single Texture2D named like its container; fonts next to the container; AudioClip, VideoClip, SpriteAtlas |
-| TextAsset | container file name; `x.bytes` → `x`, `x.acb.bytes` → `x.acb` |
+| TextAsset | container file name; `x.bytes` → `x`, `x.acb.bytes` → `x.acb`. Several TextAssets in one container that are not named like it go to `<stem>.assets/text_asset/<name>.bytes` |
+| ACB embedded in a Unity object | `<object key without extension>/<cue>.wav` and `<cue>.cues.json` |
 | Unnamed object | `<Type>_<n>`, numbered per container and type in catalog order (the original's `_#` would start a URL fragment) |
 | Object without container | `_bundles/<bundle>/<type dir>/<name>.<ext>` |
-| CRI ACB (`x_assets_x/dir/name_<hash>`) | `x/dir/name/<cue>.wav` and `<cue>.cues.json`, named by the first cue of each track |
+| CRI ACB (`x_assets_x/dir/name_<hash>`) | `x/dir/name/<cue>.wav` and `<cue>.cues.json`, named by the first cue of each track; tracks without a cue keep their index (`00001.wav`) |
 | CRI USM | `x/dir/name/name.mkv`, `name.ivf`/`name.m2v`, `name.wav`, `name.usm.json`, `name.container-mask.json` |
 
 Object names are sanitized like the original (`<>:"/\|?*`, plus `#` and `%`, and control

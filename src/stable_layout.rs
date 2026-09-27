@@ -331,6 +331,8 @@ struct Context<'a> {
     /// is named like the container.
     textures: HashMap<String, (usize, bool)>,
     unnamed: HashMap<(String, i32), usize>,
+    /// Stem already chosen for an unnamed object, so all outputs of the object agree.
+    stems: HashMap<(String, i64), String>,
 }
 
 impl Context<'_> {
@@ -343,6 +345,10 @@ impl Context<'_> {
         {
             return name;
         }
+        let identity = (object.source_file.clone(), object.path_id);
+        if let Some(stem) = self.stems.get(&identity) {
+            return stem.clone();
+        }
         let counter = self
             .unnamed
             .entry((scope.to_string(), object.class_id))
@@ -350,6 +356,7 @@ impl Context<'_> {
         // The original used `{Type}_#{index}`; `#` would start a URL fragment.
         let stem = format!("{class}_{counter}");
         *counter += 1;
+        self.stems.insert(identity, stem.clone());
         stem
     }
 
@@ -401,6 +408,16 @@ impl Context<'_> {
             // TextAsset: the raw bytes of the container file. `x.acb.bytes` -> `x.acb`,
             // `x.bytes` -> `x`, other container extensions are kept (`paths` rewrite in
             // `payload/naming.rs:33-59`, without turning `foo.txt` into `foo`).
+            // Several TextAssets in one container (e.g. `x.asset` holding `x-002`, `x-003`, ...)
+            // are named like MonoBehaviours instead of all claiming the container path.
+            49 if object
+                .name
+                .as_deref()
+                .is_some_and(|n| loose(&fix_file_name(n)) != loose(&container_stem))
+                && !container_ext.eq_ignore_ascii_case("bytes") =>
+            {
+                nested(self, "text_asset")
+            }
             49 => {
                 if container_ext.eq_ignore_ascii_case("bytes") {
                     let mut p = parts.clone();
@@ -491,27 +508,44 @@ fn container_key(parts: &[String], file: &str) -> String {
     key.to_lowercase()
 }
 
-/// Cue names of an ACB output (`NNNNN.cues.json`: `[[name, cue_id, ...], ...]`).
-fn cue_name(export: &Path, resource: &ResourceReport, output: &OutputRecord) -> Option<String> {
-    let file = output_file(output);
+/// ACB track naming for an output: `None` when the output is not an ACB track, otherwise the
+/// first cue name of its `NNNNN.cues.json` (`[[name, cue_id, ...], ...]`) or, for tracks without
+/// a cue, the track index.
+fn acb_track(export: &Path, resource: &ResourceReport, output: &OutputRecord) -> Option<String> {
+    let (dir, file) = match output.path.rsplit_once('/') {
+        Some((dir, file)) => (Some(dir), file),
+        None => (None, output.path.as_str()),
+    };
     let index = file.split('.').next()?;
-    let has_cues = resource
+    if index.len() != 5 || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let cues = match dir {
+        Some(dir) => format!("{dir}/{index}.cues.json"),
+        None => format!("{index}.cues.json"),
+    };
+    if !resource
         .outputs
         .iter()
-        .any(|o| o.kind == "cue_metadata" && output_file(o) == format!("{index}.cues.json"));
-    if !has_cues {
+        .any(|o| o.kind == "cue_metadata" && o.path == cues)
+    {
         return None;
     }
-    let path = export
-        .join(&resource.output_directory)
-        .join(format!("{index}.cues.json"));
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() > 1024 * 1024 {
-        return None;
-    }
-    let value: sonic_rs::Value = sonic_rs::from_slice(&bytes).ok()?;
-    let name = value.as_array()?.first()?.as_array()?.first()?.as_str()?;
-    Some(fix_file_name(name)).filter(|n| !n.is_empty())
+    let cue = std::fs::read(export.join(&resource.output_directory).join(&cues))
+        .ok()
+        .filter(|bytes| bytes.len() <= 1024 * 1024)
+        .and_then(|bytes| sonic_rs::from_slice::<sonic_rs::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .as_array()?
+                .first()?
+                .as_array()?
+                .first()?
+                .as_str()
+                .map(fix_file_name)
+        })
+        .filter(|name| !name.is_empty());
+    Some(cue.unwrap_or_else(|| index.to_string()))
 }
 
 fn valid_key(key: &str) -> bool {
@@ -577,6 +611,7 @@ pub(crate) fn plan_resources(
         options,
         textures,
         unnamed: HashMap::new(),
+        stems: HashMap::new(),
     };
     let mut claimed: HashMap<String, usize> = HashMap::new();
     let mut lowered: HashMap<String, String> = HashMap::new();
@@ -587,10 +622,22 @@ pub(crate) fn plan_resources(
         }
         for output in &resource.outputs {
             let parts = match &output.object {
+                Some(object) if output.path.contains('/') => {
+                    let mut parts = context.unity_key(resource, output, object);
+                    let file = output_file(output);
+                    let rest = file.split_once('.').map_or("", |x| x.1).to_string();
+                    let name = acb_track(export, resource, output)
+                        .unwrap_or_else(|| file.split('.').next().unwrap_or(file).to_string());
+                    if let Some(last) = parts.pop() {
+                        parts.push(split_ext(&last).0.to_string());
+                    }
+                    parts.push(join_ext(&name, &rest));
+                    parts
+                }
                 Some(object) => context.unity_key(resource, output, object),
                 None => {
-                    let cue = cue_name(export, resource, output);
-                    context.cri_key(resource, output, cue.as_deref())
+                    let track = acb_track(export, resource, output);
+                    context.cri_key(resource, output, track.as_deref())
                 }
             };
             let mut key = parts.join("/");
@@ -673,7 +720,12 @@ mod tests {
             sha256: sha.repeat(64 / sha.len().max(1))[..64].to_string(),
             object: object.map(|(class_id, name, container)| ObjectIdentity {
                 source_file: "b.bundle::CAB".into(),
-                path_id: (class_id as i64) * 1000 + name.map_or(0, |n| n.len() as i64),
+                path_id: path
+                    .trim_start_matches("0_")
+                    .split('.')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
                 class_id,
                 name: name.map(str::to_string),
                 container: container.map(str::to_string),
@@ -962,6 +1014,86 @@ mod tests {
             ]
         );
         assert_eq!(plan.entries[0].local, "00007/00000.wav");
+    }
+
+    #[test]
+    fn embedded_acbs_text_asset_groups_and_cueless_tracks_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("00000/0_5-0.acb")).unwrap();
+        std::fs::write(
+            dir.path().join("00000/0_5-0.acb/00000.cues.json"),
+            br#"[["default_flick",0,0]]"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("00001")).unwrap();
+        std::fs::write(dir.path().join("00001/00000.cues.json"), b"[]").unwrap();
+        std::fs::write(dir.path().join("00001/00001.cues.json"), b"[]").unwrap();
+        let se = "Assets/AddressableResources/Cri/Sound/LiveSe/set/default_flick.asset";
+        let score = "Assets/AddressableResources/Cri/Sound/MusicScore/a_song.asset";
+        let embedded = res(
+            "b",
+            "00000",
+            vec![
+                // A MonoBehaviour holding an ACB: its JSON plus the decoded track and cue metadata.
+                out(
+                    "0_5.json",
+                    "typetree_json",
+                    "a",
+                    Some((114, Some("default_flick"), Some(se))),
+                ),
+                out(
+                    "0_5-0.acb/00000.wav",
+                    "hca_wav",
+                    "b",
+                    Some((114, Some("default_flick"), Some(se))),
+                ),
+                out(
+                    "0_5-0.acb/00000.cues.json",
+                    "cue_metadata",
+                    "c",
+                    Some((114, Some("default_flick"), Some(se))),
+                ),
+                // Several TextAssets in one container are named individually.
+                out(
+                    "0_6.bytes",
+                    "text_bytes",
+                    "d",
+                    Some((49, Some("A_Song-002"), Some(score))),
+                ),
+                out(
+                    "0_7.bytes",
+                    "text_bytes",
+                    "e",
+                    Some((49, Some("A_Song-003"), Some(score))),
+                ),
+            ],
+        );
+        let cueless = res(
+            "cri_assets_cri/sound/bgm_0123456789abcdef0123456789abcdef",
+            "00001",
+            vec![
+                out("00000.wav", "hca_wav", "f", None),
+                out("00000.cues.json", "cue_metadata", "g", None),
+                out("00001.wav", "hca_wav", "h", None),
+                out("00001.cues.json", "cue_metadata", "g", None),
+            ],
+        );
+        let plan = plan_resources(dir.path(), &[embedded, cueless], &Options::default()).unwrap();
+        assert_eq!(
+            keys(&plan),
+            [
+                "cri/sound/livese/set/default_flick.json",
+                "cri/sound/livese/set/default_flick/default_flick.wav",
+                "cri/sound/livese/set/default_flick/default_flick.cues.json",
+                "cri/sound/musicscore/a_song.assets/text_asset/a_song-002.bytes",
+                "cri/sound/musicscore/a_song.assets/text_asset/a_song-003.bytes",
+                "cri/sound/bgm/00000.wav",
+                "cri/sound/bgm/00000.cues.json",
+                "cri/sound/bgm/00001.wav",
+                "cri/sound/bgm/00001.cues.json",
+            ]
+        );
+        assert_eq!(plan.renamed, 0);
     }
 
     #[test]
