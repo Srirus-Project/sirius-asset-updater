@@ -1893,3 +1893,63 @@ async fn publication_layout_objects_and_markers_carry_content_types() {
         Some("application/octet-stream")
     );
 }
+#[test]
+fn attempt_deadlines_scale_with_object_size() {
+    let config = config(local(PathBuf::from("/nonexistent")));
+    let at = |bytes: u64| {
+        config
+            .attempt_deadline(bytes)
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs_f64()
+    };
+    // object_timeout_seconds is 5 in the test configuration: one unit per started 64 MiB.
+    assert!((4.0..=5.0).contains(&at(0)));
+    assert!((4.0..=5.0).contains(&at(64 * 1024 * 1024 - 1)));
+    assert!((9.0..=10.0).contains(&at(64 * 1024 * 1024)));
+    assert!((49.0..=50.0).contains(&at(600 * 1024 * 1024)));
+}
+#[tokio::test]
+async fn large_in_memory_objects_are_streamed_as_multipart_and_verified() {
+    let server = server().await;
+    let source = tempfile::tempdir().unwrap();
+    let op = server.config.providers[0].operator(source.path()).unwrap();
+    let (_tx, mut rx) = watch::channel(false);
+    // Just over one part: two multipart parts, like a large `_sirius/files.jsonl`.
+    let body: Vec<u8> = (0..WRITE_CHUNK + 1024).map(|i| (i % 251) as u8).collect();
+    server
+        .config
+        .write_small(&op, "hk/_sirius/files.jsonl", body.clone(), &mut rx)
+        .await
+        .unwrap();
+    assert!(server.state.multipart_puts.load(Ordering::SeqCst) >= 2);
+    assert_eq!(
+        server
+            .state
+            .objects
+            .lock()
+            .unwrap()
+            .get("/synthetic-bucket/hk/_sirius/files.jsonl"),
+        Some(&body)
+    );
+    assert_eq!(
+        server
+            .state
+            .content_types
+            .lock()
+            .unwrap()
+            .get("/synthetic-bucket/hk/_sirius/files.jsonl")
+            .map(String::as_str),
+        Some("application/x-ndjson")
+    );
+    // Small objects keep using a single request.
+    let multipart = server.state.multipart_puts.load(Ordering::SeqCst);
+    server
+        .config
+        .write_small(&op, "hk/_sirius/version.json", b"{}".to_vec(), &mut rx)
+        .await
+        .unwrap();
+    assert_eq!(
+        server.state.multipart_puts.load(Ordering::SeqCst),
+        multipart
+    );
+}

@@ -390,6 +390,8 @@ pub(crate) fn secret(name: &str) -> Result<String, Error> {
     }
     Ok(value)
 }
+/// Multipart part size for streamed writes.
+const WRITE_CHUNK: usize = 8 * 1024 * 1024;
 /// `Content-Type` for an object key, from its extension (served as-is by S3 website endpoints).
 pub(crate) fn content_type(key: &str) -> &'static str {
     let name = key.rsplit('/').next().unwrap_or(key).to_ascii_lowercase();
@@ -741,7 +743,16 @@ impl Config {
             local_removed: self.remove_local_after_upload,
         })
     }
-    /// Write a small object, verify it by read-back and retry transient failures.
+    /// Deadline of one object attempt (write plus read-back): `object_timeout_seconds` for every
+    /// started 64 MiB, so a large object gets time in proportion to its size.
+    fn attempt_deadline(&self, bytes: u64) -> tokio::time::Instant {
+        let units = 1 + bytes / (64 * 1024 * 1024);
+        tokio::time::Instant::now()
+            + Duration::from_secs(self.object_timeout_seconds.saturating_mul(units))
+    }
+
+    /// Write an in-memory object (markers and `_sirius` files), verify it by read-back and
+    /// retry transient failures.
     async fn write_small(
         &self,
         op: &Operator,
@@ -753,19 +764,36 @@ impl Config {
         for attempt in 0..self.attempts {
             let task = async {
                 let _permit = self.acquire_upload().await?;
-                op.write_with(key, bytes.clone())
-                    .content_type(content_type(key))
-                    .await
-                    .map_err(storage_error)?;
+                if bytes.len() > WRITE_CHUNK {
+                    // Stable manifests reach hundreds of MB: stream them as multipart parts
+                    // instead of one request body.
+                    let mut writer = op
+                        .writer_with(key)
+                        .content_type(content_type(key))
+                        .chunk(WRITE_CHUNK)
+                        .concurrent(1)
+                        .await
+                        .map_err(storage_error)?;
+                    let written = async {
+                        for part in bytes.chunks(WRITE_CHUNK) {
+                            writer.write(part.to_vec()).await.map_err(storage_error)?;
+                        }
+                        writer.close().await.map_err(storage_error)
+                    }
+                    .await;
+                    if let Err(error) = written {
+                        let _ = tokio::time::timeout(Duration::from_secs(3), writer.abort()).await;
+                        return Err(error);
+                    }
+                } else {
+                    op.write_with(key, bytes.clone())
+                        .content_type(content_type(key))
+                        .await
+                        .map_err(storage_error)?;
+                }
                 check_remote(op, key, bytes.len() as u64, &expected).await
             };
-            match controlled(
-                task,
-                stop,
-                tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds),
-            )
-            .await
-            {
+            match controlled(task, stop, self.attempt_deadline(bytes.len() as u64)).await {
                 Err(Error::Transport) if attempt + 1 < self.attempts => {
                     let delay = (self.retry_delay_ms * (1 << attempt)).min(30_000);
                     tokio::select! {
@@ -1032,8 +1060,7 @@ impl Config {
         object: &Object,
         stop: &mut watch::Receiver<bool>,
     ) -> Result<(), Error> {
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.object_timeout_seconds);
+        let deadline = self.attempt_deadline(object.bytes);
         let _permit = controlled(self.acquire_upload(), stop, deadline).await?;
         let source = input.join(&object.path);
         let meta = controlled(
@@ -1053,7 +1080,7 @@ impl Config {
             async {
                 op.writer_with(key)
                     .content_type(content_type(key))
-                    .chunk(8 * 1024 * 1024)
+                    .chunk(WRITE_CHUNK)
                     .concurrent(1)
                     .await
                     .map_err(storage_error)

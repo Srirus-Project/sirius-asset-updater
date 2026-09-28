@@ -177,13 +177,15 @@ Do not delete prefixes merely because an active transfer has not written a marke
 - `attempts`: 1–8, default 3, for each object/marker. Only temporary backend errors or timeouts
   retry. Permission failures, integrity failures and redirects fail without automatic retry.
 - `retry_delay_ms`: 1–10000, default 500; exponential backoff capped at 30 seconds.
-- `object_timeout_seconds`: 1–3600, default 300. One absolute attempt deadline covers shared
-  admission, source metadata, writer creation, upload and read-back. Completion-marker admission,
+- `object_timeout_seconds`: 1–3600, default 300, granted for every started 64 MiB of the object
+  (since 1.2.5; a 550 MB stable manifest gets nine units). One absolute attempt deadline covers
+  shared admission, source metadata, writer creation, upload and read-back. Completion-marker admission,
   write and read-back also share one deadline. S3 HTTP requests additionally have a 10-second
   connect and 60-second request timeout. Retries receive a new attempt deadline; the service's
   overall job deadline still applies. A bounded multipart abort may extend cancellation cleanup
   by up to three seconds; the upload permit stays held through that cleanup.
-- Multipart uploads use 8 MiB chunks and one part request at a time per object. Cancellation
+- Multipart uploads use 8 MiB chunks and one part request at a time per object. In-memory
+  objects (markers and `_sirius` files) larger than one chunk are streamed the same way. Cancellation
   drains active uploads and attempts a bounded three-second abort for each active writer.
 - Source verification, cancellation or any provider failure before cleanup preserves the local
   export. Once verified cleanup begins it runs to completion without cancellation; a filesystem
