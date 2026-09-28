@@ -249,6 +249,82 @@ fn transient_media_failure(status: &str, diagnostic: &str) -> bool {
     let haystack = format!("{status} {diagnostic}").to_lowercase();
     MARKERS.iter().any(|marker| haystack.contains(marker))
 }
+/// Stream-copy mux of a USM's elementary streams into Matroska. `+bitexact` keeps the muxer from
+/// writing the current date and a random segment UID, so the same streams always give the same
+/// file (stable-layout publications compare bytes).
+fn mkv_mux_args(
+    video: &Path,
+    audio: Option<&Path>,
+    frame_rate: Option<(i32, i32)>,
+    movie: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-fflags".into(),
+        "+genpts+bitexact".into(),
+        "-protocol_whitelist".into(),
+        "file,pipe".into(),
+    ];
+    if let Some((num, den)) = frame_rate {
+        args.extend(["-r".into(), format!("{num}/{den}").into()]);
+    }
+    args.extend(["-i".into(), video.as_os_str().to_owned()]);
+    if let Some(audio) = audio {
+        args.extend([
+            "-i".into(),
+            audio.as_os_str().to_owned(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            "1:a:0".into(),
+        ]);
+    } else {
+        args.extend(["-map".into(), "0:v:0".into()]);
+    }
+    args.extend([
+        "-c".into(),
+        "copy".into(),
+        "-flags".into(),
+        "+bitexact".into(),
+        "-fflags".into(),
+        "+bitexact".into(),
+        movie.as_os_str().to_owned(),
+    ]);
+    args
+}
+/// JSON with object keys sorted at every level (arrays keep their order).
+fn canonical_json(value: &sonic_rs::Value) -> Result<Vec<u8>, Error> {
+    fn write(value: &sonic_rs::Value, out: &mut Vec<u8>) -> Result<(), Error> {
+        if let Some(object) = value.as_object() {
+            let mut entries: Vec<(&str, &sonic_rs::Value)> = object.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            out.push(b'{');
+            for (i, (key, item)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend(sonic_rs::to_vec(key).map_err(err)?);
+                out.push(b':');
+                write(item, out)?;
+            }
+            out.push(b'}');
+        } else if let Some(array) = value.as_array() {
+            out.push(b'[');
+            for (i, item) in array.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write(item, out)?;
+            }
+            out.push(b']');
+        } else {
+            out.extend(sonic_rs::to_vec(value).map_err(err)?);
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    write(value, &mut out)?;
+    Ok(out)
+}
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Error> {
     fs::write(path, sonic_rs::to_vec_pretty(value).map_err(err)?).map_err(err)
 }
@@ -1572,34 +1648,18 @@ impl ExportConfig {
         }
         let video = video.ok_or_else(|| err("USM contains no video"))?;
         let movie = output.join("movie.mkv");
-        let mut args = vec![
-            "-fflags".into(),
-            "+genpts".into(),
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-        ];
-        if let Some((num, den)) = metadata.video_frame_rate() {
-            args.extend(["-r".into(), format!("{num}/{den}").into()]);
-        }
-        args.extend(["-i".into(), video.as_os_str().to_owned()]);
-        if let Some(audio) = audio {
-            args.extend([
-                "-i".into(),
-                audio.into_os_string(),
-                "-map".into(),
-                "0:v:0".into(),
-                "-map".into(),
-                "1:a:0".into(),
-            ]);
-        } else {
-            args.extend(["-map".into(), "0:v:0".into()]);
-        }
-        args.extend(["-c".into(), "copy".into(), movie.as_os_str().to_owned()]);
+        let args = mkv_mux_args(
+            &video,
+            audio.as_deref(),
+            metadata.video_frame_rate(),
+            &movie,
+        );
         self.ffmpeg_to(&args, &[&movie])?;
         self.check_video_frames(&movie, expected_frames)?;
         self.video_formats(&movie, expected_frames, report_root, report)?;
         let target = output.join("usm.json");
-        fs::write(&target, metadata_json).map_err(err)?;
+        // cridecoder keeps table rows in hash maps: sort keys so equal USMs give equal bytes.
+        fs::write(&target, canonical_json(&value)?).map_err(err)?;
         self.record(report_root, &target, "usm_metadata_json", report)?;
         let target = output.join("container-mask.json");
         write_json(&target, &crypto.masked)?;
@@ -5535,6 +5595,79 @@ mod format_tests {
         )
         .unwrap();
         assert!(!empty_mesh(&v));
+    }
+    #[test]
+    fn usm_outputs_are_reproducible_inputs() {
+        let args: Vec<String> = mkv_mux_args(
+            Path::new("v.m2v"),
+            Some(Path::new("a.wav")),
+            Some((30000, 1001)),
+            Path::new("movie.mkv"),
+        )
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        // The output side (after the inputs, before the file) is bit-exact.
+        let output = args.iter().rposition(|a| a == "-i").unwrap();
+        let tail = &args[output..];
+        assert!(tail
+            .windows(2)
+            .any(|w| w[0] == "-fflags" && w[1] == "+bitexact"));
+        assert!(tail.windows(2).any(|w| w[0] == "-c" && w[1] == "copy"));
+        assert_eq!(args.last().map(String::as_str), Some("movie.mkv"));
+        // Key order of hash-map rows does not change the metadata bytes.
+        let a: sonic_rs::Value =
+            sonic_rs::from_str(r#"{"b":1,"a":{"y":[{"q":1,"p":2}],"x":"s"}}"#).unwrap();
+        let b: sonic_rs::Value =
+            sonic_rs::from_str(r#"{"a":{"x":"s","y":[{"p":2,"q":1}]},"b":1}"#).unwrap();
+        assert_eq!(canonical_json(&a).unwrap(), canonical_json(&b).unwrap());
+        assert_eq!(
+            canonical_json(&a).unwrap(),
+            br#"{"a":{"x":"s","y":[{"p":2,"q":1}]},"b":1}"#
+        );
+    }
+    #[test]
+    #[ignore = "requires SIRIUS_TEST_FFMPEG pointing to a local FFmpeg executable"]
+    fn real_ffmpeg_usm_mux_is_bit_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let cfg: ExportConfig = yaml_serde::from_str(&format!(
+            "input: unused\noutput: unused\ncri_key_env: UNUSED\nffmpeg: {}\n",
+            std::env::var("SIRIUS_TEST_FFMPEG").unwrap()
+        ))
+        .unwrap();
+        let video = directory.path().join("v.m2v");
+        let audio = directory.path().join("a.wav");
+        cfg.ffmpeg(&[
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "testsrc2=size=32x32:rate=25:duration=0.4".into(),
+            "-c:v".into(),
+            "mpeg2video".into(),
+            "-f".into(),
+            "mpeg2video".into(),
+            video.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        cfg.ffmpeg(&[
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "sine=frequency=440:sample_rate=48000:duration=0.4".into(),
+            audio.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let mut outputs = Vec::new();
+        for n in 0..2 {
+            let movie = directory.path().join(format!("movie{n}.mkv"));
+            let args = mkv_mux_args(&video, Some(&audio), Some((25, 1)), &movie);
+            cfg.ffmpeg_to(&args, &[&movie]).unwrap();
+            outputs.push(fs::read(&movie).unwrap());
+            // Matroska's DateUTC has one-second resolution.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+        assert!(!outputs[0].is_empty());
+        assert_eq!(outputs[0], outputs[1]);
     }
     #[test]
     #[ignore = "requires SIRIUS_TEST_FFMPEG pointing to a local FFmpeg executable"]

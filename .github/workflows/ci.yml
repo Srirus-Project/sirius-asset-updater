@@ -79,6 +79,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --features media-ffi
+      - run: cargo test --locked --features media-ffi real_ffmpeg_usm_mux_is_bit_exact -- --ignored
+        env:
+          SIRIUS_TEST_FFMPEG: /usr/bin/ffmpeg
       - run: cargo test --locked --features media-ffi ffi_audio_preserves_pcm_and_native_mp3_shapes -- --ignored
         env:
           SIRIUS_TEST_FFMPEG: /usr/bin/ffmpeg

@@ -2,6 +2,11 @@
 
 ## 1.2.5
 
+- USM exports are reproducible: `movie.mkv` is muxed with `+bitexact` (FFmpeg otherwise writes
+  the current date and a random segment UID), and `usm.json` is written with sorted keys
+  (cridecoder keeps table rows in hash maps). Before, every export without a decoded-cache hit
+  changed these two files for each of the 222 USMs, so a stable-layout publication re-uploaded
+  444 unchanged movies after an updater upgrade. The first export with 1.2.5 changes them once.
 - Stable-layout `_sirius/files.jsonl` (about 550 MB for a full Global catalog) is streamed as a
   multipart upload instead of one request body, like other large objects.
 - `object_timeout_seconds` now applies per started 64 MiB of an object, for both file uploads and
