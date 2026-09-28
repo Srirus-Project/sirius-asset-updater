@@ -73,6 +73,7 @@ struct Fake {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     acls: Mutex<HashMap<String, Option<String>>>,
     write_headers: Mutex<Vec<(String, String, String, String)>>,
+    content_types: Mutex<HashMap<String, String>>,
     checksums: Mutex<Vec<(String, String, String)>>,
     payer_headers: Mutex<Vec<(String, bool)>>,
     customer_headers: Mutex<Vec<(String, String, String, String)>>,
@@ -150,6 +151,11 @@ async fn handle(State(state): State<Arc<Fake>>, request: Request) -> Response {
                 .unwrap_or("")
                 .to_string()
         };
+        state
+            .content_types
+            .lock()
+            .unwrap()
+            .insert(key.clone(), header("content-type"));
         state.write_headers.lock().unwrap().push((
             query.clone(),
             header("x-amz-storage-class"),
@@ -1778,4 +1784,112 @@ async fn stable_layout_over_s3_treats_a_missing_manifest_as_first_publication() 
     assert_eq!(result.providers[0].stable.unwrap().uploaded, 0);
     // Only the manifest, summary and version objects are rewritten.
     assert_eq!(server.state.puts.load(Ordering::SeqCst) - puts, 3);
+}
+
+#[test]
+fn content_types_follow_the_key_extension() {
+    for (key, expected) in [
+        ("hk/adv/chat/back.png", "image/png"),
+        ("hk/cri/sound/voice/voice_001.cues.json", "application/json"),
+        ("hk/_sirius/files.jsonl", "application/x-ndjson"),
+        ("hk/cri/sound/voice/voice_001.WAV", "audio/wav"),
+        ("hk/cri/video/m/m.mkv", "video/x-matroska"),
+        ("hk/story/story.txt", "text/plain; charset=utf-8"),
+        ("hk/sound/x.acb", "application/octet-stream"),
+        ("hk/noext", "application/octet-stream"),
+    ] {
+        assert_eq!(content_type(key), expected, "{key}");
+    }
+}
+#[tokio::test]
+async fn uploads_carry_content_types_and_old_manifests_are_republished_once() {
+    let mut server = server().await;
+    let provider = server.config.providers[0].clone();
+    server.config.providers[0] = stable(provider, false);
+    let source = stable_fixture(&stable_files(b"texture-v1", true));
+    let (_tx, rx) = watch::channel(false);
+    server
+        .config
+        .publish(source.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    {
+        let types = server.state.content_types.lock().unwrap();
+        for (key, expected) in [
+            ("/synthetic-bucket/hk/adv/chat/back.png", "image/png"),
+            (
+                "/synthetic-bucket/hk/cri/sound/voice/voice_001.wav",
+                "audio/wav",
+            ),
+            (
+                "/synthetic-bucket/hk/cri/sound/voice/voice_001.cues.json",
+                "application/json",
+            ),
+            (
+                "/synthetic-bucket/hk/_sirius/files.jsonl",
+                "application/x-ndjson",
+            ),
+            (
+                "/synthetic-bucket/hk/_sirius/version.json",
+                "application/json",
+            ),
+        ] {
+            assert_eq!(types.get(key).map(String::as_str), Some(expected), "{key}");
+        }
+    }
+    // A manifest from 1.2.3 has no content types: every object is uploaded again, once.
+    {
+        let mut objects = server.state.objects.lock().unwrap();
+        let manifest = objects
+            .get_mut("/synthetic-bucket/hk/_sirius/files.jsonl")
+            .unwrap();
+        let old: Vec<u8> = String::from_utf8(manifest.clone())
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let start = line.find(",\"content_type\":\"").unwrap();
+                let end = start + line[start + 17..].find('"').unwrap() + 18;
+                format!("{}{}\n", &line[..start], &line[end..])
+            })
+            .collect::<String>()
+            .into_bytes();
+        *manifest = old;
+    }
+    let result = server
+        .config
+        .publish(source.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.providers[0].stable.unwrap().uploaded, 5);
+    let result = server
+        .config
+        .publish(source.path(), Region::Hk, rx)
+        .await
+        .unwrap();
+    assert_eq!(result.providers[0].stable.unwrap().uploaded, 0);
+}
+#[tokio::test]
+async fn publication_layout_objects_and_markers_carry_content_types() {
+    let server = server().await;
+    let source = fixture();
+    let (_tx, rx) = watch::channel(false);
+    let result = server
+        .config
+        .publish(source.path(), Region::Jp, rx)
+        .await
+        .unwrap();
+    let prefix = &result.providers[0].prefix;
+    let types = server.state.content_types.lock().unwrap();
+    assert_eq!(
+        types
+            .get(&format!("/synthetic-bucket/{prefix}/complete.json"))
+            .map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(
+        types
+            .get(&format!("/synthetic-bucket/{prefix}/00000/payload.bin"))
+            .map(String::as_str),
+        Some("application/octet-stream")
+    );
 }

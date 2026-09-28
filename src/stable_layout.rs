@@ -85,6 +85,8 @@ pub struct Entry {
     pub local: String,
     pub bytes: u64,
     pub sha256: String,
+    #[serde(default)]
+    pub content_type: String,
     pub source: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -649,6 +651,7 @@ pub(crate) fn plan_resources(
             }
             let local = format!("{}/{}", resource.output_directory, output.path);
             let entry = |path: String| Entry {
+                content_type: crate::storage::content_type(&path).to_string(),
                 path,
                 local: local.clone(),
                 bytes: output.bytes,

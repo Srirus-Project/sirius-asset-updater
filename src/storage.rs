@@ -390,6 +390,31 @@ pub(crate) fn secret(name: &str) -> Result<String, Error> {
     }
     Ok(value)
 }
+/// `Content-Type` for an object key, from its extension (served as-is by S3 website endpoints).
+pub(crate) fn content_type(key: &str) -> &'static str {
+    let name = key.rsplit('/').next().unwrap_or(key).to_ascii_lowercase();
+    let ext = name.rsplit_once('.').map_or("", |x| x.1);
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "jsonl" => "application/x-ndjson",
+        "txt" | "shader" | "obj" | "csv" => "text/plain; charset=utf-8",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "m2v" => "video/mpeg",
+        "ivf" => "video/x-ivf",
+        "webm" => "video/webm",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
+}
 fn storage_error(error: opendal::Error) -> Error {
     if error.is_temporary() {
         Error::Transport
@@ -728,7 +753,10 @@ impl Config {
         for attempt in 0..self.attempts {
             let task = async {
                 let _permit = self.acquire_upload().await?;
-                op.write(key, bytes.clone()).await.map_err(storage_error)?;
+                op.write_with(key, bytes.clone())
+                    .content_type(content_type(key))
+                    .await
+                    .map_err(storage_error)?;
                 check_remote(op, key, bytes.len() as u64, &expected).await
             };
             match controlled(
@@ -757,7 +785,7 @@ impl Config {
         op: &Operator,
         key: &str,
         stop: &mut watch::Receiver<bool>,
-    ) -> Result<std::collections::HashMap<String, (u64, String)>, Error> {
+    ) -> Result<std::collections::HashMap<String, (u64, String, String)>, Error> {
         const MAX_MANIFEST: u64 = 1024 * 1024 * 1024;
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.object_timeout_seconds.saturating_mul(4));
@@ -781,7 +809,7 @@ impl Config {
         for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
             let entry: crate::stable_layout::Entry =
                 sonic_rs::from_slice(line).map_err(|_| Error::Verification)?;
-            previous.insert(entry.path, (entry.bytes, entry.sha256));
+            previous.insert(entry.path, (entry.bytes, entry.sha256, entry.content_type));
         }
         Ok(previous)
     }
@@ -808,7 +836,11 @@ impl Config {
         let pending: Vec<&crate::stable_layout::Entry> = plan
             .entries
             .iter()
-            .filter(|e| previous.get(&e.path) != Some(&(e.bytes, e.sha256.clone())))
+            // Manifests written before 1.2.4 have no content type, so their objects are
+            // re-uploaded once with one.
+            .filter(|e| {
+                previous.get(&e.path) != Some(&(e.bytes, e.sha256.clone(), e.content_type.clone()))
+            })
             .collect();
         let mut counts = StableCounts {
             files: plan.entries.len(),
@@ -1020,6 +1052,7 @@ impl Config {
         let mut writer = controlled(
             async {
                 op.writer_with(key)
+                    .content_type(content_type(key))
                     .chunk(8 * 1024 * 1024)
                     .concurrent(1)
                     .await

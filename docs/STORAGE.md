@@ -102,6 +102,15 @@ stay published unless `prune: true`, which deletes only keys listed in the previ
 Unlike the versioned layout, a stable prefix changes in place: while a publication runs, readers
 can see a mix of old and new files, as with the original.
 
+## Content types
+
+Every uploaded object (both layouts, markers and `_sirius/` files) carries a `Content-Type` chosen
+from its key's extension: `png`, `jpg`, `webp`, `json`, `jsonl` (`application/x-ndjson`), text
+(`txt`, `shader`, `obj`, `csv`), audio (`wav`, `flac`, `mp3`, `ogg`), video (`mp4`, `mkv`, `m2v`,
+`ivf`, `webm`) and fonts (`ttf`, `otf`); anything else is `application/octet-stream`. S3 website
+endpoints and CDNs serve it unchanged, so browsers show images and play media inline. Stable
+manifests record it, so objects published before 1.2.4 without one are uploaded again once.
+
 ## S3 public-read policy
 
 S3 providers accept `public_read` (default false), `public_read_include` and
