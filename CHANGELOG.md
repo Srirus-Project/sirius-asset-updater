@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.5
+
+- Stable-layout `_sirius/files.jsonl` (about 550 MB for a full Global catalog) is streamed as a
+  multipart upload instead of one request body, like other large objects.
+- `object_timeout_seconds` now applies per started 64 MiB of an object, for both file uploads and
+  in-memory objects. A fixed 300-second deadline for the whole manifest write plus read-back
+  failed two production publications while Garage was garbage-collecting (`pipeline_failed`
+  after every file had been uploaded).
+
 ## 1.2.4
 
 - Uploads set `Content-Type` from the key's extension (images, JSON/JSONL, text, audio, video,
