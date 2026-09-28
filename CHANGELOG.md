@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.4
+
+- Uploads set `Content-Type` from the key's extension (images, JSON/JSONL, text, audio, video,
+  fonts; `application/octet-stream` otherwise), for both storage layouts and all markers. Before,
+  objects had no content type and S3 website/CDN responses carried none. Stable manifests record
+  the type, so a stable tree published by 1.2.3 is re-uploaded once to gain it.
+
 ## 1.2.3
 
 - Storage `layout: {type: stable}` publishes readable keys in place, restoring the original
