@@ -65,7 +65,21 @@ validation. An incompatible default for an encountered object fails that resourc
 Explicit type-tree extraction never falls back to raw bytes. Explicit `shader`/`obj` do not
 fall back to the JSON representations available under `auto`. `object_raw` and `typetree_json`
 bypass class-specific decoding, including embedded SplitAcb/Cubism processing; these are
-representation choices, not a claim to have produced audio/images/models. `object_raw` names
+representation choices, not a claim to have produced audio/images/models.
+
+Since 1.2.6, `auto` also matches these original shapes:
+
+- MonoBehaviours whose container ends in `.playable` are merged into one pretty JSON per
+  container (`playable_json`: `{container, object_count, objects: [{name, asset_type, data}]}`,
+  sorted by name, then bundle order) instead of one JSON per object. Explicit `typetree_json`
+  merges them the same way.
+- A Texture2D without image data (a font atlas Unity fills at runtime) exports its fields as JSON
+  (`empty_texture_json`) instead of failing the resource.
+- Fonts keep their format: `.otf` for OpenType payloads, `.ttf` otherwise.
+- ACB tracks that are not HCA (ADX, or an unknown codec) are published as stored:
+  `NNNNN.adx` or `NNNNN.bin` (`acb_raw_waveform`) with their cue metadata.
+
+`object_raw` names
 the entire serialized object deliberately: Haruki's `raw` handled some audio/video/font classes
 as their extracted payload instead. Do not translate that old spelling without checking intent.
 
@@ -183,7 +197,8 @@ still describes object/provider selection; additional renditions do not broaden 
 `audio: wav` preserves existing PCM WAV output. `audio: flac` uses FFmpeg after native
 HCA or verified ADX decoding, then decodes the FLAC back to PCM and compares channel
 count, sample rate and every sample with the source WAV. Only after this check succeeds
-is FLAC recorded and the intermediate WAV removed. Cue metadata remains unchanged.
+is FLAC recorded and the intermediate WAV removed. FLAC uses compression level 12, like the
+original (since 1.2.6; both backends). Cue metadata remains unchanged.
 This applies to embedded ACB, standalone ACB and USM audio. Matroska video muxing keeps
 the selected WAV/FLAC audio and original video stream; alpha video handling is unchanged.
 
@@ -191,8 +206,10 @@ the selected WAV/FLAC audio and original video stream; alpha video handling is u
 original decoded PCM WAV. MP3 never replaces the preservation source. Subsequent USM video
 muxing uses that WAV, avoiding an extra lossy intermediate before MP4 encoding.
 
-The encoder preserves mono/stereo and native MP3 sample rates: 32/44.1/48 kHz at 192 kbit/s,
-16/22.05/24 kHz at 128 kbit/s, and 8/11.025/12 kHz at 64 kbit/s. Unsupported rates, empty PCM
+The encoder preserves mono/stereo and native MP3 sample rates: 32/44.1/48 kHz at 320 kbit/s,
+16/22.05/24 kHz at 160 kbit/s, and 8/11.025/12 kHz at 64 kbit/s: the highest rate MP3 allows for
+each sample rate, which is what the original's `-b:a 320k` yields (since 1.2.6; 192/128 kbit/s
+before). Unsupported rates, empty PCM
 or more than two channels fail explicitly; no implicit resampling or downmixing is performed.
 The complete MP3 is decoded with errors treated as failures. Channels and sample rate must
 match; sample-frame count may differ by at most 1,152 for codec framing/padding. This verifies

@@ -2455,6 +2455,168 @@ async fn check_job_service_media_backend(ffi: bool) {
     std::env::remove_var(key);
 }
 
+/// A job whose export has a failed resource completes only under an explicit partial-publication
+/// allowance, and reports the failure in its outcome and the published version.
+#[cfg(unix)]
+#[tokio::test]
+async fn job_publishes_partially_only_when_the_stable_layout_allows_it() {
+    use crate::{
+        jobs::{Job, Status},
+        service::{Profile, Service, ServiceConfig},
+    };
+    use sonic_rs::JsonValueTrait;
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.output = directory.path().join("input");
+    enable_assets(&mut cfg, false);
+    let catalog = catalog_fixture(
+        &[
+            ("{Fwk.Resource.RemoteAssetDir}/good.acb", CRI_PROVIDER),
+            ("{Fwk.Resource.RemoteAssetDir}/bad.acb", CRI_PROVIDER),
+        ],
+        false,
+    );
+    let (client, fixture, upstream) = serve(cfg, StatusCode::OK, catalog, Duration::ZERO).await;
+    fixture.assets.lock().unwrap().insert(
+        "good.acb".into(),
+        (
+            StatusCode::OK,
+            crate::export::tests::synthetic_acb(0x12345678),
+        ),
+    );
+    fixture.assets.lock().unwrap().insert(
+        "bad.acb".into(),
+        (StatusCode::OK, b"neither ACB nor USM".to_vec()),
+    );
+    let publication = client.fetch().await.unwrap();
+    upstream.abort();
+    let token = format!("SERVICE_PARTIAL_{}", uuid::Uuid::new_v4().simple());
+    let key = format!("SERVICE_PARTIAL_KEY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "service-partial-only");
+    std::env::set_var(&key, "305419896");
+    // WAV export needs no media tool; the exporter only checks that one is configured.
+    let ffmpeg = directory.path().join("ffmpeg");
+    std::fs::write(&ffmpeg, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let export = directory.path().join("export.yaml");
+    std::fs::write(
+        &export,
+        format!("input: unused\noutput: unused\nretain_outputs: true\ncri_key_env: {key}\nffmpeg: {ffmpeg:?}\n"),
+    )
+    .unwrap();
+    let storage = directory.path().join("storage.yaml");
+    let destination = directory.path().join("published");
+    let config = ServiceConfig {
+        user_agent_prefix: None,
+        allow_cancel: true,
+        completion_notifications: vec![],
+        logging: None,
+        tls: None,
+        access_log: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        token_env: token.clone(),
+        state_directory: directory.path().join("state"),
+        output_directory: directory.path().join("jobs"),
+        max_concurrent_jobs: 1,
+        max_media_processes: 4,
+        max_cpu_stages: Some(1),
+        max_uploads: 4,
+        max_downloads: 4,
+        max_in_flight_bundle_bytes: 0,
+        max_queued_jobs: 4,
+        retain_terminal_jobs: 10,
+        timeout_seconds: 30,
+        profiles: BTreeMap::from([(
+            "export".into(),
+            Profile {
+                storage_config: Some(storage.clone()),
+                region: region::Region::Jp,
+                download_config: None,
+                export_config: Some(export.clone()),
+                input: Some(publication.clone()),
+            },
+        )]),
+    };
+    let write_storage = |allowance: usize| {
+        std::fs::write(
+            &storage,
+            format!(
+                "providers:\n  - name: local\n    prefix: jp\n    layout: {{type: stable, max_failed_resources: {allowance}}}\n    backend: {{type: local, directory: {:?}}}\n",
+                destination
+            ),
+        )
+        .unwrap()
+    };
+    write_storage(0);
+    let service = Service::open(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/api/v1/jobs", listener.local_addr().unwrap());
+    let router = service.router();
+    let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let workers = tokio::spawn(async move { service.run_workers(receiver).await });
+    let http_client = reqwest::Client::new();
+    for allowance in [0, 1] {
+        write_storage(allowance);
+        let response = http_client
+            .post(&endpoint)
+            .bearer_auth("service-partial-only")
+            .body(r#"{"region":"jp","profile":"export","operation":"export"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job: Job = sonic_rs::from_str(&response.text().await.unwrap()).unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let text = http_client
+                    .get(format!("{endpoint}/{}", job.id))
+                    .bearer_auth("service-partial-only")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let job: Job = sonic_rs::from_str(&text).unwrap();
+                if job.status.terminal() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let version = destination.join("jp/_sirius/version.json");
+        if allowance == 0 {
+            assert_eq!(finished.status, Status::Failed);
+            assert!(finished.outcome.is_none() && !version.exists());
+            continue;
+        }
+        assert_eq!(finished.status, Status::Completed, "{:?}", finished.failure);
+        let outcome = finished.outcome.unwrap();
+        let exported = outcome.export.unwrap();
+        assert_eq!((exported.failed, exported.full_export), (1, true));
+        assert!(outcome.publication_id.is_some());
+        let version: sonic_rs::Value =
+            sonic_rs::from_slice(&std::fs::read(version).unwrap()).unwrap();
+        assert_eq!(version["failed_resources"].as_u64(), Some(1));
+        assert_eq!(
+            version["verification"]["failed_resources"][0].as_str(),
+            Some("bad.acb")
+        );
+        let manifest = std::fs::read_to_string(destination.join("jp/_sirius/files.jsonl")).unwrap();
+        assert!(manifest.contains("good.acb") && !manifest.contains("bad.acb"));
+    }
+    stop.send(true).unwrap();
+    workers.await.unwrap().unwrap();
+    http.abort();
+    let _ = http.await;
+    std::env::remove_var(token);
+    std::env::remove_var(key);
+}
+
 fn listener_tls_config(root: &std::path::Path) -> crate::server::TlsConfig {
     let cert = root.join("cert.pem");
     let key = root.join("key.pem");

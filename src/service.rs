@@ -579,6 +579,16 @@ impl Service {
                 {
                     return Err(Error::Config);
                 }
+                let storage: Option<crate::storage::Config> = profile
+                    .storage_config
+                    .as_ref()
+                    .map(|path| read_yaml(path, crate::config_env::Document::Storage))
+                    .transpose()?;
+                // Partial publication is opt-in per storage layout; without storage every
+                // failed resource fails the job.
+                let max_failed = storage
+                    .as_ref()
+                    .map_or(0, crate::storage::Config::max_failed_resources);
                 export.set_service_cpu_gate(
                     self.inner.cpu_gate.clone(),
                     self.inner.config.max_cpu_stages,
@@ -617,8 +627,20 @@ impl Service {
                     total: Some(summary.input_files as u64),
                     bytes: summary.output_bytes,
                 };
-                if !summary.complete || summary.failed > 0 {
+                let partial = summary.failed > 0
+                    && summary.failed <= max_failed
+                    && summary.succeeded > 0
+                    && summary.succeeded.checked_add(summary.failed) == Some(summary.input_files)
+                    && summary.output_files > 0;
+                if !(partial || (summary.complete && summary.failed == 0)) {
                     return Err(Error::Verification);
+                }
+                if partial {
+                    tracing::warn!(
+                        failed = summary.failed,
+                        max_failed,
+                        "Export finished with failed resources; publishing the rest"
+                    );
                 }
                 // Export must describe the catalog already verified by this job.
                 if summary.catalog_sha256 != verified.catalog_sha256
@@ -633,6 +655,7 @@ impl Service {
                     retained: summary.retained,
                     files: summary.output_files,
                     bytes: summary.output_bytes,
+                    failed: summary.failed,
                 });
                 if summary.retained {
                     self.phase(&job.id, "verify_export").await?;
@@ -641,6 +664,7 @@ impl Service {
                     let work = crate::export_verify::verify_with_progress(
                         &output,
                         profile.region,
+                        max_failed,
                         progress_tx,
                     );
                     tokio::pin!(work);
@@ -670,10 +694,8 @@ impl Service {
                         total: Some(report.files_verified as u64),
                         bytes: report.bytes_verified,
                     };
-                    if let Some(path) = &profile.storage_config {
+                    if let Some(mut storage) = storage {
                         self.phase(&job.id, "publish").await?;
-                        let mut storage: crate::storage::Config =
-                            read_yaml(path, crate::config_env::Document::Storage)?;
                         storage.service_upload_gate = Some(self.inner.upload_gate.clone());
                         storage.release = Some(crate::storage::ReleaseInfo {
                             resource_version: outcome.verification.resource_version.clone(),

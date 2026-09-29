@@ -69,6 +69,7 @@ providers:
       strip_prefixes: [Assets/AddressableResources]   # default
       lowercase: true                                  # default
       prune: false                                     # default
+      max_failed_resources: 0                          # default; see Partial publication
     backend: {type: s3, ...}
 ```
 
@@ -80,11 +81,13 @@ Key rules (the export itself keeps numbered local directories; game names only b
 | Other objects of that container | `<container stem>.assets/<type dir>/<object name>.<ext>` (`sprite`, `gameobject`, `transform`, `recttransform`, `monobehaviour`, `mesh_renderer`, …) |
 | Flat exceptions | MonoBehaviour named like its container; the single Texture2D named like its container; fonts next to the container; AudioClip, VideoClip, SpriteAtlas |
 | TextAsset | container file name; `x.bytes` → `x`, `x.acb.bytes` → `x.acb`. Several TextAssets in one container that are not named like it go to `<stem>.assets/text_asset/<name>.bytes` |
+| MonoBehaviours of a `.playable` container | merged into one file at the container path: `timeline/x.playable` → `timeline/x.json`, `{container, object_count, objects: [{name, asset_type, data}]}` sorted by name, then bundle order (the original's `payload/playable.rs`) |
+| Texture2DArray | `<container stem>.assets/texture2d_array/<name>/layer_0000.png`, one image per layer |
 | ACB embedded in a Unity object | `<object key without extension>/<cue>.wav` and `<cue>.cues.json` |
 | Unnamed object | `<Type>_<n>`, numbered per container and type in catalog order (the original's `_#` would start a URL fragment) |
 | Object without container | `_bundles/<bundle>/<type dir>/<name>.<ext>` |
-| CRI ACB (`x_assets_x/dir/name_<hash>`) | `x/dir/name/<cue>.wav` and `<cue>.cues.json`, named by the first cue of each track; tracks without a cue keep their index (`00001.wav`) |
-| CRI USM | `x/dir/name/name.mkv`, `name.ivf`/`name.m2v`, `name.wav`, `name.usm.json`, `name.container-mask.json` |
+| CRI ACB (`x_assets_x/dir/name_<hash>`) | `x/dir/name/<cue>.wav` and `<cue>.cues.json`, named by the first cue of each track; a track played by several cues is also published under each further cue name (same content, as the original wrote one file per cue); tracks without a cue keep their index (`00001.wav`). Non-HCA tracks (ADX and others) are published as stored (`.adx`/`.bin`) |
+| CRI USM | `x/dir/name/name.mkv`, `name.ivf`/`name.m2v`, `name.wav`, `name.usm.json`, `name.container-mask.json`; the alpha stream of a masked movie is `name.alpha.<ext>` |
 
 Object names are sanitized like the original (`<>:"/\|?*`, plus `#` and `%`, and control
 characters become `_`; repeated `(Clone)` becomes `__cloneN`; stems over 220 characters are
@@ -101,6 +104,26 @@ verification report). Consumers read `version.json` first. Files the export no l
 stay published unless `prune: true`, which deletes only keys listed in the previous manifest.
 Unlike the versioned layout, a stable prefix changes in place: while a publication runs, readers
 can see a mix of old and new files, as with the original.
+
+### Partial publication
+
+By default one failed resource fails the job and nothing is published, so a single broken bundle
+holds back a whole resource version. The original updater logged failed objects and published
+the rest. `max_failed_resources: N` (stable layout only, default `0`) restores that for up to `N`
+failed resources per export:
+
+- The export must have finished: every resource either succeeded or failed, at least one
+  succeeded, and at most `N` failed. Anything else (cancellation, a failed download or catalog
+  check, more failures) still publishes nothing.
+- A failed resource contributes no new files. Its keys from the previous manifest stay in storage
+  and are carried into the new `_sirius/files.jsonl` (so `prune` keeps them), unless another
+  resource's new output now claims the same key.
+- `_sirius/version.json` records `failed_resources` (count) and `carried_forward`, and
+  `verification.failed_resources` lists the failed sources. The job completes; its
+  `outcome.export.failed` is the count (omitted when zero), and the application log has a
+  warning. The export cache has no entry for a failed resource, so the next job retries only it.
+- Every provider of the storage configuration must allow partial publication: with a versioned
+  provider (or any `0`) the limit is `0`, because an immutable publication tree cannot be partial.
 
 ## Content types
 

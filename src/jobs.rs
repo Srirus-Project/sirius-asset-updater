@@ -78,6 +78,12 @@ pub struct ExportOutcome {
     pub retained: bool,
     pub files: usize,
     pub bytes: u64,
+    /// Resources left out of a partial publication (their previous files stay published).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed: usize,
+}
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Job {

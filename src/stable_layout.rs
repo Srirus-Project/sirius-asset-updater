@@ -44,6 +44,11 @@ pub struct Options {
     /// Delete keys listed in the previous manifest that this export no longer produces.
     #[serde(default)]
     pub prune: bool,
+    /// Partial publication: up to this many failed resources are left out of an otherwise
+    /// verified export; their previously published files stay and are carried into the new
+    /// manifest. `0` (default) rejects any failure.
+    #[serde(default)]
+    pub max_failed_resources: usize,
 }
 fn default_strip_prefixes() -> Vec<String> {
     DEFAULT_STRIP_PREFIXES
@@ -60,6 +65,7 @@ impl Default for Options {
             strip_prefixes: default_strip_prefixes(),
             lowercase: true,
             prune: false,
+            max_failed_resources: 0,
         }
     }
 }
@@ -105,6 +111,8 @@ pub struct Plan {
     pub deduplicated: usize,
     /// Outputs that needed a `__dupN` suffix.
     pub renamed: usize,
+    /// Sources of failed resources left out under `max_failed_resources`, in catalog order.
+    pub failed_sources: Vec<String>,
 }
 
 /// Unity class names for the IDs seen in Sirius bundles and the common built-in types.
@@ -368,6 +376,31 @@ impl Context<'_> {
         output: &OutputRecord,
         object: &ObjectIdentity,
     ) -> Vec<String> {
+        let mut parts = self.object_key(resource, output, object);
+        // Texture2DArray layers (`<stem>_layer_NNNN.<ext>`): `<name>/layer_NNNN.<ext>`, as in the
+        // original, instead of one key per array that every layer would collide on.
+        if object.class_id == 187 {
+            let (file_stem, ext) = split_ext(output_file(output));
+            if let Some(layer) = file_stem
+                .rsplit_once("_layer_")
+                .map(|x| x.1)
+                .filter(|l| l.len() == 4 && l.bytes().all(|b| b.is_ascii_digit()))
+            {
+                if let Some(last) = parts.pop() {
+                    parts.push(split_ext(&last).0.to_string());
+                }
+                parts.push(join_ext(&format!("layer_{layer}"), ext));
+            }
+        }
+        parts
+    }
+
+    fn object_key(
+        &mut self,
+        resource: &ResourceReport,
+        output: &OutputRecord,
+        object: &ObjectIdentity,
+    ) -> Vec<String> {
         let class = class_name(object.class_id)
             .map(str::to_string)
             .unwrap_or_else(|| format!("ClassID{}", object.class_id));
@@ -407,6 +440,9 @@ impl Context<'_> {
             p
         };
         match object.class_id {
+            // A merged timeline replaces its container: `x.playable` -> `x.json`
+            // (`payload/naming.rs:12-31`).
+            _ if output.kind == "playable_json" => flat(&ext),
             // TextAsset: the raw bytes of the container file. `x.acb.bytes` -> `x.acb`,
             // `x.bytes` -> `x`, other container extensions are kept (`paths` rewrite in
             // `payload/naming.rs:33-59`, without turning `foo.txt` into `foo`).
@@ -472,6 +508,13 @@ impl Context<'_> {
         let (mut parts, stem) = cri_location(&resource.source);
         let file = output_file(output);
         let (base, ext) = split_ext(file);
+        // A USM with an alpha channel exports `color/` and `alpha/` streams: name the alpha ones
+        // `<stem>.alpha.<ext>` instead of letting them collide with the colour ones.
+        let name_stem = if output.path.starts_with("alpha/") {
+            format!("{stem}.alpha")
+        } else {
+            stem.clone()
+        };
         let index = file.split('.').next().unwrap_or(file);
         let numbered = index.len() == 5 && index.bytes().all(|b| b.is_ascii_digit());
         if let Some(cue) = cue {
@@ -483,11 +526,11 @@ impl Context<'_> {
         }
         // USM and other media: `<dir of the source>/<stem>.<ext>` next to each other.
         let name = if numbered {
-            join_ext(&stem, file.split_once('.').map_or(ext, |x| x.1))
+            join_ext(&name_stem, file.split_once('.').map_or(ext, |x| x.1))
         } else if base == "movie" {
-            join_ext(&stem, ext)
+            join_ext(&name_stem, ext)
         } else {
-            format!("{stem}.{file}")
+            format!("{name_stem}.{file}")
         };
         parts.push(stem);
         parts.push(name);
@@ -513,7 +556,11 @@ fn container_key(parts: &[String], file: &str) -> String {
 /// ACB track naming for an output: `None` when the output is not an ACB track, otherwise the
 /// first cue name of its `NNNNN.cues.json` (`[[name, cue_id, ...], ...]`) or, for tracks without
 /// a cue, the track index.
-fn acb_track(export: &Path, resource: &ResourceReport, output: &OutputRecord) -> Option<String> {
+fn acb_track(
+    export: &Path,
+    resource: &ResourceReport,
+    output: &OutputRecord,
+) -> Option<Vec<String>> {
     let (dir, file) = match output.path.rsplit_once('/') {
         Some((dir, file)) => (Some(dir), file),
         None => (None, output.path.as_str()),
@@ -533,21 +580,31 @@ fn acb_track(export: &Path, resource: &ResourceReport, output: &OutputRecord) ->
     {
         return None;
     }
-    let cue = std::fs::read(export.join(&resource.output_directory).join(&cues))
+    // Every cue that plays this track (first one first); a track without cues keeps its index.
+    let mut names: Vec<String> = Vec::new();
+    if let Some(value) = std::fs::read(export.join(&resource.output_directory).join(&cues))
         .ok()
         .filter(|bytes| bytes.len() <= 1024 * 1024)
         .and_then(|bytes| sonic_rs::from_slice::<sonic_rs::Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .as_array()?
-                .first()?
-                .as_array()?
-                .first()?
-                .as_str()
+    {
+        for cue in value.as_array().into_iter().flat_map(|a| a.iter()) {
+            let name = cue
+                .as_array()
+                .and_then(|c| c.first())
+                .and_then(|n| n.as_str())
                 .map(fix_file_name)
-        })
-        .filter(|name| !name.is_empty());
-    Some(cue.unwrap_or_else(|| index.to_string()))
+                .filter(|n| !n.is_empty());
+            if let Some(name) = name {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        names.push(index.to_string());
+    }
+    Some(names)
 }
 
 fn valid_key(key: &str) -> bool {
@@ -558,6 +615,57 @@ fn valid_key(key: &str) -> bool {
         && key
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != ".." && part.len() <= 255)
+}
+
+/// Claim `key` (or the first free `__dupN` variant) for an output. Keys compare case-insensitively
+/// so they stay unique for case-insensitive consumers even with `lowercase: false`; a key already
+/// holding byte-identical content is reused instead of duplicated.
+fn claim(
+    plan: &mut Plan,
+    claimed: &mut HashMap<String, usize>,
+    lowered: &mut HashMap<String, String>,
+    key: String,
+    mut entry: Entry,
+) {
+    let mut candidate = key.clone();
+    let mut n = 1;
+    loop {
+        let folded = candidate.to_lowercase();
+        match lowered.get(&folded) {
+            None => {
+                if n > 1 {
+                    plan.renamed += 1;
+                }
+                entry.content_type = crate::storage::content_type(&candidate).to_string();
+                entry.path = candidate.clone();
+                lowered.insert(folded, candidate.clone());
+                claimed.insert(candidate, plan.entries.len());
+                plan.entries.push(entry);
+                return;
+            }
+            Some(existing) => {
+                let index = claimed[existing];
+                if plan.entries[index].sha256 == entry.sha256
+                    && plan.entries[index].bytes == entry.bytes
+                {
+                    plan.deduplicated += 1;
+                    return;
+                }
+                n += 1;
+                let (stem, ext) = match key.rsplit_once('/') {
+                    Some((dir, file)) => {
+                        let (s, e) = split_ext(file);
+                        (format!("{dir}/{s}"), e.to_string())
+                    }
+                    None => {
+                        let (s, e) = split_ext(&key);
+                        (s.to_string(), e.to_string())
+                    }
+                };
+                candidate = join_ext(&format!("{stem}__dup{n}"), &ext);
+            }
+        }
+    }
 }
 
 /// Plan stable keys for a verified export directory (its `resources.jsonl` in catalog order).
@@ -583,7 +691,7 @@ pub(crate) fn plan_resources(
     options: &Options,
 ) -> Result<Plan, Error> {
     let mut textures: HashMap<String, (usize, bool)> = HashMap::new();
-    for resource in resources {
+    for resource in resources.iter().filter(|r| r.errors.is_empty()) {
         let mut seen = HashSet::new();
         for output in &resource.outputs {
             let Some(object) = &output.object else {
@@ -620,86 +728,76 @@ pub(crate) fn plan_resources(
     let mut plan = Plan::default();
     for resource in resources {
         if !resource.errors.is_empty() {
-            return Err(Error::Verification);
-        }
-        for output in &resource.outputs {
-            let parts = match &output.object {
-                Some(object) if output.path.contains('/') => {
-                    let mut parts = context.unity_key(resource, output, object);
-                    let file = output_file(output);
-                    let rest = file.split_once('.').map_or("", |x| x.1).to_string();
-                    let name = acb_track(export, resource, output)
-                        .unwrap_or_else(|| file.split('.').next().unwrap_or(file).to_string());
-                    if let Some(last) = parts.pop() {
-                        parts.push(split_ext(&last).0.to_string());
-                    }
-                    parts.push(join_ext(&name, &rest));
-                    parts
-                }
-                Some(object) => context.unity_key(resource, output, object),
-                None => {
-                    let track = acb_track(export, resource, output);
-                    context.cri_key(resource, output, track.as_deref())
-                }
-            };
-            let mut key = parts.join("/");
-            if options.lowercase {
-                key = key.to_lowercase();
-            }
-            if !valid_key(&key) {
+            if plan.failed_sources.len() >= options.max_failed_resources {
                 return Err(Error::Verification);
             }
-            let local = format!("{}/{}", resource.output_directory, output.path);
-            let entry = |path: String| Entry {
-                content_type: crate::storage::content_type(&path).to_string(),
-                path,
-                local: local.clone(),
-                bytes: output.bytes,
-                sha256: output.sha256.clone(),
-                source: resource.source.clone(),
-                kind: output.kind.clone(),
-                class_id: output.object.as_ref().map(|o| o.class_id),
-                container: output.object.as_ref().and_then(|o| o.container.clone()),
-                name: output.object.as_ref().and_then(|o| o.name.clone()),
-            };
-            // Compare case-insensitively so keys stay unique for case-insensitive consumers
-            // even with `lowercase: false`.
-            let mut candidate = key.clone();
-            let mut n = 1;
-            loop {
-                let folded = candidate.to_lowercase();
-                match lowered.get(&folded) {
-                    None => {
-                        if n > 1 {
-                            plan.renamed += 1;
-                        }
-                        lowered.insert(folded, candidate.clone());
-                        claimed.insert(candidate.clone(), plan.entries.len());
-                        plan.entries.push(entry(candidate));
-                        break;
-                    }
-                    Some(existing) => {
-                        let index = claimed[existing];
-                        if plan.entries[index].sha256 == output.sha256
-                            && plan.entries[index].bytes == output.bytes
-                        {
-                            plan.deduplicated += 1;
-                            break;
-                        }
-                        n += 1;
-                        let (stem, ext) = match key.rsplit_once('/') {
-                            Some((dir, file)) => {
-                                let (s, e) = split_ext(file);
-                                (format!("{dir}/{s}"), e.to_string())
+            plan.failed_sources.push(resource.source.clone());
+            continue;
+        }
+        for output in &resource.outputs {
+            // One primary key per output; ACB tracks referenced by several cues get one alias key
+            // per additional cue, as the original wrote one file per cue.
+            let key_parts: Vec<Vec<String>> = match &output.object {
+                Some(object) if output.path.contains('/') => {
+                    let base = context.unity_key(resource, output, object);
+                    let file = output_file(output);
+                    let rest = file.split_once('.').map_or("", |x| x.1).to_string();
+                    let names = acb_track(export, resource, output).unwrap_or_else(|| {
+                        vec![file.split('.').next().unwrap_or(file).to_string()]
+                    });
+                    names
+                        .iter()
+                        .map(|name| {
+                            let mut parts = base.clone();
+                            if let Some(last) = parts.pop() {
+                                parts.push(split_ext(&last).0.to_string());
                             }
-                            None => {
-                                let (s, e) = split_ext(&key);
-                                (s.to_string(), e.to_string())
-                            }
-                        };
-                        candidate = join_ext(&format!("{stem}__dup{n}"), &ext);
-                    }
+                            parts.push(join_ext(name, &rest));
+                            parts
+                        })
+                        .collect()
                 }
+                Some(object) => vec![context.unity_key(resource, output, object)],
+                None => match acb_track(export, resource, output) {
+                    Some(names) => names
+                        .iter()
+                        .map(|name| context.cri_key(resource, output, Some(name)))
+                        .collect(),
+                    None => vec![context.cri_key(resource, output, None)],
+                },
+            };
+            let aliases = if output.kind == "cue_metadata" {
+                1
+            } else {
+                key_parts.len()
+            };
+            let local = format!("{}/{}", resource.output_directory, output.path);
+            for parts in key_parts.into_iter().take(aliases) {
+                let mut key = parts.join("/");
+                if options.lowercase {
+                    key = key.to_lowercase();
+                }
+                if !valid_key(&key) {
+                    return Err(Error::Verification);
+                }
+                claim(
+                    &mut plan,
+                    &mut claimed,
+                    &mut lowered,
+                    key,
+                    Entry {
+                        content_type: String::new(),
+                        path: String::new(),
+                        local: local.clone(),
+                        bytes: output.bytes,
+                        sha256: output.sha256.clone(),
+                        source: resource.source.clone(),
+                        kind: output.kind.clone(),
+                        class_id: output.object.as_ref().map(|o| o.class_id),
+                        container: output.object.as_ref().and_then(|o| o.container.clone()),
+                        name: output.object.as_ref().and_then(|o| o.name.clone()),
+                    },
+                );
             }
         }
     }
@@ -1100,6 +1198,95 @@ mod tests {
     }
 
     #[test]
+    fn shared_tracks_alpha_movies_and_texture_array_layers_get_distinct_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("00000")).unwrap();
+        // One waveform played by two cues: one file per cue name, as the original wrote.
+        std::fs::write(
+            dir.path().join("00000/00000.cues.json"),
+            br#"[["spot_nagi_01",0,0],["IntroRandom",1,0]]"#,
+        )
+        .unwrap();
+        let acb = res(
+            "cri_assets_cri/sound/spot_0123456789abcdef0123456789abcdef",
+            "00000",
+            vec![
+                out("00000.wav", "hca_wav", "a", None),
+                out("00000.cues.json", "cue_metadata", "b", None),
+            ],
+        );
+        let usm = res(
+            "cri_assets_cri/video/m_0123456789abcdef0123456789abcdef",
+            "00001",
+            vec![
+                out("color/00000.m2v", "usm_video_stream", "c", None),
+                out("alpha/00000.m2v", "usm_video_stream", "d", None),
+                out("color/movie.mkv", "usm_mkv", "e", None),
+                out("alpha/movie.mkv", "usm_mkv", "f", None),
+            ],
+        );
+        let c = "Assets/AddressableResources/Fx/Clouds.asset";
+        let array = res(
+            "b",
+            "00002",
+            vec![
+                out(
+                    "0_7_layer_0000.png",
+                    "image_png",
+                    "g",
+                    Some((187, Some("Clouds"), Some(c))),
+                ),
+                out(
+                    "0_7_layer_0001.png",
+                    "image_png",
+                    "g",
+                    Some((187, Some("Clouds"), Some(c))),
+                ),
+            ],
+        );
+        // A merged timeline takes its container's path.
+        let playable = res(
+            "c",
+            "00003",
+            vec![out(
+                "playable_0000.json",
+                "playable_json",
+                "h",
+                Some((
+                    114,
+                    Some("Director"),
+                    Some("Assets/AddressableResources/Timeline/Opening.playable"),
+                )),
+            )],
+        );
+        let plan = plan_resources(
+            dir.path(),
+            &[acb, usm, array, playable],
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&plan),
+            [
+                "cri/sound/spot/spot_nagi_01.wav",
+                "cri/sound/spot/introrandom.wav",
+                "cri/sound/spot/spot_nagi_01.cues.json",
+                "cri/video/m/m.m2v",
+                "cri/video/m/m.alpha.m2v",
+                "cri/video/m/m.mkv",
+                "cri/video/m/m.alpha.mkv",
+                // Identical layers keep their own keys: they are different layers.
+                "fx/clouds.assets/texture2d_array/clouds/layer_0000.png",
+                "fx/clouds.assets/texture2d_array/clouds/layer_0001.png",
+                "timeline/opening.json",
+            ]
+        );
+        // The alias points at the same verified local file.
+        assert_eq!(plan.entries[0].local, plan.entries[1].local);
+        assert_eq!(plan.renamed, 0);
+    }
+
+    #[test]
     fn names_are_sanitized_and_failed_resources_rejected() {
         let long = "n".repeat(300);
         let r = res(
@@ -1132,7 +1319,25 @@ mod tests {
         assert!(plan.entries[1].path.ends_with("__truncated.json"));
         let mut failed = res("b", "00000", vec![]);
         failed.errors.push("export failed".into());
-        assert!(plan_resources(Path::new("/nonexistent"), &[failed], &Options::default()).is_err());
+        assert!(plan_resources(
+            Path::new("/nonexistent"),
+            &[failed.clone()],
+            &Options::default()
+        )
+        .is_err());
+        // Partial publication leaves failed resources out, up to the configured count.
+        let partial = Options {
+            max_failed_resources: 1,
+            ..Options::default()
+        };
+        let plan = plan_resources(Path::new("/nonexistent"), &[failed.clone()], &partial).unwrap();
+        assert_eq!(
+            (plan.entries.len(), plan.failed_sources),
+            (0, vec!["b".to_string()])
+        );
+        let mut second = failed.clone();
+        second.source = "c".into();
+        assert!(plan_resources(Path::new("/nonexistent"), &[failed, second], &partial).is_err());
         assert_eq!(
             snake_case("ParticleSystemRenderer"),
             "particle_system_renderer"

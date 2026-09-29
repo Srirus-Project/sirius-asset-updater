@@ -28,6 +28,9 @@ pub struct Report {
     pub full_export: bool,
     pub summary_sha256: String,
     pub journal_sha256: String,
+    /// Sources of failed resources accepted for a partial publication, in journal order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_resources: Vec<String>,
 }
 
 /// A temporary, verified allowlist for a subsequent storage publication.
@@ -157,21 +160,34 @@ pub struct VerificationProgress {
     pub files: usize,
     pub bytes: u64,
 }
+/// `max_failed` > 0 accepts a finished export with up to that many failed resources (partial
+/// publication); their outputs are never verified or listed for upload.
 pub async fn verify_with_progress(
     directory: &Path,
     region: Region,
+    max_failed: usize,
     progress: tokio::sync::watch::Sender<VerificationProgress>,
 ) -> Result<Report, Error> {
-    Ok(prepare_with_progress(directory, region, Some(progress))
-        .await?
-        .report)
+    Ok(
+        prepare_with_progress(directory, region, max_failed, Some(progress))
+            .await?
+            .report,
+    )
 }
 pub async fn prepare(directory: &Path, region: Region) -> Result<VerifiedExport, Error> {
-    prepare_with_progress(directory, region, None).await
+    prepare_with_progress(directory, region, 0, None).await
+}
+pub(crate) async fn prepare_partial(
+    directory: &Path,
+    region: Region,
+    max_failed: usize,
+) -> Result<VerifiedExport, Error> {
+    prepare_with_progress(directory, region, max_failed, None).await
 }
 async fn prepare_with_progress(
     directory: &Path,
     region: Region,
+    max_failed: usize,
     progress: Option<tokio::sync::watch::Sender<VerificationProgress>>,
 ) -> Result<VerifiedExport, Error> {
     if region == Region::Cn {
@@ -195,10 +211,12 @@ async fn prepare_with_progress(
         sonic_rs::from_slice(&summary_bytes).map_err(|_| Error::Verification)?;
     if summary.schema_version != 4
         || summary.region != region
-        || !summary.complete
         || !summary.retained
-        || summary.failed != 0
-        || summary.succeeded != summary.input_files
+        // Every resource finished; failures only within the accepted count.
+        || summary.succeeded.checked_add(summary.failed) != Some(summary.input_files)
+        || summary.failed > max_failed
+        || summary.complete != (summary.failed == 0)
+        || summary.succeeded == 0
         || summary.input_files == 0
         || summary.input_files > MAX_RESOURCES
         || summary.input_files > summary.catalog_files
@@ -232,6 +250,11 @@ async fn prepare_with_progress(
     let mut journal_hash = Sha256::new();
     let mut journal_bytes = 0_u64;
     let mut directories = HashSet::new();
+    let mut names = HashSet::new();
+    let mut failed_resources = Vec::new();
+    // Outputs a failed resource declared before failing: counted in the summary, never published.
+    let mut failed_files = 0_usize;
+    let mut failed_bytes = 0_u64;
     let mut sources = HashSet::new();
     let mut files = 0_usize;
     let mut bytes = 0_u64;
@@ -252,7 +275,7 @@ async fn prepare_with_progress(
         }
         if size as u64 > MAX_REPORT
             || line.last() != Some(&b'\n')
-            || directories.len() >= summary.input_files
+            || names.len() >= summary.input_files
         {
             return Err(Error::Verification);
         }
@@ -266,14 +289,37 @@ async fn prepare_with_progress(
         let index = name.parse::<usize>().map_err(|_| Error::Verification)?;
         if name != &format!("{index:05}")
             || index >= summary.input_files
-            || !directories.insert(name.clone())
+            || !names.insert(name.clone())
             || !sources.insert(resource.source.clone())
             || !safe_path(&resource.source)
             || !valid_digest(&resource.source_sha256)
-            || !resource.errors.is_empty()
         {
             return Err(Error::Verification);
         }
+        if !resource.errors.is_empty() {
+            if failed_resources.len() >= max_failed || resource.cache_hit {
+                return Err(Error::Verification);
+            }
+            failed_resources.push(resource.source.clone());
+            for item in &resource.outputs {
+                failed_files = failed_files.checked_add(1).ok_or(Error::Verification)?;
+                failed_bytes = failed_bytes
+                    .checked_add(item.bytes)
+                    .ok_or(Error::Verification)?;
+                *kinds.entry(item.kind.clone()).or_default() += 1;
+            }
+            objects = objects
+                .checked_add(resource.objects)
+                .ok_or(Error::Verification)?;
+            selected = selected
+                .checked_add(resource.selected_objects)
+                .ok_or(Error::Verification)?;
+            skipped = skipped
+                .checked_add(resource.skipped_objects)
+                .ok_or(Error::Verification)?;
+            continue;
+        }
+        directories.insert(name.clone());
         let raw_only = summary
             .raw_bundles
             .as_ref()
@@ -356,8 +402,9 @@ async fn prepare_with_progress(
         }
     }
     if directories.len() != summary.succeeded
-        || files != summary.output_files
-        || bytes != summary.output_bytes
+        || failed_resources.len() != summary.failed
+        || files.checked_add(failed_files) != Some(summary.output_files)
+        || bytes.checked_add(failed_bytes) != Some(summary.output_bytes)
         || objects != summary.unity_objects
         || selected != summary.selected_unity_objects
         || skipped != summary.skipped_unity_objects
@@ -420,6 +467,7 @@ async fn prepare_with_progress(
             full_catalog: summary.full_catalog,
             full_export: summary.full_export,
             summary_sha256,
+            failed_resources,
             journal_sha256,
         },
     })
@@ -472,14 +520,14 @@ pub(crate) mod tests {
     async fn verification_progress_counts_only_verified_payloads_and_never_masks_failure() {
         let root = fixture();
         let (tx, rx) = tokio::sync::watch::channel(VerificationProgress::default());
-        let report = verify_with_progress(root.path(), Region::Jp, tx)
+        let report = verify_with_progress(root.path(), Region::Jp, 0, tx)
             .await
             .unwrap();
         assert_eq!(rx.borrow().files, report.files_verified);
         assert_eq!(rx.borrow().bytes, report.bytes_verified);
         std::fs::write(root.path().join("00000/payload.bin"), b"corrupted export").unwrap();
         let (tx, rx) = tokio::sync::watch::channel(VerificationProgress::default());
-        assert!(verify_with_progress(root.path(), Region::Jp, tx)
+        assert!(verify_with_progress(root.path(), Region::Jp, 0, tx)
             .await
             .is_err());
         assert_eq!(rx.borrow().files, 0);

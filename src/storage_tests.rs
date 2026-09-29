@@ -1622,9 +1622,127 @@ fn stable(provider: Provider, prune: bool) -> Provider {
             strip_prefixes: stable_strip_prefixes(),
             lowercase: true,
             prune,
+            max_failed_resources: 0,
         },
         ..provider
     }
+}
+fn partial(provider: Provider, prune: bool, max: usize) -> Provider {
+    let mut provider = stable(provider, prune);
+    if let Layout::Stable {
+        max_failed_resources,
+        ..
+    } = &mut provider.layout
+    {
+        *max_failed_resources = max;
+    }
+    provider
+}
+/// Turn resource `dir` of a fixture into a failed one, as the exporter records it: the report
+/// keeps the outputs it declared, the directory is never renamed into place.
+fn fail_resource(root: &Path, dir: &str) {
+    use crate::export::ExportSummary;
+    let journal = std::fs::read_to_string(root.join("resources.jsonl")).unwrap();
+    let mut lines = Vec::new();
+    for line in journal.lines() {
+        let mut report: sonic_rs::Value = sonic_rs::from_str(line).unwrap();
+        if report["output_directory"].as_str() == Some(dir) {
+            report["errors"] = sonic_rs::json!(["object 3 class 1: synthetic failure"]);
+        }
+        lines.push(sonic_rs::to_string(&report).unwrap());
+    }
+    std::fs::write(root.join("resources.jsonl"), lines.join("\n") + "\n").unwrap();
+    std::fs::remove_dir_all(root.join(dir)).unwrap();
+    let mut summary: ExportSummary =
+        sonic_rs::from_slice(&std::fs::read(root.join("summary.json")).unwrap()).unwrap();
+    summary.succeeded -= 1;
+    summary.failed += 1;
+    summary.complete = false;
+    std::fs::write(
+        root.join("summary.json"),
+        sonic_rs::to_vec(&summary).unwrap(),
+    )
+    .unwrap();
+}
+#[tokio::test]
+async fn partial_publication_keeps_failed_resources_previous_files() {
+    let destination = tempfile::tempdir().unwrap();
+    let root = destination.path().join("hk");
+    let mut config = config(partial(local(destination.path().into()), true, 1));
+    let (_tx, rx) = watch::channel(false);
+    let first = stable_fixture(&stable_files(b"texture-v1", true));
+    config
+        .publish(first.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+
+    // The extra resource fails this time: everything else updates, its file stays published,
+    // stays in the manifest (so pruning keeps it) and the failure is recorded.
+    let second = stable_fixture(&stable_files(b"texture-v2", true));
+    fail_resource(second.path(), "00002");
+    let result = config
+        .publish(second.path(), Region::Hk, rx.clone())
+        .await
+        .unwrap();
+    let counts = result.providers[0].stable.unwrap();
+    assert_eq!(
+        (
+            counts.files,
+            counts.uploaded,
+            counts.pruned,
+            counts.failed_resources,
+            counts.carried_forward
+        ),
+        (4, 1, 0, 1, 1)
+    );
+    assert_eq!(
+        std::fs::read(root.join("adv/chat/back.png")).unwrap(),
+        b"texture-v2"
+    );
+    assert!(root.join("ui/extra.assets/gameobject/extra.json").is_file());
+    let manifest = std::fs::read_to_string(root.join("_sirius/files.jsonl")).unwrap();
+    assert_eq!(manifest.lines().count(), 5);
+    assert!(manifest.contains("ui/extra.assets/gameobject/extra.json"));
+    let version: sonic_rs::Value =
+        sonic_rs::from_slice(&std::fs::read(root.join("_sirius/version.json")).unwrap()).unwrap();
+    assert_eq!(version["files"].as_u64(), Some(5));
+    assert_eq!(version["failed_resources"].as_u64(), Some(1));
+    assert_eq!(
+        version["verification"]["failed_resources"][0].as_str(),
+        Some("bundle_00002")
+    );
+    let published = std::fs::read(root.join("_sirius/version.json")).unwrap();
+
+    // More failures than allowed, or no allowance at all, publish nothing.
+    let third = stable_fixture(&stable_files(b"texture-v3", true));
+    fail_resource(third.path(), "00000");
+    fail_resource(third.path(), "00002");
+    assert!(config
+        .publish(third.path(), Region::Hk, rx.clone())
+        .await
+        .is_err());
+    config.providers[0] = stable(local(destination.path().into()), true);
+    assert!(config
+        .publish(second.path(), Region::Hk, rx.clone())
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(root.join("_sirius/version.json")).unwrap(),
+        published
+    );
+    assert_eq!(config.max_failed_resources(), 0);
+
+    // The next complete export replaces the carried entry with fresh output.
+    let fourth = stable_fixture(&stable_files(b"texture-v2", true));
+    let result = config.publish(fourth.path(), Region::Hk, rx).await.unwrap();
+    let counts = result.providers[0].stable.unwrap();
+    assert_eq!(
+        (counts.files, counts.uploaded, counts.carried_forward),
+        (5, 0, 0)
+    );
+    let version: sonic_rs::Value =
+        sonic_rs::from_slice(&std::fs::read(root.join("_sirius/version.json")).unwrap()).unwrap();
+    assert!(version.get("failed_resources").is_none());
 }
 #[tokio::test]
 async fn stable_layout_publishes_readable_keys_and_uploads_only_changes() {

@@ -249,6 +249,18 @@ fn transient_media_failure(status: &str, diagnostic: &str) -> bool {
     let haystack = format!("{status} {diagnostic}").to_lowercase();
     MARKERS.iter().any(|marker| haystack.contains(marker))
 }
+/// `.ttf`/`.otf` from unity-rs's payload-signature suggestion, like the original updater.
+fn font_extension(suggested: &str) -> &'static str {
+    if suggested.eq_ignore_ascii_case(".otf") {
+        "otf"
+    } else {
+        "ttf"
+    }
+}
+/// HCA signature, including the masked form (high bit set on each letter) of encrypted files.
+fn is_hca(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4].iter().map(|b| b & 0x7f).eq(*b"HCA\0")
+}
 /// Stream-copy mux of a USM's elementary streams into Matroska. `+bitexact` keeps the muxer from
 /// writing the current date and a random segment UID, so the same streams always give the same
 /// file (stable-layout publications compare bytes).
@@ -907,9 +919,13 @@ impl ExportConfig {
             return Err(err("bundle contains no serialized objects"));
         }
         let mut embedded = 0;
-        for object in studio
+        // Haruki merges every MonoBehaviour of a `.playable` container into one timeline JSON.
+        let mut playables: BTreeMap<String, Vec<PlayableObject>> = BTreeMap::new();
+        let mut playable_bytes = 0u64;
+        for (index, object) in studio
             .objects()
-            .filter(|o| own_files.contains(o.source_path()))
+            .enumerate()
+            .filter(|(_, o)| own_files.contains(o.source_path()))
         {
             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Error::Cancelled);
@@ -946,9 +962,27 @@ impl ExportConfig {
                     if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(Error::Cancelled);
                     }
-                    let target = output.join(format!("{stem}.{extension}"));
-                    fs::write(&target, bytes).map_err(err)?;
-                    self.record(output, &target, kind, report)?;
+                    if read_kind == Kind::TypetreeJson {
+                        if let Some(container) = playable_container(object) {
+                            self.hold_playable(
+                                &mut playables,
+                                &mut playable_bytes,
+                                container,
+                                index,
+                                object,
+                                bytes,
+                                report,
+                            )?;
+                        } else {
+                            let target = output.join(format!("{stem}.{extension}"));
+                            fs::write(&target, bytes).map_err(err)?;
+                            self.record(output, &target, kind, report)?;
+                        }
+                    } else {
+                        let target = output.join(format!("{stem}.{extension}"));
+                        fs::write(&target, bytes).map_err(err)?;
+                        self.record(output, &target, kind, report)?;
+                    }
                     if read_kind == Kind::TypetreeJson {
                         let file =
                             &studio.collection().serialized_files()[object.file_index()].file;
@@ -1070,9 +1104,24 @@ impl ExportConfig {
                 }
                 if matches!(object.class_id(), 28 | 213) {
                     let image = if object.class_id() == 28 {
-                        object
-                            .decode_texture_mip(0, TextureReadLimits::default())
-                            .map_err(err)?
+                        match object.decode_texture_mip(0, TextureReadLimits::default()) {
+                            Ok(image) => image,
+                            // Unity builds dynamic font atlases empty and fills them at runtime:
+                            // keep the object's fields instead of failing the resource.
+                            Err(unity_rs_core::Error::Unsupported(reason))
+                                if read_kind == Kind::Auto
+                                    && reason.contains("carries no image data") =>
+                            {
+                                let bytes = object
+                                    .read_type_tree_json(false, limit as usize)
+                                    .map_err(err)?;
+                                drop(cpu);
+                                let target = output.join(format!("{stem}.json"));
+                                fs::write(&target, bytes).map_err(err)?;
+                                return self.record(output, &target, "empty_texture_json", report);
+                            }
+                            Err(error) => return Err(err(error)),
+                        }
                     } else {
                         object
                             .decode_sprite(
@@ -1176,7 +1225,7 @@ impl ExportConfig {
                             .map_err(err)?;
                         (
                             font.payload.read_to_vec(limit).map_err(err)?,
-                            "font",
+                            font_extension(&font.suggested_extension),
                             "font_bytes",
                         )
                     }
@@ -1188,9 +1237,22 @@ impl ExportConfig {
                         "typetree_json",
                     ),
                 };
-                let target = output.join(format!("{stem}.{extension}"));
-                fs::write(&target, &data).map_err(err)?;
-                self.record(output, &target, kind, report)?;
+                match playable_container(object).filter(|_| kind == "typetree_json") {
+                    Some(container) => self.hold_playable(
+                        &mut playables,
+                        &mut playable_bytes,
+                        container,
+                        index,
+                        object,
+                        data.clone(),
+                        report,
+                    )?,
+                    None => {
+                        let target = output.join(format!("{stem}.{extension}"));
+                        fs::write(&target, &data).map_err(err)?;
+                        self.record(output, &target, kind, report)?;
+                    }
+                }
                 if extension == "json" {
                     let file = &studio.collection().serialized_files()[object.file_index()].file;
                     let tree = file.object_type_tree(object.object_index()).map_err(err)?;
@@ -1298,17 +1360,7 @@ impl ExportConfig {
                 Ok(())
             })();
             for record in &mut report.outputs[output_start..] {
-                record.object = Some(ObjectIdentity {
-                    source_file: Path::new(object.source_path())
-                        .file_name()
-                        .ok_or(Error::AssetPath)?
-                        .to_string_lossy()
-                        .into_owned(),
-                    path_id: object.path_id(),
-                    class_id: object.class_id(),
-                    name: object.name().map(str::to_owned),
-                    container: object.container().map(str::to_owned),
-                });
+                record.object = Some(object_identity(object)?);
             }
             if let Err(error) = result {
                 report.errors.push(format!(
@@ -1318,6 +1370,49 @@ impl ExportConfig {
                 ));
             }
         }
+        for (number, (container, objects)) in playables.into_iter().enumerate() {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let (identity, merged) = merge_playable(container, objects)?;
+            let target = output.join(format!("playable_{number:04}.json"));
+            fs::write(&target, merged).map_err(err)?;
+            self.record(output, &target, "playable_json", report)?;
+            if let Some(record) = report.outputs.last_mut() {
+                record.object = Some(identity);
+            }
+        }
+        Ok(())
+    }
+    /// Keeps a `.playable` MonoBehaviour's typetree JSON for the per-container merge.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_playable(
+        &self,
+        playables: &mut BTreeMap<String, Vec<PlayableObject>>,
+        held: &mut u64,
+        container: String,
+        index: usize,
+        object: unity_rs_core::studio::StudioObject<'_>,
+        data: Vec<u8>,
+        report: &ResourceReport,
+    ) -> Result<(), Error> {
+        let prior: u64 = report.outputs.iter().map(|o| o.bytes).sum();
+        *held = held.saturating_add(data.len() as u64);
+        if prior.saturating_add(*held) > self.max_resource_output_bytes {
+            return Err(Error::Size);
+        }
+        playables
+            .entry(container)
+            .or_default()
+            .push(PlayableObject {
+                name: object
+                    .name()
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| format!("MonoBehaviour_#{index}"), str::to_owned),
+                index,
+                data,
+                identity: object_identity(object)?,
+            });
         Ok(())
     }
     /// Decode once in the caller, then encode/write/verify one rendition at a time.
@@ -1428,6 +1523,33 @@ impl ExportConfig {
             )?;
             let cpu = self.acquire_cpu(self.cpu_deadline())?;
             let hca = awb.file_data(entry).map_err(err)?;
+            if !is_hca(&hca) {
+                // ADX and other waveforms are published as stored, like the original updater.
+                drop(cpu);
+                drop(hca_stage);
+                let prior: u64 = report.outputs.iter().map(|o| o.bytes).sum();
+                if prior.saturating_add(hca.len() as u64) > self.max_resource_output_bytes {
+                    return Err(Error::Size);
+                }
+                let extension = if hca.starts_with(&[0x80, 0x00]) {
+                    "adx"
+                } else {
+                    "bin"
+                };
+                let target = output.join(format!("{i:05}.{extension}"));
+                fs::write(&target, &hca).map_err(err)?;
+                self.record(root, &target, "acb_raw_waveform", report)?;
+                let cues: Vec<_> = tracks
+                    .tracks
+                    .iter()
+                    .filter(|t| t.wav_id == entry.cue_id)
+                    .map(|c| (&c.name, c.cue_id, entry.cue_id))
+                    .collect();
+                let target = output.join(format!("{i:05}.cues.json"));
+                write_json(&target, &cues)?;
+                self.record(root, &target, "cue_metadata", report)?;
+                continue;
+            }
             let mut decoder = cridecoder::HcaDecoder::from_reader(Cursor::new(hca)).map_err(err)?;
             decoder.set_encryption_key(key, awb.subkey as u64);
             let info = decoder.info();
@@ -2158,6 +2280,8 @@ impl ExportConfig {
                 "0:a:0".into(),
                 "-c:a".into(),
                 "flac".into(),
+                "-compression_level".into(),
+                "12".into(),
                 target.as_os_str().to_owned(),
             ],
         )?;
@@ -2194,9 +2318,10 @@ impl ExportConfig {
         if !matches!(channels, 1 | 2) || pcm.is_empty() {
             return Err(err("MP3 requires nonempty mono/stereo PCM"));
         }
+        // The highest bitrate each MPEG version allows (the original updater used 320k).
         let bitrate = match rate {
-            32000 | 44100 | 48000 => "192k",
-            16000 | 22050 | 24000 => "128k",
+            32000 | 44100 | 48000 => "320k",
+            16000 | 22050 | 24000 => "160k",
             8000 | 11025 | 12000 => "64k",
             _ => return Err(err("MP3 sample rate is unsupported without resampling")),
         };
@@ -2363,6 +2488,76 @@ fn validate_wav(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+struct PlayableObject {
+    name: String,
+    index: usize,
+    data: Vec<u8>,
+    identity: ObjectIdentity,
+}
+/// Haruki's merged timeline layout (`export/payload/playable.rs`).
+#[derive(Serialize)]
+struct PlayableExport {
+    container: String,
+    object_count: usize,
+    objects: Vec<PlayableExportObject>,
+}
+#[derive(Serialize)]
+struct PlayableExportObject {
+    name: String,
+    asset_type: &'static str,
+    data: sonic_rs::Value,
+}
+/// One pretty JSON per container, objects ordered by name then bundle order; the output takes
+/// the first object's identity under the normalized container.
+fn merge_playable(
+    container: String,
+    mut objects: Vec<PlayableObject>,
+) -> Result<(ObjectIdentity, Vec<u8>), Error> {
+    objects.sort_by(|a, b| a.name.cmp(&b.name).then(a.index.cmp(&b.index)));
+    let identity = ObjectIdentity {
+        container: Some(container.clone()),
+        ..objects.first().ok_or(Error::AssetPath)?.identity.clone()
+    };
+    let merged = PlayableExport {
+        object_count: objects.len(),
+        objects: objects
+            .into_iter()
+            .map(|o| {
+                Ok(PlayableExportObject {
+                    name: o.name,
+                    asset_type: "MonoBehaviour",
+                    data: sonic_rs::from_slice(&o.data).map_err(err)?,
+                })
+            })
+            .collect::<Result<_, Error>>()?,
+        container,
+    };
+    Ok((identity, sonic_rs::to_vec_pretty(&merged).map_err(err)?))
+}
+/// The normalized container of a MonoBehaviour that belongs to a `.playable` timeline.
+fn playable_container(object: unity_rs_core::studio::StudioObject<'_>) -> Option<String> {
+    let container = object
+        .container()
+        .filter(|c| !c.trim().is_empty())?
+        .replace('\\', "/");
+    (object.class_id() == 114 && container.to_ascii_lowercase().ends_with(".playable"))
+        .then_some(container)
+}
+fn object_identity(
+    object: unity_rs_core::studio::StudioObject<'_>,
+) -> Result<ObjectIdentity, Error> {
+    Ok(ObjectIdentity {
+        source_file: Path::new(object.source_path())
+            .file_name()
+            .ok_or(Error::AssetPath)?
+            .to_string_lossy()
+            .into_owned(),
+        path_id: object.path_id(),
+        class_id: object.class_id(),
+        name: object.name().map(str::to_owned),
+        container: object.container().map(str::to_owned),
+    })
+}
 fn is_moc_object(
     studio: &unity_rs_core::studio::Studio,
     object: unity_rs_core::studio::StudioObject<'_>,
@@ -3465,6 +3660,172 @@ pub(crate) mod tests {
         bytes.resize(offset, 0);
         bytes.extend(body);
         (bytes, pixels)
+    }
+    // The same Texture2D with no image bytes, as Unity ships dynamic font atlases.
+    fn synthetic_empty_texture() -> Vec<u8> {
+        fn ints(out: &mut Vec<u8>, values: &[i32]) {
+            for value in values {
+                out.extend(value.to_le_bytes());
+            }
+        }
+        let mut body = Vec::new();
+        ints(&mut body, &[4]);
+        body.extend(b"test");
+        ints(&mut body, &[0, 0, 16, 32, 0, 0, 4, 1]);
+        body.extend([1, 0, 0, 0]);
+        ints(&mut body, &[0, 0, 0, 1, 2]);
+        body.extend([0; 24]);
+        ints(&mut body, &[0, 0, 0, 0]);
+        body.extend([0; 16]);
+        let mut metadata = b"2022.3.62f1\0".to_vec();
+        ints(&mut metadata, &[13]);
+        metadata.push(0);
+        ints(&mut metadata, &[1, 28]);
+        metadata.push(0);
+        metadata.extend((-1_i16).to_le_bytes());
+        metadata.extend([0; 16]);
+        ints(&mut metadata, &[1]);
+        while !(metadata.len() + 48).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend(7_i64.to_le_bytes());
+        metadata.extend(0_i64.to_le_bytes());
+        ints(&mut metadata, &[body.len() as i32, 0, 0, 0, 0]);
+        metadata.push(0);
+        let offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut bytes = vec![0; 48];
+        bytes[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        bytes[24..32].copy_from_slice(&((offset + body.len()) as u64).to_be_bytes());
+        bytes[32..40].copy_from_slice(&(offset as u64).to_be_bytes());
+        bytes.extend(metadata);
+        bytes.resize(offset, 0);
+        bytes.extend(body);
+        bytes
+    }
+    #[test]
+    fn playable_objects_merge_per_container_like_haruki() {
+        let object = |name: &str, index: usize, value: i32| PlayableObject {
+            name: name.into(),
+            index,
+            data: format!(r#"{{"m_Name":"{name}","value":{value}}}"#).into_bytes(),
+            identity: ObjectIdentity {
+                source_file: "CAB-x".into(),
+                path_id: index as i64 + 100,
+                class_id: 114,
+                name: Some(name.into()),
+                container: Some("Assets\\Timeline\\Opening.playable".into()),
+            },
+        };
+        let (identity, bytes) = merge_playable(
+            "Assets/Timeline/Opening.playable".into(),
+            vec![object("b", 1, 1), object("a", 9, 2), object("a", 3, 3)],
+        )
+        .unwrap();
+        // Name first, then bundle order; the output belongs to the first object.
+        assert_eq!(identity.path_id, 103);
+        assert_eq!(
+            identity.container.as_deref(),
+            Some("Assets/Timeline/Opening.playable")
+        );
+        let expected = r#"{
+  "container": "Assets/Timeline/Opening.playable",
+  "object_count": 3,
+  "objects": [
+    {
+      "name": "a",
+      "asset_type": "MonoBehaviour",
+      "data": {
+        "m_Name": "a",
+        "value": 3
+      }
+    },
+    {
+      "name": "a",
+      "asset_type": "MonoBehaviour",
+      "data": {
+        "m_Name": "a",
+        "value": 2
+      }
+    },
+    {
+      "name": "b",
+      "asset_type": "MonoBehaviour",
+      "data": {
+        "m_Name": "b",
+        "value": 1
+      }
+    }
+  ]
+}"#;
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+    #[test]
+    fn empty_textures_fall_back_to_their_fields_and_non_hca_tracks_pass_through() {
+        // Empty Texture2D: the export no longer stops at "carries no image data"; it reads the
+        // object's fields instead (this synthetic file has no type tree, real bundles do).
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        fs::create_dir_all(input.join("assets")).unwrap();
+        let source = synthetic_empty_texture();
+        fs::write(input.join("assets/a.bundle"), &source).unwrap();
+        let asset = crate::update::AssetReceipt {
+            relative_path: "a.bundle".into(),
+            provider: Provider::EncryptedBundle,
+            bytes: source.len() as u64,
+            downloaded_sha256: "c".repeat(64),
+            stored_sha256: hex::encode(Sha256::digest(&source)),
+            decrypted: true,
+        };
+        let cfg = config(root.path());
+        let out = root.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        let report = cfg
+            .process_resource(&input, &out, &asset, 0, 0, None)
+            .unwrap();
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            !report.errors[0].contains("carries no image data"),
+            "{:?}",
+            report.errors
+        );
+
+        // An ADX waveform inside an ACB is published as stored, with its cue metadata.
+        let mut adx = vec![0x80, 0x00, 0x00, 0x20];
+        adx.extend([0x11; 60]);
+        let mut builder = cridecoder::AcbBuilder::new();
+        builder.add_track(cridecoder::TrackInput::new("se_click", 0, adx.clone()));
+        let mut acb = Cursor::new(Vec::new());
+        builder.build(&mut acb, None).unwrap();
+        let dir = root.path().join("acb");
+        fs::create_dir(&dir).unwrap();
+        let mut report = ResourceReport::default();
+        cfg.acb(&acb.into_inner(), &dir, 0, &mut report, &dir)
+            .unwrap();
+        let kinds: Vec<_> = report
+            .outputs
+            .iter()
+            .map(|o| (o.path.as_str(), o.kind.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("00000.adx", "acb_raw_waveform"),
+                ("00000.cues.json", "cue_metadata")
+            ]
+        );
+        assert_eq!(fs::read(dir.join("00000.adx")).unwrap(), adx);
+        // HCA detection accepts the masked (encrypted) signature; fonts keep their format.
+        assert!(is_hca(b"HCA\0rest") && is_hca(&[0xC8, 0xC3, 0xC1, 0x80]));
+        assert!(!is_hca(&[0x80, 0x00, 0x00, 0x20]) && !is_hca(b"HC"));
+        assert_eq!(
+            (
+                font_extension(".otf"),
+                font_extension(".ttf"),
+                font_extension("")
+            ),
+            ("otf", "ttf", "ttf")
+        );
     }
     fn synthetic_texture_array(
         streamed: bool,

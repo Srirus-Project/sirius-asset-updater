@@ -675,15 +675,20 @@ unsafe fn configure_encoder(
                     num: 1,
                     den: (*encoder_ctx).sample_rate,
                 };
+                if matches!(output_codec, OutputCodec::Flac) {
+                    // Same level as the CLI backend (and the original updater).
+                    (*encoder_ctx).compression_level = 12;
+                }
                 if matches!(output_codec, OutputCodec::Aac) {
                     (*encoder_ctx).bit_rate = 192_000;
                 } else if matches!(output_codec, OutputCodec::Mp3) {
                     if !matches!((*decoder_ctx).ch_layout.nb_channels, 1 | 2) {
                         return Err(media_error("MP3 requires mono or stereo"));
                     }
+                    // The highest bitrate each MPEG version allows (matches the CLI backend).
                     (*encoder_ctx).bit_rate = match (*decoder_ctx).sample_rate {
-                        32000 | 44100 | 48000 => 192000,
-                        16000 | 22050 | 24000 => 128000,
+                        32000 | 44100 | 48000 => 320000,
+                        16000 | 22050 | 24000 => 160000,
                         8000 | 11025 | 12000 => 64000,
                         _ => return Err(media_error("unsupported native MP3 sample rate")),
                     };

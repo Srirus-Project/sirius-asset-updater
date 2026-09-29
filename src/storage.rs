@@ -86,6 +86,9 @@ pub enum Layout {
         lowercase: bool,
         #[serde(default)]
         prune: bool,
+        /// Partial publication (see `stable_layout::Options::max_failed_resources`).
+        #[serde(default)]
+        max_failed_resources: usize,
     },
 }
 fn stable_strip_prefixes() -> Vec<String> {
@@ -102,10 +105,12 @@ impl Layout {
                 strip_prefixes,
                 lowercase,
                 prune,
+                max_failed_resources,
             } => Some(crate::stable_layout::Options {
                 strip_prefixes: strip_prefixes.clone(),
                 lowercase: *lowercase,
                 prune: *prune,
+                max_failed_resources: *max_failed_resources,
             }),
         }
     }
@@ -317,6 +322,10 @@ pub struct StableCounts {
     pub pruned: usize,
     pub deduplicated: usize,
     pub renamed: usize,
+    /// Resources left out of a partial publication.
+    pub failed_resources: usize,
+    /// Previously published keys of those resources kept in the new manifest.
+    pub carried_forward: usize,
 }
 struct StableContext<'a> {
     input: &'a Path,
@@ -339,8 +348,16 @@ struct StableVersion<'a> {
     pruned: usize,
     deduplicated: usize,
     renamed: usize,
+    /// Partial publication only; the sources are in `verification.failed_resources`.
+    #[serde(skip_serializing_if = "is_zero")]
+    failed_resources: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    carried_forward: usize,
     completed_at: String,
     verification: &'a export_verify::Report,
+}
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 /// `path -> (bytes, sha256)` of the verified export inventory.
 async fn verified_inventory(
@@ -432,6 +449,15 @@ impl Config {
         }
         Ok(())
     }
+    /// Failed resources an export may contain and still be published: every provider must use
+    /// a stable layout that allows them (an immutable publication tree cannot be partial).
+    pub fn max_failed_resources(&self) -> usize {
+        self.providers
+            .iter()
+            .map(|p| p.layout.stable().map_or(0, |o| o.max_failed_resources))
+            .min()
+            .unwrap_or(0)
+    }
     fn resolved(&self, region: Region) -> Result<Self, Error> {
         if region == Region::Cn {
             return Err(Error::ReservedRegion);
@@ -521,7 +547,7 @@ impl Config {
         let resolved = self.resolved(region)?;
         resolved.validate_resolved()?;
         let verified = tokio::select! {
-            result = export_verify::prepare(input, region) => result?,
+            result = export_verify::prepare_partial(input, region, resolved.max_failed_resources()) => result?,
             _ = crate::service::cancelled(&mut stop) => return Err(Error::Cancelled),
         };
         let input = tokio::fs::canonicalize(input)
@@ -807,13 +833,13 @@ impl Config {
         Err(Error::Storage)
     }
 
-    /// The previous stable manifest (`key -> (bytes, sha256)`); empty when none was published.
+    /// The previous stable manifest by key; empty when none was published.
     async fn previous_manifest(
         &self,
         op: &Operator,
         key: &str,
         stop: &mut watch::Receiver<bool>,
-    ) -> Result<std::collections::HashMap<String, (u64, String, String)>, Error> {
+    ) -> Result<std::collections::HashMap<String, crate::stable_layout::Entry>, Error> {
         const MAX_MANIFEST: u64 = 1024 * 1024 * 1024;
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.object_timeout_seconds.saturating_mul(4));
@@ -837,7 +863,7 @@ impl Config {
         for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
             let entry: crate::stable_layout::Entry =
                 sonic_rs::from_slice(line).map_err(|_| Error::Verification)?;
-            previous.insert(entry.path, (entry.bytes, entry.sha256, entry.content_type));
+            previous.insert(entry.path.clone(), entry);
         }
         Ok(previous)
     }
@@ -867,15 +893,36 @@ impl Config {
             // Manifests written before 1.2.4 have no content type, so their objects are
             // re-uploaded once with one.
             .filter(|e| {
-                previous.get(&e.path) != Some(&(e.bytes, e.sha256.clone(), e.content_type.clone()))
+                previous.get(&e.path).is_none_or(|p| {
+                    (p.bytes, &p.sha256, &p.content_type) != (e.bytes, &e.sha256, &e.content_type)
+                })
             })
             .collect();
+        // Partial publication: a failed resource keeps what it published before, unless a
+        // key now belongs to another resource's new output.
+        let carried: Vec<&crate::stable_layout::Entry> = if plan.failed_sources.is_empty() {
+            Vec::new()
+        } else {
+            let failed: HashSet<&str> = plan.failed_sources.iter().map(String::as_str).collect();
+            let claimed: HashSet<String> =
+                plan.entries.iter().map(|e| e.path.to_lowercase()).collect();
+            let mut carried: Vec<_> = previous
+                .values()
+                .filter(|e| {
+                    failed.contains(e.source.as_str()) && !claimed.contains(&e.path.to_lowercase())
+                })
+                .collect();
+            carried.sort_by(|a, b| a.path.cmp(&b.path));
+            carried
+        };
         let mut counts = StableCounts {
             files: plan.entries.len(),
             uploaded: pending.len(),
             unchanged: plan.entries.len() - pending.len(),
             deduplicated: plan.deduplicated,
             renamed: plan.renamed,
+            failed_resources: plan.failed_sources.len(),
+            carried_forward: carried.len(),
             ..StableCounts::default()
         };
         progress.completed = progress
@@ -944,7 +991,12 @@ impl Config {
             return Err(error);
         }
         if options.prune {
-            let current: HashSet<&str> = plan.entries.iter().map(|e| e.path.as_str()).collect();
+            let current: HashSet<&str> = plan
+                .entries
+                .iter()
+                .chain(carried.iter().copied())
+                .map(|e| e.path.as_str())
+                .collect();
             for key in previous.keys().filter(|k| !current.contains(k.as_str())) {
                 // Only keys this layout published before are ever deleted.
                 let key = format!("{prefix}/{key}");
@@ -960,7 +1012,7 @@ impl Config {
             }
         }
         let mut manifest = Vec::new();
-        for entry in &plan.entries {
+        for entry in plan.entries.iter().chain(carried.iter().copied()) {
             let mut public = entry.clone();
             public.local.clear();
             manifest.extend(sonic_rs::to_vec(&public).map_err(|_| Error::Verification)?);
@@ -996,13 +1048,20 @@ impl Config {
             region: context.region,
             publication_id: context.id,
             release: self.release.as_ref(),
-            files: counts.files,
-            bytes: plan.entries.iter().map(|e| e.bytes).sum(),
+            files: counts.files + counts.carried_forward,
+            bytes: plan
+                .entries
+                .iter()
+                .chain(carried.iter().copied())
+                .map(|e| e.bytes)
+                .sum(),
             uploaded: counts.uploaded,
             unchanged: counts.unchanged,
             pruned: counts.pruned,
             deduplicated: counts.deduplicated,
             renamed: counts.renamed,
+            failed_resources: counts.failed_resources,
+            carried_forward: counts.carried_forward,
             completed_at: chrono::Utc::now().to_rfc3339(),
             verification: context.report,
         };

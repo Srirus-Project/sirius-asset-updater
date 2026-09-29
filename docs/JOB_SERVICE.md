@@ -101,6 +101,9 @@ Successful new jobs include an `outcome` saved in the same ledger transaction as
   region/platform, full-catalog scope and verified input counters.
 - `export`: null when no export ran; otherwise full-export scope, final local-retention state,
   output file count and output bytes. Validation-only export is not retained publication.
+  `failed` (omitted when zero) counts resources left out of a
+  [partial publication](STORAGE.md#partial-publication); `full_export` still describes the
+  selection, so a consumer that needs every file must also check `failed`.
 - `publication_id`: null when no storage publication ran; otherwise the UUID of the verified
   storage publication described by the job's `publication.json`.
 
