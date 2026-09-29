@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.6
+
+Behavior audit against the original updater; these restore its output where Sirius differed.
+
+- Partial publication (stable layout, opt-in): `max_failed_resources: N` publishes an export in
+  which up to N resources failed. Failed resources keep their previously published files, which
+  stay in the manifest (also under `prune`); `_sirius/version.json` lists them and the job's
+  `outcome.export.failed` counts them. Default `0`: any failure still publishes nothing. See
+  `docs/STORAGE.md#partial-publication`.
+- MonoBehaviours of a `.playable` container are merged into one JSON per container at the
+  container path (`timeline/x.playable` → `timeline/x.json`), as the original did.
+- A CRI track played by several cues is published under every cue name, not only the first.
+- The alpha stream of a masked USM is published as `name.alpha.<ext>` next to the color stream.
+  Before, both claimed `name.<ext>` and the alpha stream became `name__dup2.<ext>`.
+- Texture2DArray layers get `<name>/layer_NNNN.png` keys.
+- ACB tracks that are not HCA (ADX and unknown codecs) are published as stored instead of failing
+  the resource.
+- A Texture2D without image data exports its fields as JSON instead of failing the resource.
+- Fonts keep `.otf` for OpenType payloads (was always `.ttf`).
+- MP3 uses the original's bit rates (320/160/64 kbit/s by sample-rate class, was 192/128/64) and
+  FLAC compression level 12, for both media backends. Stable trees with MP3 or FLAC output
+  re-upload those files once.
+
 ## 1.2.5
 
 - USM exports are reproducible: `movie.mkv` is muxed with `+bitexact` (FFmpeg otherwise writes
