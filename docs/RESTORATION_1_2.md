@@ -4,7 +4,7 @@ Objective: retain Haruki's reusable service/platform capabilities, replace all S
 
 Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e131 and Haruki-Sekai-Asset-Updater 3d33ed037f0ef5009e361e0535b3b19f8c239947. Preserve MIT attribution. Existing Sirius release baselines: API 5ab1e390ca514e550cb609ae4d299b19c105b79e, updater e7ffb7b905958de88aa8d5a06327dafcc8acd8ce.
 
-## API requirements (all pending)
+## API requirements
 
 - Multi-region service configuration/routing with per-region protocol family, credentials and isolated state; retain v1.1 single-region config compatibility and reserved CN.
 - Account pool, per-account locking, selection, health/cooldown and credential reload. No speculative retries of account mutations; no fabricated Global login.
@@ -14,7 +14,7 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Master registry/manifests, owner/consumer synchronization, notifications, optional generic persistence and Git publication. Do not restore Sekai table models or Ent code.
 - Full documented config surface, examples, migration, meaningful local integration tests including failure/authorization cases.
 
-## Updater requirements (all pending unless specifically evidenced)
+## Updater requirements
 
 - Authenticated long-running HTTP service, region configs, job submission/list/detail/cancel/retry, bounded queue/concurrency, progress, retention and safe shutdown/restart.
 - Invoke Sirius catalog/download/verify/export pipeline from the service, not a stub or arbitrary shell executor; retain CLI support.
@@ -26,7 +26,10 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Update trigger/scheduling, completion notification and generic publication integration where applicable. Sekai chart-hash/character-ID/3D model adapters are removed, not copied.
 - End-to-end tests cover queue saturation, cancellation, restart, per-region serialization, incremental behavior, upload failure safety and secrets.
 
-## Release gates (all pending)
+## Release gates
+
+The requirement lists above were the plan written before work started; the status of each item is
+recorded in the ledger below (all were completed for 1.2.0; later releases are in CHANGELOG.md).
 
 - Audit each feature against original code/config; no placeholders or silent ignored config fields; record any game-specific non-applicability with evidence. Configuration audit: [HARUKI_CONFIG_AUDIT.md](HARUKI_CONFIG_AUDIT.md).
 - Both repositories fmt/check/Clippy/tests and release packaging smoke pass.
