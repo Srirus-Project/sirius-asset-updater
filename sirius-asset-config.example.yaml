@@ -7,8 +7,8 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 # Must differ from the internal token; never sent to the CDN.
 refresh_token_env: SIRIUS_API_TOKEN
 environment: release
-client_version: 1.0.3
-protocol_version: 1.0.3
+client_version: 1.0.4
+protocol_version: 1.0.4
 output: ./downloads/catalogs
 cdn_roots:
   https://static.bang-dream-on.jp:

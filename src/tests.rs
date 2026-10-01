@@ -19,7 +19,7 @@ fn config() -> Config {
         internal_token_env: "TOKEN".into(),
         refresh_token_env: None,
         environment: "release".into(),
-        client_version: "1.0.3".into(),
+        client_version: "1.0.4".into(),
         output: PathBuf::from("unused"),
         assets: None,
         catalog_locale: None,
@@ -37,12 +37,12 @@ fn snapshot() -> SnapshotResponse {
     SnapshotResponse {
         stale: false,
         snapshot: Snapshot {
-            region: None,
-            schema_version: 1,
+            region: Some(region::Region::Jp),
+            schema_version: 2,
             environment: "release".into(),
             platform: "iOS".into(),
-            client_version: "1.0.3".into(),
-            protocol_version: "1.0.3".into(),
+            client_version: "1.0.4".into(),
+            protocol_version: "1.0.4".into(),
             master_version: Some("m1".into()),
             resource_version: "r1".into(),
             platform_hash: "h1".into(),
@@ -78,11 +78,28 @@ fn snapshot_policy_rejects_stale_identity_paths_and_secret_substitution() {
             5 => s.snapshot.resource_version = "../other".into(),
             6 => s.snapshot.effective_cdn_root = "https://evil.example".into(),
             7 => s.snapshot.credential_ref = "OTHER_SECRET".into(),
-            8 => s.snapshot.schema_version = 2,
+            // A regionless schema-1 snapshot is legacy JP 1.0.3 only.
+            8 => {
+                s.snapshot.schema_version = 1;
+                s.snapshot.region = None;
+            }
             _ => s.snapshot.source = "offline-bundled".into(),
         }
         assert!(s.catalog_url(&cfg, now).is_err(), "case {case}");
     }
+    // Legacy API (schema 1, JP 1.0.3): accepted only when the profile pins 1.0.3.
+    let mut legacy = snapshot();
+    legacy.snapshot.schema_version = 1;
+    legacy.snapshot.region = None;
+    legacy.snapshot.client_version = "1.0.3".into();
+    legacy.snapshot.protocol_version = "1.0.3".into();
+    let mut pinned = config();
+    pinned.client_version = "1.0.3".into();
+    assert!(legacy.catalog_url(&pinned, now).is_err());
+    pinned.protocol_version = Some("1.0.3".into());
+    assert!(legacy.catalog_url(&pinned, now).is_ok());
+    // The JP default protocol is 1.0.4 (API 1.3.2 and later).
+    assert_eq!(cfg.protocol_version(), "1.0.4");
 }
 #[test]
 fn config_rejects_remote_plaintext_and_cdn_plaintext() {
@@ -1605,6 +1622,12 @@ fn cache_identity_separates_regions_even_with_shared_cdn_and_catalog() {
 #[test]
 fn persisted_identity_accepts_legacy_jp_and_rejects_ambiguous_or_reserved_regions() {
     let mut s = snapshot().snapshot;
+    assert_eq!(s.region_identity().unwrap(), region::Region::Jp);
+    // Legacy regionless schema 1: JP iOS 1.0.3 only.
+    s.schema_version = 1;
+    s.region = None;
+    assert!(s.region_identity().is_err());
+    s.protocol_version = "1.0.3".into();
     assert_eq!(s.region_identity().unwrap(), region::Region::Jp);
     s.schema_version = 2;
     assert!(s.region_identity().is_err());

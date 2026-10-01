@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.7
+
+- The JP default `protocol_version` is 1.0.4, matching API 1.3.2 and later (JP protocol 1.0.4;
+  the JP server now requires client 1.0.4). The example configuration uses `client_version` and
+  `protocol_version` 1.0.4.
+  - A JP profile that relied on the default now refuses snapshots from an older API that still
+    reports 1.0.3. Pin `protocol_version: 1.0.3` for such an API.
+  - The protocol version is part of the export cache identity, so a JP profile that changes
+    version exports once more.
+  - HK/EN/KR are unchanged (1.0.1).
+
 ## 1.2.6
 
 Behavior audit against the original updater; these restore its output where Sirius differed.

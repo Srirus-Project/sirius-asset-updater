@@ -67,7 +67,7 @@ impl Region {
     }
     pub fn protocol_version(self) -> &'static str {
         match self {
-            Self::Jp => "1.0.3",
+            Self::Jp => "1.0.4",
             Self::Cn => "",
             _ => "1.0.1",
         }

@@ -75,7 +75,7 @@ the same shape. It has no job `id` and cannot be polled:
 {"dry_run":true,"ready":true,"issues":[],
  "request":{"region":"jp","profile":"jp-full","operation":"update"},
  "steps":["download","verify","export","verify_export","publish"],
- "download":{"environment":"release","platform":"iOS","client_version":"1.0.3",
+ "download":{"environment":"release","platform":"iOS","client_version":"1.0.4",
    "protocol_version":"...","refresh_enabled":true,"catalog_only":false,"decryption_enabled":true,
    "selection":{"entire_catalog":false,"keys":["InitialDownload"],"include_patterns":0,
      "exclude_patterns":0,"priority_patterns":1},

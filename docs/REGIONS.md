@@ -7,7 +7,7 @@ one protocol family and cannot switch regions or account identity.
 
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
-| `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy and verified download/export pipeline |
+| `jp` | Japan | Not inferred | `iOS` | JP 1.0.4 | Existing JP proxy and verified download/export pipeline |
 | `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); full catalog verified live |
 | `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); selection verified live |
 | `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and asset download/verification/export (schema-3 snapshots); selection verified live |
@@ -23,8 +23,8 @@ never paste the whole list into an endpoint. No automatic endpoint switching is 
 
 Omitting `region` preserves JP behavior. `platform` accepts exactly `iOS` or `Android`; when
 omitted it follows the table. A Global instance selects `protocol/global/1.0.1` by default;
-an explicit protocol path must have the matching family. The existing JP default path remains
-`protocol/sirius/1.0.3`. Both bundles generate native prost/pbjson codecs at build time. Exact
+an explicit protocol path must have the matching family. The JP default path is
+`protocol/sirius/1.0.4` since API 1.3.2 (1.0.3 before). Both bundles generate native prost/pbjson codecs at build time. Exact
 fingerprints select native codecs; compatible changed definitions use dynamic startup/reload.
 
 `GET /api/v1/regions` reports the selected region and capability/reservation metadata.
@@ -41,7 +41,7 @@ Global automatic Master storage is rejected until that pipeline is verified.
 ## Asset updater
 
 Configure the same region, platform, client version and protocol version as the proxy.
-`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR; it can be pinned explicitly
+`protocol_version` defaults to 1.0.4 for JP (1.0.3 before updater 1.2.7) and 1.0.1 for HK/EN/KR; it can be pinned explicitly
 when deploying a new verified bundle. `cdn_roots` matches the entire HTTPS base URL, including
 its path. Each root states its `authorization`: `basic` (the default, required for JP) with
 username/password environment references that belong only to that base URL, or `none` (HK/EN/KR
@@ -50,7 +50,7 @@ roots/references are rejected before CDN requests.
 
 JP snapshots use schema version 2 (a schema-3 snapshot with `catalog_layout: jp` is also
 accepted) and Global snapshots schema version 3; both require explicit region identity. A regionless schema-1 snapshot is accepted only for legacy
-JP/iOS/protocol-1.0.3. A mismatched or missing region, platform, environment, client or protocol
+JP/iOS/protocol-1.0.3, so it needs a profile that pins `protocol_version: 1.0.3`. A mismatched or missing region, platform, environment, client or protocol
 version fails before any CDN request.
 Publication names contain region and platform; receipts and export summaries retain identity.
 Cache keys additionally include region, environment and platform, even for shared CDN URLs.
